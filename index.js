@@ -5,6 +5,8 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import admin from "firebase-admin";
 import { readFileSync } from "fs";
+import dotenv from 'dotenv';
+dotenv.config();
 
 const app = express();
 app.use(cors());
@@ -130,6 +132,77 @@ app.post("/api/check-2fa-required", async (req, res) => {
     
     console.error("Check 2FA required error:", error);
     res.status(500).json({ success: false, message: "Szerver hiba" });
+  }
+});
+
+// ✅ ÚJ: Validate password endpoint (NEM jelentkeztet be!)
+app.post("/api/validate-password", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Email és jelszó szükséges" 
+      });
+    }
+
+    console.log("🔐 Validating password for:", email);
+
+    // Firebase Admin SDK-val nem tudjuk közvetlenül ellenőrizni a jelszót
+    // Ezért a Firebase Auth REST API-t használjuk
+    // Ez NEM hoz létre session-t, csak ellenőrzi a credentials-t
+    
+    // FONTOS: Add hozzá a FIREBASE_API_KEY-t a .env fájlhoz!
+    // Megtalálod: Firebase Console -> Project Settings -> Web API Key
+    const firebaseApiKey = process.env.FIREBASE_API_KEY || "AIzaSyDummyKeyReplaceThis";
+    
+    const response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email,
+          password,
+          returnSecureToken: true, // Kell token, de nem fogjuk használni
+        }),
+      }
+    );
+
+    const data = await response.json();
+
+    if (response.ok) {
+      console.log("✅ Password is valid for:", email);
+      
+      // Ellenőrizzük az email verifikációt
+      const userRecord = await admin.auth().getUserByEmail(email);
+      if (!userRecord.emailVerified) {
+        return res.status(401).json({ 
+          success: false, 
+          message: "Nincs megerősítve az email!" 
+        });
+      }
+      
+      res.json({ 
+        success: true,
+        message: "Jelszó helyes"
+      });
+    } else {
+      console.log("❌ Invalid password for:", email);
+      res.status(401).json({ 
+        success: false, 
+        message: "Hibás email/jelszó páros"
+      });
+    }
+  } catch (error) {
+    console.error("❌ Password validation error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Szerver hiba" 
+    });
   }
 });
 
