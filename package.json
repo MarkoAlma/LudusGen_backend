@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "description": "Backend for 2FA authentication with Firebase",
   "type": "module",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js",
+    "start": "node index.js",
+    "dev": "nodemon index.js",
     "prod": "NODE_ENV=production node server-production.js"
   },
   "keywords": [
