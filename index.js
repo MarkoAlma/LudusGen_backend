@@ -108,7 +108,8 @@ function generateBackupCodes(count = 10) {
 app.post("/api/check-2fa-required", async (req, res) => {
   try {
     const { email } = req.body;
-    
+    console.log("REQ BODY:", req.body);
+
     if (!email) {
       return res.status(400).json({ 
         success: false, 
@@ -143,7 +144,11 @@ app.post("/api/check-2fa-required", async (req, res) => {
 // Login endpoint 2FA-val (NEM kell Firebase token, mert még nem vagyunk bejelentkezve)
 app.post("/api/login-with-2fa", async (req, res) => {
   try {
+
     const { email, code } = req.body;
+    console.log(email);
+    console.log(code);
+    
     
     if (!email || !code) {
       return res.status(400).json({ 
@@ -159,6 +164,7 @@ app.post("/api/login-with-2fa", async (req, res) => {
     // 2FA adatok lekérése
     const twoFAData = await get2FAData(userId);
 
+    
     if (!twoFAData || !twoFAData.is2FAEnabled) {
       return res.status(400).json({ 
         success: false, 
