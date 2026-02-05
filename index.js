@@ -182,13 +182,9 @@ app.post("/api/login-with-2fa", async (req, res) => {
     }
 
     if (isValid) {
-      // ✅ FONTOS: Generálunk egy Firebase Custom Token-t
-      const customToken = await admin.auth().createCustomToken(userId);
-      
       res.json({ 
         success: true,
         message: "Sikeres 2FA validáció",
-        customToken: customToken, // ✅ Ezt küldjük a frontend-nek
         remainingBackupCodes: twoFAData.backupCodes?.length || 0,
       });
     } else {
