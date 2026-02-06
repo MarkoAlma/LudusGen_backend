@@ -5,6 +5,7 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import admin from "firebase-admin";
 import { readFileSync } from "fs";
+import nodemailer from "nodemailer";
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -28,6 +29,138 @@ try {
 
 const db = admin.firestore();
 
+// ==================== NODEMAILER SETUP ====================
+const transporter = nodemailer.createTransport({
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false, // true for 465, false for other ports
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD,
+  },
+  tls: {
+    rejectUnauthorized: false
+  }
+});
+
+// ✅ VERIFY CONNECTION
+transporter.verify(function (error, success) {
+  if (error) {
+    console.log('❌ SMTP connection error:', error);
+  } else {
+    console.log('✅ SMTP server is ready to send emails');
+  }
+});
+
+// Email küldő függvény
+async function sendVerificationEmail(email, verificationLink, displayName) {
+  const mailOptions = {
+    from: {
+      name: 'LudusGen',
+      address: process.env.EMAIL_USER
+    },
+    to: email,
+    subject: 'Erősítsd meg az email címedet - LudusGen',
+    text: `Üdvözlünk a LudusGen-nél! Kattints az alábbi linkre az email megerősítéséhez: ${verificationLink}`, // ✅ Plaintext verzió
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+        <table role="presentation" style="width: 100%; border-collapse: collapse;">
+          <tr>
+            <td align="center" style="padding: 40px 0;">
+              <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                <!-- Header -->
+                <tr>
+                  <td style="padding: 40px 40px 20px 40px; text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 8px 8px 0 0;">
+                    <h1 style="margin: 0; color: #ffffff; font-size: 28px;">🎮 LudusGen</h1>
+                  </td>
+                </tr>
+                
+                <!-- Content -->
+                <tr>
+                  <td style="padding: 40px;">
+                    <h2 style="margin: 0 0 20px 0; color: #333333; font-size: 24px;">
+                      Üdvözlünk${displayName ? `, ${displayName}` : ''}! 👋
+                    </h2>
+                    
+                    <p style="margin: 0 0 20px 0; color: #666666; font-size: 16px; line-height: 1.6;">
+                      Köszönjük, hogy regisztráltál a LudusGen platformra! Már csak egy lépés van hátra.
+                    </p>
+                    
+                    <p style="margin: 0 0 30px 0; color: #666666; font-size: 16px; line-height: 1.6;">
+                      Kattints az alábbi gombra az email címed megerősítéséhez:
+                    </p>
+                    
+                    <!-- Button -->
+                    <table role="presentation" style="margin: 0 auto;">
+                      <tr>
+                        <td style="border-radius: 6px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                          <a href="${verificationLink}" target="_blank" style="
+                            display: inline-block;
+                            padding: 16px 40px;
+                            color: #ffffff;
+                            text-decoration: none;
+                            font-size: 16px;
+                            font-weight: bold;
+                            border-radius: 6px;
+                          ">
+                            ✉️ Email megerősítése
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+                    
+                    <p style="margin: 30px 0 20px 0; color: #999999; font-size: 14px; line-height: 1.6;">
+                      Ha a gomb nem működik, másold be ezt a linket a böngészőbe:
+                    </p>
+                    
+                    <p style="margin: 0 0 30px 0; padding: 15px; background-color: #f8f8f8; border-radius: 4px; word-break: break-all; color: #666666; font-size: 13px; font-family: monospace;">
+                      ${verificationLink}
+                    </p>
+                    
+                    <hr style="border: none; border-top: 1px solid #eeeeee; margin: 30px 0;">
+                    
+                    <p style="margin: 0; color: #999999; font-size: 13px; line-height: 1.6;">
+                      ⚠️ Ha nem te regisztráltál, hagyd figyelmen kívül ezt az emailt. A link 24 óra múlva lejár.
+                    </p>
+                  </td>
+                </tr>
+                
+                <!-- Footer -->
+                <tr>
+                  <td style="padding: 30px 40px; background-color: #f8f8f8; border-radius: 0 0 8px 8px; text-align: center;">
+                    <p style="margin: 0; color: #999999; font-size: 12px;">
+                      © ${new Date().getFullYear()} LudusGen. Minden jog fenntartva.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
+    `,
+  };
+
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    console.log('✅ Verification email sent to:', email);
+    console.log('📧 Message ID:', info.messageId);
+    console.log('📬 Preview URL:', nodemailer.getTestMessageUrl(info)); // Ha Ethereal-t használnál
+    return true;
+  } catch (error) {
+    console.error('❌ Email sending failed:', error);
+    console.error('Error details:', error.message);
+    return false;
+  }
+}
+
 // ==================== MIDDLEWARE: Firebase Auth Token ellenőrzés ====================
 const verifyFirebaseToken = async (req, res, next) => {
   try {
@@ -41,6 +174,16 @@ const verifyFirebaseToken = async (req, res, next) => {
     }
 
     const decodedToken = await admin.auth().verifyIdToken(token);
+    
+    // Email verifikáció ellenőrzése
+    const userRecord = await admin.auth().getUser(decodedToken.uid);
+    if (!userRecord.emailVerified) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Email nincs megerősítve" 
+      });
+    }
+    
     req.userId = decodedToken.uid;
     req.userEmail = decodedToken.email;
     next();
@@ -103,10 +246,110 @@ function generateBackupCodes(count = 10) {
 
 // ==================== PUBLIC ENDPOINTS ====================
 
+// ✅ BIZTONSÁGOS REGISZTRÁCIÓ NODEMAILER-REL
+app.post("/api/register-user", async (req, res) => {
+  try {
+    const { email, password, displayName } = req.body;
+    
+    // Validáció
+    if (!email || !password || !displayName) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Email, jelszó és név szükséges" 
+      });
+    }
+    
+    if (password.length < 6) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "A jelszó legalább 6 karakter hosszú legyen" 
+      });
+    }
+    
+    if (displayName.trim().length < 2) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "A név legalább 2 karakter hosszú legyen" 
+      });
+    }
+    
+    console.log("📝 Registering new user:", email);
+    
+    // 1. Firebase Auth user létrehozása (Admin SDK - NEM jelentkeztet be!)
+    const userRecord = await admin.auth().createUser({
+      email,
+      password,
+      displayName: displayName.trim(),
+      emailVerified: false,
+    });
+    
+    console.log("✅ Firebase Auth user created:", userRecord.uid);
+    
+    // 2. Email verifikációs link generálása
+    const verificationLink = await admin.auth().generateEmailVerificationLink(email, {
+      url: 'http://localhost:5173/signin', // Ide irányít az email link után
+    });
+    
+    console.log("📧 Email verification link generated");
+    
+    // 3. Email küldése Nodemailer-rel
+    const emailSent = await sendVerificationEmail(email, verificationLink, displayName);
+    
+    if (!emailSent) {
+      console.warn('⚠️ Email sending failed, but user created');
+      // Opcionális: törölheted a usert, ha az email küldés sikertelen
+      // await admin.auth().deleteUser(userRecord.uid);
+      // return res.status(500).json({ success: false, message: "Email küldése sikertelen" });
+    }
+    
+    // 4. Firestore dokumentum létrehozása
+    await db.collection("users").doc(userRecord.uid).set({
+      email,
+      name: displayName.trim(),
+      displayName: displayName.trim(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      twoFA: {
+        enabled: false,
+        secret: null,
+        backupCodes: [],
+      },
+    });
+    
+    console.log("✅ Firestore user document created");
+    console.log("✅ Registration complete for:", email);
+    
+    res.json({ 
+      success: true,
+      message: "Regisztráció sikeres! Elküldtük az email megerősítő linket.",
+    });
+    
+  } catch (error) {
+    console.error("❌ Registration error:", error);
+    
+    if (error.code === 'auth/email-already-exists') {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Ez az email cím már regisztrálva van" 
+      });
+    }
+    
+    if (error.code === 'auth/invalid-email') {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Érvénytelen email cím formátum" 
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || "Regisztrációs hiba" 
+    });
+  }
+});
+
 app.post("/api/check-2fa-required", async (req, res) => {
   try {
     const { email } = req.body;
-    console.log("REQ BODY:", req.body);
 
     if (!email) {
       return res.status(400).json({ 
@@ -136,7 +379,6 @@ app.post("/api/check-2fa-required", async (req, res) => {
   }
 });
 
-// ✅ ÚJ: Validate password endpoint (NEM jelentkeztet be!)
 app.post("/api/validate-password", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -150,13 +392,11 @@ app.post("/api/validate-password", async (req, res) => {
 
     console.log("🔐 Validating password for:", email);
 
-    // Firebase Admin SDK-val nem tudjuk közvetlenül ellenőrizni a jelszót
-    // Ezért a Firebase Auth REST API-t használjuk
-    // Ez NEM hoz létre session-t, csak ellenőrzi a credentials-t
+    const firebaseApiKey = process.env.FIREBASE_API_KEY;
     
-    // FONTOS: Add hozzá a FIREBASE_API_KEY-t a .env fájlhoz!
-    // Megtalálod: Firebase Console -> Project Settings -> Web API Key
-    const firebaseApiKey = process.env.FIREBASE_API_KEY || "AIzaSyDummyKeyReplaceThis";
+    if (!firebaseApiKey) {
+      throw new Error("FIREBASE_API_KEY nincs beállítva a .env fájlban!");
+    }
     
     const response = await fetch(
       `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`,
@@ -168,7 +408,7 @@ app.post("/api/validate-password", async (req, res) => {
         body: JSON.stringify({
           email,
           password,
-          returnSecureToken: true, // Kell token, de nem fogjuk használni
+          returnSecureToken: true,
         }),
       }
     );
@@ -178,7 +418,7 @@ app.post("/api/validate-password", async (req, res) => {
     if (response.ok) {
       console.log("✅ Password is valid for:", email);
       
-      // Ellenőrizzük az email verifikációt
+      // Email verifikáció ellenőrzése
       const userRecord = await admin.auth().getUserByEmail(email);
       if (!userRecord.emailVerified) {
         return res.status(401).json({ 
@@ -209,11 +449,8 @@ app.post("/api/validate-password", async (req, res) => {
 
 app.post("/api/login-with-2fa", async (req, res) => {
   try {
-
     const { email, code } = req.body;
-    console.log(email);
-    console.log(code);
-    
+    console.log("🔐 2FA Login attempt:", email);
     
     if (!email || !code) {
       return res.status(400).json({ 
@@ -224,8 +461,16 @@ app.post("/api/login-with-2fa", async (req, res) => {
 
     const userRecord = await admin.auth().getUserByEmail(email);
     const userId = userRecord.uid;
+    
+    // Email verifikáció ellenőrzése
+    if (!userRecord.emailVerified) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Email nincs megerősítve!" 
+      });
+    }
+    
     const twoFAData = await get2FAData(userId);
-
     
     if (!twoFAData || !twoFAData.is2FAEnabled) {
       return res.status(400).json({ 
@@ -283,6 +528,37 @@ app.post("/api/login-with-2fa", async (req, res) => {
 
 // ==================== PROTECTED ENDPOINTS ====================
 
+app.get("/api/get-user/:uid", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { uid } = req.params;
+    
+    // Csak a saját adatait kérheti le
+    if (uid !== req.userId) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Nincs jogosultság" 
+      });
+    }
+    
+    const doc = await db.collection("users").doc(uid).get();
+    
+    if (!doc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User nem található" 
+      });
+    }
+    
+    res.json({ 
+      success: true,
+      user: doc.data()
+    });
+  } catch (error) {
+    console.error("Get user error:", error);
+    res.status(500).json({ success: false, message: "Szerver hiba" });
+  }
+});
+
 app.get("/api/check-2fa-status", verifyFirebaseToken, async (req, res) => {
   try {
     const twoFAData = await get2FAData(req.userId);
@@ -316,19 +592,16 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
     } else {
       console.log('🆕 Generating new secret with Speakeasy');
       
-      // Speakeasy secret generation
       const secretObj = speakeasy.generateSecret({
         name: `LudusGen (${userEmail})`,
         issuer: 'LudusGen',
         length: 32
       });
       
-      secret = secretObj.base32; // ⚠️ FONTOS: base32 encoding!
+      secret = secretObj.base32;
       backupCodes = generateBackupCodes();
 
       console.log('💾 Saving new secret to DB...');
-      console.log('Secret (base32):', secret);
-      console.log('Secret length:', secret?.length);
 
       await save2FAData(userId, {
         secret,
@@ -336,21 +609,16 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
         backupCodes,
       });
 
-      // Verification
       const verification = await get2FAData(userId);
       console.log('✅ Secrets match:', verification?.secret === secret);
     }
 
-    console.log('📝 Final secret length:', secret?.length);
-    
-    // Test token generation
     const testToken = speakeasy.totp({
       secret: secret,
       encoding: 'base32'
     });
     console.log('🧪 Test token generated:', testToken);
 
-    // QR Code generation with otpauth URL
     const otpauthUrl = speakeasy.otpauthURL({
       secret: secret,
       label: userEmail,
@@ -358,15 +626,13 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
       encoding: 'base32'
     });
 
-    console.log('🔗 OTPAuth URL:', otpauthUrl);
-
     const qr = await QRCode.toDataURL(otpauthUrl);
 
     console.log('✅ MFA setup data prepared');
 
     res.json({
       qr,
-      secret,  // Dev only
+      secret,
       backupCodes,
     });
   } catch (error) {
@@ -386,7 +652,6 @@ app.post("/api/verify-mfa", verifyFirebaseToken, async (req, res) => {
     console.log('🔐 Verify MFA Request:');
     console.log('User ID:', userId);
     console.log('Code received:', code);
-    console.log('Code length:', code?.length);
 
     if (!code || code.length !== 6) {
       console.warn('❌ Invalid code format');
@@ -414,28 +679,21 @@ app.post("/api/verify-mfa", verifyFirebaseToken, async (req, res) => {
       });
     }
 
-    console.log('📝 Secret from DB:', twoFAData.secret);
-    console.log('Secret length:', twoFAData.secret?.length);
-
-    // ⚠️ KRITIKUS: Speakeasy verify with window: 2
     const verified = speakeasy.totp.verify({
       secret: twoFAData.secret,
       encoding: 'base32',
       token: code,
-      window: 2  // ±60 másodperc tolerancia
+      window: 2
     });
 
-    console.log('🔍 Code being checked:', code);
     console.log('🔍 Verification result:', verified);
 
     if (!verified) {
-      // Debug: mi lenne a helyes kód
       const currentToken = speakeasy.totp({
         secret: twoFAData.secret,
         encoding: 'base32'
       });
       console.log('❓ Current valid token would be:', currentToken);
-      console.log('⚠️ User entered:', code, '(did not match)');
       
       return res.status(400).json({
         success: false,
@@ -556,39 +814,6 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-app.post("/api/create-user", async (req, res) => {
-  try {
-    const { uid, email, name, displayName } = req.body;
-    
-    if (!uid || !email) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "UID és email szükséges" 
-      });
-    }
-
-    await db.collection("users").doc(uid).set({
-      email,
-      name: name || displayName || "User",
-      displayName: displayName || name || "User",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      twoFA: {
-        enabled: false,
-        secret: null,
-        backupCodes: [],
-      },
-    });
-
-    res.json({ 
-      success: true,
-      message: "User dokumentum létrehozva" 
-    });
-  } catch (error) {
-    console.error("Create user error:", error);
-    res.status(500).json({ success: false, message: "Szerver hiba" });
-  }
-});
-
 // ==================== SERVER START ====================
 
-app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Speakeasy TOTP)"));
+app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));

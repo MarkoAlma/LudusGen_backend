@@ -26,6 +26,9 @@ importers:
       firebase-admin:
         specifier: ^12.0.0
         version: 12.7.0
+      nodemailer:
+        specifier: ^8.0.0
+        version: 8.0.0
       qrcode:
         specifier: ^1.5.3
         version: 1.5.4
@@ -707,6 +710,10 @@ packages:
   node-forge@1.3.3:
     resolution: {integrity: sha512-rLvcdSyRCyouf6jcOIPe/BgwG/d7hKjzMKOas33/pHEr6gbq18IK9zV7DiPvzsz0oBJPme6qr6H6kGZuI9/DZg==}
     engines: {node: '>= 6.13.0'}
+
+  nodemailer@8.0.0:
+    resolution: {integrity: sha512-xvVJf/f0bzmNpnRIbhCp/IKxaHgJ6QynvUbLXzzMRPG3LDQr5oXkYuw4uDFyFYs8cge8agwwrJAXZsd4hhMquw==}
+    engines: {node: '>=6.0.0'}
 
   nodemon@3.1.11:
     resolution: {integrity: sha512-is96t8F/1//UHAjNPHpbsNY46ELPpftGUoSVNXwUfMk/qdjSylYrWSu1XavVTBOn526kFiOR733ATgNBCQyH0g==}
@@ -1855,6 +1862,8 @@ snapshots:
     optional: true
 
   node-forge@1.3.3: {}
+
+  nodemailer@8.0.0: {}
 
   nodemon@3.1.11:
     dependencies:
