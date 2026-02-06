@@ -606,10 +606,10 @@ app.get("/api/get-user/:userId", verifyFirebaseToken, async (req, res) => {
 app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
   try {
     const userId = req.userId;
-    const { name, displayName, phone, location, bio } = req.body;
+    const { name, displayName, bio } = req.body;
 
     console.log('📥 Update profile request for user:', userId);
-    console.log('📥 Received data:', { name, displayName, phone, location, bio });
+    console.log('📥 Received data:', { name, displayName, bio });
 
     // Validáció
     if (displayName !== undefined && (!displayName || displayName.trim().length < 2)) {
@@ -624,8 +624,6 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     
     if (name !== undefined) updateData.name = name.trim();
     if (displayName !== undefined) updateData.displayName = displayName.trim();
-    if (phone !== undefined) updateData.phone = phone.trim();
-    if (location !== undefined) updateData.location = location.trim();
     if (bio !== undefined) updateData.bio = bio.trim();
 
     // Ha nincs semmi frissítés
