@@ -514,47 +514,7 @@ app.post("/api/disable-2fa", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
-  try {
-    const userId = req.userId;
-    const { name, displayName, email, phone, location, bio } = req.body;
 
-    if (!name || name.trim().length < 2) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "A név legalább 2 karakter hosszú legyen" 
-      });
-    }
-
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Érvényes email címet adj meg" 
-      });
-    }
-
-    await db.collection("users").doc(userId).set(
-      {
-        name: name.trim(),
-        displayName: displayName.trim(),
-        email: email.trim(),
-        phone: phone?.trim() || "",
-        location: location?.trim() || "",
-        bio: bio?.trim() || "",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    res.json({ 
-      success: true,
-      message: "Profil sikeresen frissítve",
-    });
-  } catch (error) {
-    console.error("Update profile error:", error);
-    res.status(500).json({ success: false, message: "Szerver hiba" });
-  }
-});
 
 app.post("/api/create-user", async (req, res) => {
   try {
@@ -636,47 +596,62 @@ app.get("/api/get-user/:userId", verifyFirebaseToken, async (req, res) => {
 // ==================== PROTECTED ENDPOINTS ====================
 // Cseréld le a régi app.post("/api/update-profile"...) endpoint-ot erre:
 
+// ==================== PROTECTED ENDPOINTS ====================
+// Cseréld le a régi app.post("/api/update-profile"...) endpoint-ot erre:
+
+// ==================== PROTECTED ENDPOINTS - JAVÍTOTT VERZIÓ ====================
+
+// Cseréld le a meglévő app.post("/api/update-profile"...) kódot erre:
+
 app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
   try {
     const userId = req.userId;
     const { name, displayName, phone, location, bio } = req.body;
 
-    // Csak azokat a mezőket frissítjük, amiket elküldtek
-    const updatedData = {};
-    
-    if (name !== undefined && name.trim()) {
-      updatedData.name = name.trim();
+    console.log('📥 Update profile request for user:', userId);
+    console.log('📥 Received data:', { name, displayName, phone, location, bio });
+
+    // Validáció
+    if (displayName !== undefined && (!displayName || displayName.trim().length < 2)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "A név legalább 2 karakter hosszú legyen" 
+      });
     }
+
+    // Csak azokat az adatokat mentjük, amik jöttek a request-ben
+    const updateData = {};
     
-    if (displayName !== undefined && displayName.trim()) {
-      updatedData.displayName = displayName.trim();
+    if (name !== undefined) updateData.name = name.trim();
+    if (displayName !== undefined) updateData.displayName = displayName.trim();
+    if (phone !== undefined) updateData.phone = phone.trim();
+    if (location !== undefined) updateData.location = location.trim();
+    if (bio !== undefined) updateData.bio = bio.trim();
+
+    // Ha nincs semmi frissítés
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Nincs frissítendő adat" 
+      });
     }
+
+    updateData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
     
-    if (phone !== undefined) {
-      updatedData.phone = phone.trim();
-    }
+    console.log('💾 Saving to Firestore:', updateData);
     
-    if (location !== undefined) {
-      updatedData.location = location.trim();
-    }
-    
-    if (bio !== undefined) {
-      updatedData.bio = bio.trim();
-    }
-    
-    // Ha van bármilyen frissítés
-    if (Object.keys(updatedData).length > 0) {
-      updatedData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-      
-      await db.collection("users").doc(userId).set(
-        updatedData,
-        { merge: true }
-      );
-    }
+    await db.collection("users").doc(userId).set(
+      updateData,
+      { merge: true }
+    );
+
+    console.log('✅ Profile updated successfully');
 
     // Visszaküldjük a teljes frissített user adatokat
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
+
+    console.log('📤 Sending back updated user data');
 
     res.json({ 
       success: true,
@@ -687,8 +662,11 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error("Update profile error:", error);
-    res.status(500).json({ success: false, message: "Szerver hiba" });
+    console.error("❌ Update profile error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Szerver hiba" 
+    });
   }
 });
 // ==================== SERVER START ====================
