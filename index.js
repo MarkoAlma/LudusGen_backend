@@ -320,8 +320,10 @@ app.post("/api/register-user", async (req, res) => {
     
     // 2. Email verifikációs link generálása
     const verificationLink = await admin.auth().generateEmailVerificationLink(email, {
-      url: 'http://localhost:5173/signin', // Ide irányít az email link után
+      url: 'http://localhost:5173', // Ide irányít az email link után
     });
+    console.log(verificationLink);
+    
     
     console.log("📧 Email verification link generated");
     
