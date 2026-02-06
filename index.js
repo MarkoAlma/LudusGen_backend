@@ -6,6 +6,8 @@ import bodyParser from "body-parser";
 import admin from "firebase-admin";
 import { readFileSync } from "fs";
 import nodemailer from "nodemailer";
+import multer from 'multer';
+import { v2 as cloudinary } from 'cloudinary';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -14,6 +16,15 @@ app.use(cors());
 app.use(bodyParser.json());
 
 console.log('🔐 Using Speakeasy for TOTP (more reliable than otplib)');
+
+// ==================== CLOUDINARY CONFIG ====================
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+console.log('☁️ Cloudinary configured:', process.env.CLOUDINARY_CLOUD_NAME ? '✅' : '❌ Missing credentials');
 
 // ==================== FIREBASE ADMIN INIT ====================
 try {
@@ -243,6 +254,28 @@ function generateBackupCodes(count = 10) {
   }
   return codes;
 }
+
+// ==================== MULTER CONFIGURATION FOR FILE UPLOADS ====================
+
+// Memory storage for Cloudinary upload
+const storage = multer.memoryStorage();
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const mimetype = allowedTypes.test(file.mimetype);
+
+    if (mimetype) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Csak képfájlokat lehet feltölteni!'));
+    }
+  }
+});
 
 // ==================== PUBLIC ENDPOINTS ====================
 
@@ -479,7 +512,6 @@ app.post("/api/login-with-2fa", async (req, res) => {
       });
     }
 
-    // Speakeasy verify with window
     let isValid = speakeasy.totp.verify({
       secret: twoFAData.secret,
       encoding: 'base32',
@@ -487,7 +519,6 @@ app.post("/api/login-with-2fa", async (req, res) => {
       window: 2
     });
 
-    // Backup kód check
     if (!isValid && twoFAData.backupCodes.includes(code)) {
       isValid = true;
       const updatedBackupCodes = twoFAData.backupCodes.filter(bc => bc !== code);
@@ -522,6 +553,39 @@ app.post("/api/login-with-2fa", async (req, res) => {
     }
     
     console.error("Login 2FA error:", error);
+    res.status(500).json({ success: false, message: "Szerver hiba" });
+  }
+});
+
+app.post("/api/create-user", async (req, res) => {
+  try {
+    const { uid, email, name, displayName } = req.body;
+    
+    if (!uid || !email) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "UID és email szükséges" 
+      });
+    }
+
+    await db.collection("users").doc(uid).set({
+      email,
+      name: name || displayName || "User",
+      displayName: displayName || name || "User",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      twoFA: {
+        enabled: false,
+        secret: null,
+        backupCodes: [],
+      },
+    });
+
+    res.json({ 
+      success: true,
+      message: "User dokumentum létrehozva" 
+    });
+  } catch (error) {
+    console.error("Create user error:", error);
     res.status(500).json({ success: false, message: "Szerver hiba" });
   }
 });
@@ -772,45 +836,236 @@ app.post("/api/disable-2fa", verifyFirebaseToken, async (req, res) => {
   }
 });
 
+app.get("/api/get-user/:userId", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    if (userId !== req.userId) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Nincs jogosultságod ehhez az adathoz" 
+      });
+    }
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User nem található" 
+      });
+    }
+
+    const userData = userDoc.data();
+
+    res.json({ 
+      success: true,
+      user: {
+        ...userData,
+        uid: userId,
+      }
+    });
+  } catch (error) {
+    console.error("Get user error:", error);
+    res.status(500).json({ success: false, message: "Szerver hiba" });
+  }
+});
+
 app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
   try {
     const userId = req.userId;
-    const { name, displayName, email, phone, location, bio } = req.body;
+    const { name, displayName, bio } = req.body;
 
-    if (!name || name.trim().length < 2) {
+    console.log('📥 Update profile request for user:', userId);
+    console.log('📥 Received data:', { name, displayName, bio });
+
+    if (displayName !== undefined && (!displayName || displayName.trim().length < 2)) {
       return res.status(400).json({ 
         success: false, 
         message: "A név legalább 2 karakter hosszú legyen" 
       });
     }
 
-    if (!email || !email.includes('@')) {
+    const updateData = {};
+    
+    if (name !== undefined) updateData.name = name.trim();
+    if (displayName !== undefined) updateData.displayName = displayName.trim();
+    if (bio !== undefined) updateData.bio = bio.trim();
+
+    if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ 
         success: false, 
-        message: "Érvényes email címet adj meg" 
+        message: "Nincs frissítendő adat" 
       });
     }
 
+    updateData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+    
+    console.log('💾 Saving to Firestore:', updateData);
+    
+    await db.collection("users").doc(userId).set(
+      updateData,
+      { merge: true }
+    );
+
+    console.log('✅ Profile updated successfully');
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    console.log('📤 Sending back updated user data');
+
+    res.json({ 
+      success: true,
+      message: "Profil sikeresen frissítve",
+      user: {
+        ...userData,
+        uid: userId,
+      }
+    });
+  } catch (error) {
+    console.error("❌ Update profile error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Szerver hiba" 
+    });
+  }
+});
+
+// ==================== PROFILE PICTURE ENDPOINTS ====================
+
+app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('profilePicture'), async (req, res) => {
+  try {
+    const userId = req.userId;
+    
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Nincs feltöltött fájl" 
+      });
+    }
+
+    console.log('📸 Uploading profile picture to Cloudinary for user:', userId);
+    console.log('📁 File info:', {
+      originalname: req.file.originalname,
+      size: req.file.size,
+      mimetype: req.file.mimetype
+    });
+
+    // Get old profile picture to delete from Cloudinary
+    const userDoc = await db.collection("users").doc(userId).get();
+    const oldProfilePicture = userDoc.data()?.profilePicture;
+    const oldPublicId = userDoc.data()?.profilePicturePublicId;
+    
+    // Upload to Cloudinary
+    const uploadPromise = new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          folder: 'profile-pictures',
+          public_id: `user_${userId}_${Date.now()}`,
+          transformation: [
+            { width: 500, height: 500, crop: 'limit' },
+            { quality: 'auto' }
+          ]
+        },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      
+      uploadStream.end(req.file.buffer);
+    });
+
+    const cloudinaryResult = await uploadPromise;
+
+    console.log('☁️ Cloudinary upload successful:', cloudinaryResult.public_id);
+
+    // Delete old image from Cloudinary if exists
+    if (oldPublicId) {
+      try {
+        await cloudinary.uploader.destroy(oldPublicId);
+        console.log('🗑️ Old profile picture deleted from Cloudinary');
+      } catch (err) {
+        console.log('⚠️ Could not delete old image from Cloudinary:', err.message);
+      }
+    }
+
+    // Save new profile picture URL to Firestore
     await db.collection("users").doc(userId).set(
       {
-        name: name.trim(),
-        displayName: displayName.trim(),
-        email: email.trim(),
-        phone: phone?.trim() || "",
-        location: location?.trim() || "",
-        bio: bio?.trim() || "",
+        profilePicture: cloudinaryResult.secure_url,
+        profilePicturePublicId: cloudinaryResult.public_id,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
+    console.log('✅ Profile picture uploaded successfully');
+
     res.json({ 
       success: true,
-      message: "Profil sikeresen frissítve",
+      message: "Profilkép sikeresen feltöltve",
+      profilePictureUrl: cloudinaryResult.secure_url
     });
   } catch (error) {
-    console.error("Update profile error:", error);
-    res.status(500).json({ success: false, message: "Szerver hiba" });
+    console.error("❌ Upload profile picture error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || "Szerver hiba" 
+    });
+  }
+});
+
+app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    console.log('🗑️ Deleting profile picture for user:', userId);
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    const profilePicture = userDoc.data()?.profilePicture;
+    const publicId = userDoc.data()?.profilePicturePublicId;
+
+    if (!profilePicture) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Nincs profilkép a törléshez" 
+      });
+    }
+
+    // Delete from Cloudinary
+    if (publicId) {
+      try {
+        await cloudinary.uploader.destroy(publicId);
+        console.log('✅ Profile picture deleted from Cloudinary');
+      } catch (err) {
+        console.log('⚠️ Could not delete from Cloudinary:', err.message);
+      }
+    }
+
+    // Update Firestore
+    await db.collection("users").doc(userId).set(
+      {
+        profilePicture: admin.firestore.FieldValue.delete(),
+        profilePicturePublicId: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log('✅ Profile picture deleted successfully');
+
+    res.json({ 
+      success: true,
+      message: "Profilkép sikeresen törölve"
+    });
+  } catch (error) {
+    console.error("❌ Delete profile picture error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Szerver hiba" 
+    });
   }
 });
 
