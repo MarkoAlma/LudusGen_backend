@@ -583,6 +583,108 @@ app.post("/api/create-user", async (req, res) => {
   }
 });
 
+
+
+// Add ezt az endpoint-ot a PROTECTED ENDPOINTS részhez a backend-en
+
+app.get("/api/get-user/:userId", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Csak a saját adatait kérheti le
+    if (userId !== req.userId) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Nincs jogosultságod ehhez az adathoz" 
+      });
+    }
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User nem található" 
+      });
+    }
+
+    const userData = userDoc.data();
+
+    res.json({ 
+      success: true,
+      user: {
+        ...userData,
+        uid: userId,
+      }
+    });
+  } catch (error) {
+    console.error("Get user error:", error);
+    res.status(500).json({ success: false, message: "Szerver hiba" });
+  }
+});// ==================== PROTECTED ENDPOINTS ====================
+// ...előző kód...
+
+// ==================== PROTECTED ENDPOINTS ====================
+// Cseréld le a régi app.post("/api/update-profile"...) endpoint-ot erre:
+
+// ==================== PROTECTED ENDPOINTS ====================
+// Cseréld le a régi app.post("/api/update-profile"...) endpoint-ot erre:
+
+app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { name, displayName, phone, location, bio } = req.body;
+
+    // Csak azokat a mezőket frissítjük, amiket elküldtek
+    const updatedData = {};
+    
+    if (name !== undefined && name.trim()) {
+      updatedData.name = name.trim();
+    }
+    
+    if (displayName !== undefined && displayName.trim()) {
+      updatedData.displayName = displayName.trim();
+    }
+    
+    if (phone !== undefined) {
+      updatedData.phone = phone.trim();
+    }
+    
+    if (location !== undefined) {
+      updatedData.location = location.trim();
+    }
+    
+    if (bio !== undefined) {
+      updatedData.bio = bio.trim();
+    }
+    
+    // Ha van bármilyen frissítés
+    if (Object.keys(updatedData).length > 0) {
+      updatedData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+      
+      await db.collection("users").doc(userId).set(
+        updatedData,
+        { merge: true }
+      );
+    }
+
+    // Visszaküldjük a teljes frissített user adatokat
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.data();
+
+    res.json({ 
+      success: true,
+      message: "Profil sikeresen frissítve",
+      user: {
+        ...userData,
+        uid: userId,
+      }
+    });
+  } catch (error) {
+    console.error("Update profile error:", error);
+    res.status(500).json({ success: false, message: "Szerver hiba" });
+  }
+});
 // ==================== SERVER START ====================
 
 app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Speakeasy TOTP)"));
