@@ -5,6 +5,8 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import admin from "firebase-admin";
 import { readFileSync } from "fs";
+import multer from 'multer';
+import { v2 as cloudinary } from 'cloudinary';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -13,6 +15,15 @@ app.use(cors());
 app.use(bodyParser.json());
 
 console.log('🔐 Using Speakeasy for TOTP (more reliable than otplib)');
+
+// ==================== CLOUDINARY CONFIG ====================
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+console.log('☁️ Cloudinary configured:', process.env.CLOUDINARY_CLOUD_NAME ? '✅' : '❌ Missing credentials');
 
 // ==================== FIREBASE ADMIN INIT ====================
 try {
@@ -101,6 +112,28 @@ function generateBackupCodes(count = 10) {
   return codes;
 }
 
+// ==================== MULTER CONFIGURATION FOR FILE UPLOADS ====================
+
+// Memory storage for Cloudinary upload
+const storage = multer.memoryStorage();
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const mimetype = allowedTypes.test(file.mimetype);
+
+    if (mimetype) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Csak képfájlokat lehet feltölteni!'));
+    }
+  }
+});
+
 // ==================== PUBLIC ENDPOINTS ====================
 
 app.post("/api/check-2fa-required", async (req, res) => {
@@ -135,7 +168,6 @@ app.post("/api/check-2fa-required", async (req, res) => {
   }
 });
 
-// ✅ ÚJ: Validate password endpoint (NEM jelentkeztet be!)
 app.post("/api/validate-password", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -149,12 +181,6 @@ app.post("/api/validate-password", async (req, res) => {
 
     console.log("🔐 Validating password for:", email);
 
-    // Firebase Admin SDK-val nem tudjuk közvetlenül ellenőrizni a jelszót
-    // Ezért a Firebase Auth REST API-t használjuk
-    // Ez NEM hoz létre session-t, csak ellenőrzi a credentials-t
-    
-    // FONTOS: Add hozzá a FIREBASE_API_KEY-t a .env fájlhoz!
-    // Megtalálod: Firebase Console -> Project Settings -> Web API Key
     const firebaseApiKey = process.env.FIREBASE_API_KEY || "AIzaSyDummyKeyReplaceThis";
     
     const response = await fetch(
@@ -167,7 +193,7 @@ app.post("/api/validate-password", async (req, res) => {
         body: JSON.stringify({
           email,
           password,
-          returnSecureToken: true, // Kell token, de nem fogjuk használni
+          returnSecureToken: true,
         }),
       }
     );
@@ -177,7 +203,6 @@ app.post("/api/validate-password", async (req, res) => {
     if (response.ok) {
       console.log("✅ Password is valid for:", email);
       
-      // Ellenőrizzük az email verifikációt
       const userRecord = await admin.auth().getUserByEmail(email);
       if (!userRecord.emailVerified) {
         return res.status(401).json({ 
@@ -228,7 +253,6 @@ app.post("/api/login-with-2fa", async (req, res) => {
       });
     }
 
-    // Speakeasy verify with window
     let isValid = speakeasy.totp.verify({
       secret: twoFAData.secret,
       encoding: 'base32',
@@ -236,7 +260,6 @@ app.post("/api/login-with-2fa", async (req, res) => {
       window: 2
     });
 
-    // Backup kód check
     if (!isValid && twoFAData.backupCodes.includes(code)) {
       isValid = true;
       const updatedBackupCodes = twoFAData.backupCodes.filter(bc => bc !== code);
@@ -271,6 +294,39 @@ app.post("/api/login-with-2fa", async (req, res) => {
     }
     
     console.error("Login 2FA error:", error);
+    res.status(500).json({ success: false, message: "Szerver hiba" });
+  }
+});
+
+app.post("/api/create-user", async (req, res) => {
+  try {
+    const { uid, email, name, displayName } = req.body;
+    
+    if (!uid || !email) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "UID és email szükséges" 
+      });
+    }
+
+    await db.collection("users").doc(uid).set({
+      email,
+      name: name || displayName || "User",
+      displayName: displayName || name || "User",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      twoFA: {
+        enabled: false,
+        secret: null,
+        backupCodes: [],
+      },
+    });
+
+    res.json({ 
+      success: true,
+      message: "User dokumentum létrehozva" 
+    });
+  } catch (error) {
+    console.error("Create user error:", error);
     res.status(500).json({ success: false, message: "Szerver hiba" });
   }
 });
@@ -310,14 +366,13 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
     } else {
       console.log('🆕 Generating new secret with Speakeasy');
       
-      // Speakeasy secret generation
       const secretObj = speakeasy.generateSecret({
         name: `LudusGen (${userEmail})`,
         issuer: 'LudusGen',
         length: 32
       });
       
-      secret = secretObj.base32; // ⚠️ FONTOS: base32 encoding!
+      secret = secretObj.base32;
       backupCodes = generateBackupCodes();
 
       console.log('💾 Saving new secret to DB...');
@@ -330,21 +385,18 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
         backupCodes,
       });
 
-      // Verification
       const verification = await get2FAData(userId);
       console.log('✅ Secrets match:', verification?.secret === secret);
     }
 
     console.log('📝 Final secret length:', secret?.length);
     
-    // Test token generation
     const testToken = speakeasy.totp({
       secret: secret,
       encoding: 'base32'
     });
     console.log('🧪 Test token generated:', testToken);
 
-    // QR Code generation with otpauth URL
     const otpauthUrl = speakeasy.otpauthURL({
       secret: secret,
       label: userEmail,
@@ -360,7 +412,7 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
 
     res.json({
       qr,
-      secret,  // Dev only
+      secret,
       backupCodes,
     });
   } catch (error) {
@@ -411,19 +463,17 @@ app.post("/api/verify-mfa", verifyFirebaseToken, async (req, res) => {
     console.log('📝 Secret from DB:', twoFAData.secret);
     console.log('Secret length:', twoFAData.secret?.length);
 
-    // ⚠️ KRITIKUS: Speakeasy verify with window: 2
     const verified = speakeasy.totp.verify({
       secret: twoFAData.secret,
       encoding: 'base32',
       token: code,
-      window: 2  // ±60 másodperc tolerancia
+      window: 2
     });
 
     console.log('🔍 Code being checked:', code);
     console.log('🔍 Verification result:', verified);
 
     if (!verified) {
-      // Debug: mi lenne a helyes kód
       const currentToken = speakeasy.totp({
         secret: twoFAData.secret,
         encoding: 'base32'
@@ -508,50 +558,10 @@ app.post("/api/disable-2fa", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-
-
-app.post("/api/create-user", async (req, res) => {
-  try {
-    const { uid, email, name, displayName } = req.body;
-    
-    if (!uid || !email) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "UID és email szükséges" 
-      });
-    }
-
-    await db.collection("users").doc(uid).set({
-      email,
-      name: name || displayName || "User",
-      displayName: displayName || name || "User",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      twoFA: {
-        enabled: false,
-        secret: null,
-        backupCodes: [],
-      },
-    });
-
-    res.json({ 
-      success: true,
-      message: "User dokumentum létrehozva" 
-    });
-  } catch (error) {
-    console.error("Create user error:", error);
-    res.status(500).json({ success: false, message: "Szerver hiba" });
-  }
-});
-
-
-
-// Add ezt az endpoint-ot a PROTECTED ENDPOINTS részhez a backend-en
-
 app.get("/api/get-user/:userId", verifyFirebaseToken, async (req, res) => {
   try {
     const { userId } = req.params;
     
-    // Csak a saját adatait kérheti le
     if (userId !== req.userId) {
       return res.status(403).json({ 
         success: false, 
@@ -581,21 +591,7 @@ app.get("/api/get-user/:userId", verifyFirebaseToken, async (req, res) => {
     console.error("Get user error:", error);
     res.status(500).json({ success: false, message: "Szerver hiba" });
   }
-});// ==================== PROTECTED ENDPOINTS ====================
-// ...előző kód...
-
-// ==================== PROTECTED ENDPOINTS ====================
-// Cseréld le a régi app.post("/api/update-profile"...) endpoint-ot erre:
-
-// ==================== PROTECTED ENDPOINTS ====================
-// Cseréld le a régi app.post("/api/update-profile"...) endpoint-ot erre:
-
-// ==================== PROTECTED ENDPOINTS ====================
-// Cseréld le a régi app.post("/api/update-profile"...) endpoint-ot erre:
-
-// ==================== PROTECTED ENDPOINTS - JAVÍTOTT VERZIÓ ====================
-
-// Cseréld le a meglévő app.post("/api/update-profile"...) kódot erre:
+});
 
 app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
   try {
@@ -605,7 +601,6 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     console.log('📥 Update profile request for user:', userId);
     console.log('📥 Received data:', { name, displayName, bio });
 
-    // Validáció
     if (displayName !== undefined && (!displayName || displayName.trim().length < 2)) {
       return res.status(400).json({ 
         success: false, 
@@ -613,14 +608,12 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
       });
     }
 
-    // Csak azokat az adatokat mentjük, amik jöttek a request-ben
     const updateData = {};
     
     if (name !== undefined) updateData.name = name.trim();
     if (displayName !== undefined) updateData.displayName = displayName.trim();
     if (bio !== undefined) updateData.bio = bio.trim();
 
-    // Ha nincs semmi frissítés
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ 
         success: false, 
@@ -639,7 +632,6 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
 
     console.log('✅ Profile updated successfully');
 
-    // Visszaküldjük a teljes frissített user adatokat
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
@@ -661,6 +653,144 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     });
   }
 });
+
+// ==================== PROFILE PICTURE ENDPOINTS ====================
+
+app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('profilePicture'), async (req, res) => {
+  try {
+    const userId = req.userId;
+    
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Nincs feltöltött fájl" 
+      });
+    }
+
+    console.log('📸 Uploading profile picture to Cloudinary for user:', userId);
+    console.log('📁 File info:', {
+      originalname: req.file.originalname,
+      size: req.file.size,
+      mimetype: req.file.mimetype
+    });
+
+    // Get old profile picture to delete from Cloudinary
+    const userDoc = await db.collection("users").doc(userId).get();
+    const oldProfilePicture = userDoc.data()?.profilePicture;
+    const oldPublicId = userDoc.data()?.profilePicturePublicId;
+    
+    // Upload to Cloudinary
+    const uploadPromise = new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          folder: 'profile-pictures',
+          public_id: `user_${userId}_${Date.now()}`,
+          transformation: [
+            { width: 500, height: 500, crop: 'limit' },
+            { quality: 'auto' }
+          ]
+        },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      
+      uploadStream.end(req.file.buffer);
+    });
+
+    const cloudinaryResult = await uploadPromise;
+
+    console.log('☁️ Cloudinary upload successful:', cloudinaryResult.public_id);
+
+    // Delete old image from Cloudinary if exists
+    if (oldPublicId) {
+      try {
+        await cloudinary.uploader.destroy(oldPublicId);
+        console.log('🗑️ Old profile picture deleted from Cloudinary');
+      } catch (err) {
+        console.log('⚠️ Could not delete old image from Cloudinary:', err.message);
+      }
+    }
+
+    // Save new profile picture URL to Firestore
+    await db.collection("users").doc(userId).set(
+      {
+        profilePicture: cloudinaryResult.secure_url,
+        profilePicturePublicId: cloudinaryResult.public_id,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log('✅ Profile picture uploaded successfully');
+
+    res.json({ 
+      success: true,
+      message: "Profilkép sikeresen feltöltve",
+      profilePictureUrl: cloudinaryResult.secure_url
+    });
+  } catch (error) {
+    console.error("❌ Upload profile picture error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || "Szerver hiba" 
+    });
+  }
+});
+
+app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    console.log('🗑️ Deleting profile picture for user:', userId);
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    const profilePicture = userDoc.data()?.profilePicture;
+    const publicId = userDoc.data()?.profilePicturePublicId;
+
+    if (!profilePicture) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Nincs profilkép a törléshez" 
+      });
+    }
+
+    // Delete from Cloudinary
+    if (publicId) {
+      try {
+        await cloudinary.uploader.destroy(publicId);
+        console.log('✅ Profile picture deleted from Cloudinary');
+      } catch (err) {
+        console.log('⚠️ Could not delete from Cloudinary:', err.message);
+      }
+    }
+
+    // Update Firestore
+    await db.collection("users").doc(userId).set(
+      {
+        profilePicture: admin.firestore.FieldValue.delete(),
+        profilePicturePublicId: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log('✅ Profile picture deleted successfully');
+
+    res.json({ 
+      success: true,
+      message: "Profilkép sikeresen törölve"
+    });
+  } catch (error) {
+    console.error("❌ Delete profile picture error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Szerver hiba" 
+    });
+  }
+});
+
 // ==================== SERVER START ====================
 
 app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Speakeasy TOTP)"));
