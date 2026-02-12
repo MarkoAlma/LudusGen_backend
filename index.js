@@ -594,34 +594,76 @@ app.post("/api/create-user", async (req, res) => {
 
 // ==================== PROTECTED ENDPOINTS ====================
 
-app.get("/api/get-user/:uid", verifyFirebaseToken, async (req, res) => {
+// Backend: /api/get-user/:uid módosítása
+app.get("/api/get-user/:uid", async (req, res) => {
   try {
     const { uid } = req.params;
+    const token = req.headers.authorization?.split("Bearer ")[1];
+
+    if (!token) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Token hiányzik" 
+      });
+    }
+
+    // Token verifikálás
+    const decodedToken = await admin.auth().verifyIdToken(token);
     
-    // Csak a saját adatait kérheti le
-    if (uid !== req.userId) {
+    if (decodedToken.uid !== uid) {
       return res.status(403).json({ 
         success: false, 
-        message: "Nincs jogosultság" 
+        message: "Hozzáférés megtagadva" 
       });
     }
-    
-    const doc = await db.collection("users").doc(uid).get();
-    
-    if (!doc.exists) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "User nem található" 
+
+    const userDocRef = admin.firestore().collection("users").doc(uid);
+    const userDoc = await userDocRef.get();
+
+    // 🔥 HA NEM LÉTEZIK, HOZZUK LÉTRE
+    if (!userDoc.exists) {
+      console.log("⚠️ User document not found, creating it now for:", uid);
+      
+      const userRecord = await admin.auth().getUser(uid);
+      const isGoogleProvider = userRecord.providerData.some(
+        p => p.providerId === 'google.com'
+      );
+
+      await userDocRef.set({
+        email: userRecord.email,
+        displayName: userRecord.displayName || "",
+        name: userRecord.displayName || "",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        provider: isGoogleProvider ? "google" : "email",
+        photoURL: userRecord.photoURL || null,
+        twoFA: {
+          enabled: false,
+          secret: null,
+          backupCodes: []
+        }
+      });
+
+      console.log("✅ User document created for:", userRecord.email);
+
+      // Frissen létrehozott dokumentum visszaadása
+      const newUserDoc = await userDocRef.get();
+      return res.json({ 
+        success: true, 
+        user: newUserDoc.data() 
       });
     }
-    
+
     res.json({ 
-      success: true,
-      user: doc.data()
+      success: true, 
+      user: userDoc.data() 
     });
+
   } catch (error) {
-    console.error("Get user error:", error);
-    res.status(500).json({ success: false, message: "Szerver hiba" });
+    console.error("Error in get-user:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Szerver hiba" 
+    });
   }
 });
 
@@ -1015,6 +1057,290 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
     res.status(500).json({ 
       success: false, 
       message: error.message || "Szerver hiba" 
+    });
+  }
+});
+
+// // ✅ GOOGLE TOKEN VALIDÁLÁS + FIRESTORE DOKUMENTUM LÉTREHOZÁS + SESSION TÁROLÁS
+// app.post("/api/validate-google-token", async (req, res) => {
+//   try {
+//     const { googleToken, email } = req.body;
+    
+//     if (!googleToken || !email) {
+//       return res.status(400).json({ 
+//         success: false, 
+//         message: "Google token és email szükséges" 
+//       });
+//     }
+
+//     console.log("🔐 Validating Google token for:", email);
+
+//     // Google token verifikálása
+//     const decodedToken = await admin.auth().verifyIdToken(googleToken);
+    
+//     if (decodedToken.email !== email) {
+//       return res.status(401).json({ 
+//         success: false, 
+//         message: "Email nem egyezik" 
+//       });
+//     }
+
+//     const userRecord = await admin.auth().getUserByEmail(email);
+
+//     if (userRecord.email !== email) {
+//       return res.status(400).json({ 
+//         success: false, 
+//         message: "Email mismatch" 
+//       });
+//     }
+    
+//     if (!userRecord.emailVerified) {
+//       return res.status(401).json({ 
+//         success: false, 
+//         message: "Nincs megerősítve az email!" 
+//       });
+//     }
+
+//     console.log("✅ Google token is valid for:", email);
+
+//     // 🔥 FIRESTORE DOKUMENTUM LÉTREHOZÁSA (ha még nincs)
+//     const userDocRef = admin.firestore().collection("users").doc(decodedToken.uid);
+//     const userDoc = await userDocRef.get();
+
+//     if (!userDoc.exists) {
+//       await userDocRef.set({
+//         email,
+//         displayName: userRecord.displayName || "",
+//         name: userRecord.displayName || "",
+//         createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//         provider: "google",
+//         photoURL: userRecord.photoURL || null,
+//         twoFA: {
+//           enabled: false,
+//           secret: null,
+//           backupCodes: []
+//         }
+//       });
+//       console.log("✅ Google user document created in Firestore for:", email);
+//     } else {
+//       console.log("✅ Google user document already exists for:", email);
+//     }
+    
+//     // ✅ TÁROLJUK A SESSION-T 2FA-hoz (mint az emailes verzióban)
+//     const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+//     // In-memory tárolás (production-ben használj Redis-t!)
+//     pendingAuth.set(sessionId, {
+//       email,
+//       googleToken,
+//       uid: decodedToken.uid,
+//       timestamp: Date.now(),
+//       provider: 'google'
+//     });
+    
+//     res.json({ 
+//       success: true,
+//       message: "Google token helyes",
+//       sessionId  // ← Ezt add vissza a frontend-nek
+//     });
+    
+//   } catch (error) {
+//     console.error("❌ Google token validation error:", error);
+//     res.status(500).json({ 
+//       success: false, 
+//       message: "Google token érvénytelen" 
+//     });
+//   }
+// });
+
+// ==================== IN-MEMORY SESSION STORAGE ====================
+const pendingAuth = new Map();
+
+// Cleanup régi sessionök
+setInterval(() => {
+  const now = Date.now();
+  const fiveMinutes = 5 * 60 * 1000;
+  
+  for (const [sessionId, sessionData] of pendingAuth.entries()) {
+    if (now - sessionData.timestamp > fiveMinutes) {
+      pendingAuth.delete(sessionId);
+      console.log(`🗑️ Expired session deleted: ${sessionId}`);
+    }
+  }
+}, 60 * 1000);
+
+// ✅ GOOGLE 2FA LOGIN
+app.post("/api/login-with-2fa-google", async (req, res) => {
+  try {
+    const { sessionId, code } = req.body;
+    
+    console.log("🔐 Google 2FA Login attempt with sessionId:", sessionId);
+    
+    if (!sessionId || !code) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "SessionId és kód szükséges" 
+      });
+    }
+
+    const session = pendingAuth.get(sessionId);
+    
+    if (!session) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Lejárt vagy érvénytelen session" 
+      });
+    }
+
+    if (session.provider !== 'google') {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Ez a session nem Google bejelentkezéshez tartozik" 
+      });
+    }
+
+    const userId = session.uid;
+    const twoFAData = await get2FAData(userId);
+    
+    if (!twoFAData || !twoFAData.is2FAEnabled) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "2FA nincs engedélyezve" 
+      });
+    }
+
+    let isValid = speakeasy.totp.verify({
+      secret: twoFAData.secret,
+      encoding: 'base32',
+      token: code,
+      window: 2
+    });
+
+    if (!isValid && twoFAData.backupCodes.includes(code)) {
+      isValid = true;
+      const updatedBackupCodes = twoFAData.backupCodes.filter(bc => bc !== code);
+      await save2FAData(userId, {
+        ...twoFAData,
+        backupCodes: updatedBackupCodes,
+      });
+      console.log(`✅ Backup kód használva. Megmaradt: ${updatedBackupCodes.length}`);
+    }
+
+    if (isValid) {
+      const customToken = await admin.auth().createCustomToken(userId);
+      pendingAuth.delete(sessionId);
+      
+      res.json({ 
+        success: true,
+        message: "Sikeres 2FA validáció",
+        customToken: customToken,
+        remainingBackupCodes: twoFAData.backupCodes?.length || 0,
+      });
+    } else {
+      res.status(400).json({ 
+        success: false, 
+        message: "Érvénytelen kód" 
+      });
+    }
+  } catch (error) {
+    console.error("❌ Google 2FA login error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Szerver hiba" 
+    });
+  }
+});
+
+// ✅ GOOGLE SESSION VALIDÁLÁS - FIREBASE ID TOKEN-NEL
+app.post("/api/validate-google-session", async (req, res) => {
+  try {
+    const { firebaseIdToken, email } = req.body;
+    
+    if (!firebaseIdToken || !email) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Firebase token és email szükséges" 
+      });
+    }
+
+    console.log("🔐 Validating Firebase token for Google user:", email);
+
+    // ✅ Firebase ID token verifikálása (ez most működni fog!)
+    const decodedToken = await admin.auth().verifyIdToken(firebaseIdToken);
+    
+    if (decodedToken.email !== email) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Email nem egyezik" 
+      });
+    }
+
+    const userRecord = await admin.auth().getUser(decodedToken.uid);
+    
+    if (!userRecord.emailVerified) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Nincs megerősítve az email!" 
+      });
+    }
+
+    console.log("✅ Firebase token is valid for:", email);
+
+    // 🔥 FIRESTORE DOKUMENTUM LÉTREHOZÁSA (ha még nincs)
+    const userDocRef = admin.firestore().collection("users").doc(decodedToken.uid);
+    
+    // Transaction használata race condition ellen
+    await admin.firestore().runTransaction(async (transaction) => {
+      const doc = await transaction.get(userDocRef);
+      
+      if (!doc.exists) {
+        const isGoogleProvider = userRecord.providerData.some(
+          p => p.providerId === 'google.com'
+        );
+
+        transaction.set(userDocRef, {
+          email,
+          displayName: userRecord.displayName || "",
+          name: userRecord.displayName || "",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          provider: isGoogleProvider ? "google" : "email",
+          photoURL: userRecord.photoURL || null,
+          twoFA: {
+            enabled: false,
+            secret: null,
+            backupCodes: []
+          }
+        });
+        
+        console.log("✅ Google user document created in Firestore for:", email);
+      } else {
+        console.log("✅ Google user document already exists for:", email);
+      }
+    });
+    
+    // ✅ SESSION TÁROLÁS 2FA-hoz
+    const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    pendingAuth.set(sessionId, {
+      email,
+      uid: decodedToken.uid,
+      timestamp: Date.now(),
+      provider: 'google'
+    });
+    
+    console.log("✅ Session created:", sessionId);
+    
+    res.json({ 
+      success: true,
+      message: "Session létrehozva",
+      sessionId
+    });
+    
+  } catch (error) {
+    console.error("❌ Google session validation error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Token érvénytelen" 
     });
   }
 });
