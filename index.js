@@ -54,6 +54,8 @@ const transporter = nodemailer.createTransport({
   }
 });
 
+
+
 // ✅ VERIFY CONNECTION
 transporter.verify(function (error, success) {
   if (error) {
@@ -62,6 +64,104 @@ transporter.verify(function (error, success) {
     console.log('✅ SMTP server is ready to send emails');
   }
 });
+
+async function sendForgotPasswordEmail(email, resetLink, displayName) {
+  const mailOptions = {
+    from: {
+      name: 'LudusGen',
+      address: process.env.EMAIL_USER
+    },
+    to: email,
+    subject: 'Jelszó visszaállítása - LudusGen',
+    text: `Jelszó visszaállítási kérelem érkezett a fiókodhoz. Kattints az alábbi linkre: ${resetLink}`,
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+        <table role="presentation" style="width: 100%; border-collapse: collapse;">
+          <tr>
+            <td align="center" style="padding: 40px 0;">
+              <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                <!-- Header -->
+                <tr>
+                  <td style="padding: 40px 40px 20px 40px; text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 8px 8px 0 0;">
+                    <h1 style="margin: 0; color: #ffffff; font-size: 28px;">🎮 LudusGen</h1>
+                  </td>
+                </tr>
+
+                <!-- Content -->
+                <tr>
+                  <td style="padding: 40px;">
+                    <h2 style="margin: 0 0 20px 0; color: #333333; font-size: 24px;">
+                      Jelszó visszaállítása 🔐
+                    </h2>
+
+                    <p style="margin: 0 0 20px 0; color: #666666; font-size: 16px; line-height: 1.6;">
+                      Szia${displayName ? ` ${displayName}` : ''}! Jelszó visszaállítási kérelem érkezett a fiókoddal kapcsolatban.
+                    </p>
+
+                    <p style="margin: 0 0 30px 0; color: #666666; font-size: 16px; line-height: 1.6;">
+                      Kattints az alábbi gombra az új jelszó beállításához:
+                    </p>
+
+                    <!-- Button -->
+                    <table role="presentation" style="margin: 0 auto;">
+                      <tr>
+                        <td style="border-radius: 6px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                          <a href="${resetLink}" target="_blank" style="
+                            display: inline-block;
+                            padding: 16px 40px;
+                            color: #ffffff;
+                            text-decoration: none;
+                            font-size: 16px;
+                            font-weight: bold;
+                            border-radius: 6px;
+                          ">
+                            🔑 Jelszó visszaállítása
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+
+                    <p style="margin: 30px 0 20px 0; color: #999999; font-size: 14px; line-height: 1.6;">
+                      Ha a gomb nem működik, másold be ezt a linket a böngészőbe:
+                    </p>
+
+                    <p style="margin: 0 0 30px 0; padding: 15px; background-color: #f8f8f8; border-radius: 4px; word-break: break-all; color: #666666; font-size: 13px; font-family: monospace;">
+                      ${resetLink}
+                    </p>
+
+                    <hr style="border: none; border-top: 1px solid #eeeeee; margin: 30px 0;">
+
+                    <p style="margin: 0; color: #999999; font-size: 13px; line-height: 1.6;">
+                      ⚠️ Ha nem te kérted a jelszó visszaállítását, hagyd figyelmen kívül ezt az emailt. A link 1 óra múlva lejár.
+                    </p>
+                  </td>
+                </tr>
+
+                <!-- Footer -->
+                <tr>
+                  <td style="padding: 30px 40px; background-color: #f8f8f8; border-radius: 0 0 8px 8px; text-align: center;">
+                    <p style="margin: 0; color: #999999; font-size: 12px;">
+                      © ${new Date().getFullYear()} LudusGen. Minden jog fenntartva.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
+    `,
+  };
+
+  await transporter.sendMail(mailOptions);
+}
 
 // Email küldő függvény
 async function sendVerificationEmail(email, verificationLink, displayName) {
@@ -1342,6 +1442,34 @@ app.post("/api/validate-google-session", async (req, res) => {
       success: false, 
       message: "Token érvénytelen" 
     });
+  }
+});
+
+app.post('/api/forgot-password', async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    // 1. Ellenőrzd hogy létezik-e a user (Firebase Admin)
+    let userRecord;
+    try {
+      userRecord = await admin.auth().getUserByEmail(email);
+    } catch (err) {
+      // Ha nem létezik, ne áruljuk el - biztonsági okból
+      return res.status(200).json({ message: 'Ha létezik a fiók, kiküldtük az emailt.' });
+    }
+
+    // 2. Firebase generálja a reset linket (automatikusan kezeli a tokent)
+    const resetLink = await admin.auth().generatePasswordResetLink(email, {
+      url: `http://localhost:5173`, // ide irányít vissza reset után
+    });
+
+    // 3. Küldd ki az emailt Nodemailerrel
+    await sendForgotPasswordEmail(email, resetLink, userRecord.displayName);
+
+    res.status(200).json({ message: 'Ha létezik a fiók, kiküldtük az emailt.' });
+  } catch (error) {
+    console.error('❌ Forgot password error:', error);
+    res.status(500).json({ error: 'Szerverhiba.' });
   }
 });
 
