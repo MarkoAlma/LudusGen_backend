@@ -1,21 +1,29 @@
-import speakeasy from "speakeasy";
-import QRCode from "qrcode";
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
+import dotenv from "dotenv";
+import speakeasy from "speakeasy";
+import QRCode from "qrcode";
 import admin from "firebase-admin";
 import { readFileSync } from "fs";
 import nodemailer from "nodemailer";
-import multer from 'multer';
-import { v2 as cloudinary } from 'cloudinary';
-import dotenv from 'dotenv';
+import multer from "multer";
+import { v2 as cloudinary } from "cloudinary";
+
+import aiRoutes from './ai-routes.js';
+
 dotenv.config();
 
-const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+const app = express();          // Initialize app first
 
-console.log('🔐 Using Speakeasy for TOTP (more reliable than otplib)');
+// Middlewares
+app.use(cors({
+  origin: ['http://localhost:5173', 'http://localhost:3001'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
+app.use(bodyParser.json());
+app.use('/api', aiRoutes);     // Add routes after middlewares
 
 // ==================== CLOUDINARY CONFIG ====================
 cloudinary.config({
@@ -1530,101 +1538,3 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
 app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));
 
 
-
-import { fal } from "@fal-ai/client";
-
-// Fal.ai kliens konfigurálása
-fal.config({
-  credentials: process.env.FAL_KEY,
-});
-
-// Kép feltöltés Fal.ai storage-ba (publikus URL-lé alakítja)
-app.post("/api/upload-to-fal", verifyFirebaseToken, async (req, res) => {
-  try {
-    const { base64Image, mimeType } = req.body;
-    
-    // Base64 → Buffer → File
-    const buffer = Buffer.from(base64Image, 'base64');
-    const blob = new Blob([buffer], { type: mimeType });
-    const file = new File([blob], `image_${Date.now()}.png`, { type: mimeType });
-    
-    const uploadedUrl = await fal.storage.upload(file);
-    
-    res.json({ success: true, url: uploadedUrl });
-  } catch (error) {
-    console.error("Upload error:", error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// TRELLIS.2 generálás indítása
-app.post("/api/trellis2-generate", verifyFirebaseToken, async (req, res) => {
-  try {
-    const { imageUrl, resolution = "1024", ssGuidance = 7.5, slatGuidance = 3.0 } = req.body;
-
-    const result = await fal.subscribe("fal-ai/trellis-2", {
-      input: {
-        image_url: imageUrl,
-        // Opcionális paraméterek:
-        // ss_guidance_strength: ssGuidance,
-        // slat_guidance_strength: slatGuidance,
-      },
-      logs: true,
-      onQueueUpdate: (update) => {
-        console.log("TRELLIS.2 status:", update.status);
-      },
-    });
-
-    res.json({
-      success: true,
-      glbUrl: result.data.model_glb?.url,
-      requestId: result.requestId,
-    });
-  } catch (error) {
-    console.error("TRELLIS.2 generation error:", error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Aszinkron verzió (hosszú generáláshoz, webhook-kal)
-app.post("/api/trellis2-submit", verifyFirebaseToken, async (req, res) => {
-  try {
-    const { imageUrl, resolution = "1024" } = req.body;
-
-    const { request_id } = await fal.queue.submit("fal-ai/trellis-2", {
-      input: { image_url: imageUrl },
-    });
-
-    res.json({ success: true, requestId: request_id });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Státusz lekérdezés
-app.get("/api/trellis2-status/:requestId", verifyFirebaseToken, async (req, res) => {
-  try {
-    const status = await fal.queue.status("fal-ai/trellis-2", {
-      requestId: req.params.requestId,
-      logs: true,
-    });
-    res.json({ success: true, status });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Eredmény lekérése kész generáláshoz
-app.get("/api/trellis2-result/:requestId", verifyFirebaseToken, async (req, res) => {
-  try {
-    const result = await fal.queue.result("fal-ai/trellis-2", {
-      requestId: req.params.requestId,
-    });
-    res.json({
-      success: true,
-      glbUrl: result.data.model_glb?.url,
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
