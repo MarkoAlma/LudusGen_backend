@@ -1,21 +1,29 @@
-import speakeasy from "speakeasy";
-import QRCode from "qrcode";
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
+import dotenv from "dotenv";
+import speakeasy from "speakeasy";
+import QRCode from "qrcode";
 import admin from "firebase-admin";
 import { readFileSync } from "fs";
 import nodemailer from "nodemailer";
-import multer from 'multer';
-import { v2 as cloudinary } from 'cloudinary';
-import dotenv from 'dotenv';
+import multer from "multer";
+import { v2 as cloudinary } from "cloudinary";
+
+import aiRoutes from './ai-routes.js';
+
 dotenv.config();
 
-const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+const app = express();          // Initialize app first
 
-console.log('🔐 Using Speakeasy for TOTP (more reliable than otplib)');
+// Middlewares
+app.use(cors({
+  origin: ['http://localhost:5173', 'http://localhost:3001'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
+app.use(bodyParser.json());
+app.use('/api', aiRoutes);     // Add routes after middlewares
 
 // ==================== CLOUDINARY CONFIG ====================
 cloudinary.config({
@@ -1528,3 +1536,5 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
 // ==================== SERVER START ====================
 
 app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));
+
+
