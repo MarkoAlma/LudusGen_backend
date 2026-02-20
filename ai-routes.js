@@ -165,6 +165,173 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
             return res.json({ success: true, content, usage });
         }
+        else if (provider === 'groq') {
+    if (!process.env.GROQ_API_KEY) {
+        return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
+    }
+
+    const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    let streamResp;
+    try {
+        streamResp = await axios.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            {
+                model,
+                messages: chatMsgs,
+                temperature: Math.min(Math.max(0, temperature), 2),
+                max_tokens: safeMax,
+                top_p: Math.min(Math.max(0, top_p), 1),
+                stream: true,
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+                responseType: 'stream',
+                timeout: 60000,
+            }
+        );
+    } catch (err) {
+        console.error('Groq hiba:', err.response?.data || err.message);
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        return res.end();
+    }
+
+    let totalContent = '';
+    let buf = '';
+
+    streamResp.data.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data: ')) continue;
+            const raw = trimmed.slice(6);
+            if (raw === '[DONE]') continue;
+            try {
+                const parsed = JSON.parse(raw);
+                const delta = parsed.choices?.[0]?.delta?.content || '';
+                if (delta) {
+                    totalContent += delta;
+                    res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                }
+            } catch {}
+        }
+    });
+
+    streamResp.data.on('end', async () => {
+        res.write('data: [DONE]\n\n');
+        res.end();
+        await logUsage(req.userId, 'chat', { model, provider: 'groq', tokens: totalContent.length });
+    });
+
+    streamResp.data.on('error', (err) => {
+        res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+        res.end();
+    });
+
+    return;
+}
+
+
+        else if (provider === 'gemini') {
+    if (!process.env.GEMINI_API_KEY) {
+        return res.status(500).json({ success: false, message: 'GEMINI_API_KEY nincs beállítva' });
+    }
+
+    // OpenAI messages → Gemini contents konverzió
+    const systemMsg = messages.find((m) => m.role === 'system');
+    const contents = messages
+        .filter((m) => m.role !== 'system')
+        .map((m) => ({
+            role: m.role === 'assistant' ? 'model' : 'user',  // Gemini "model"-t használ "assistant" helyett
+            parts: [{ text: String(m.content) }],
+        }));
+
+    // SSE fejlécek
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    let streamResp;
+    try {
+        // :streamGenerateContent?alt=sse → valós idejű streaming
+        streamResp = await axios.post(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
+            {
+                contents,
+                ...(systemMsg ? {
+                    systemInstruction: { parts: [{ text: systemMsg.content }] }
+                } : {}),
+                generationConfig: {
+                    temperature: Math.min(Math.max(0, temperature), 2),
+                    maxOutputTokens: safeMax,
+                    topP: Math.min(Math.max(0, top_p), 1),
+                },
+            },
+            {
+                headers: {
+                    'x-goog-api-key': process.env.GEMINI_API_KEY,
+                    'Content-Type': 'application/json',
+                },
+                responseType: 'stream',
+                timeout: 60000,
+            }
+        );
+    } catch (err) {
+        console.error('Gemini kapcsolódási hiba:', err.message);
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        return res.end();
+    }
+
+    let totalContent = '';
+    let buf = '';
+
+    streamResp.data.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data: ')) continue;
+            const raw = trimmed.slice(6);
+            try {
+                const parsed = JSON.parse(raw);
+                // Gemini válasz struktúra: candidates[0].content.parts[0].text
+                const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                if (delta) {
+                    totalContent += delta;
+                    res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                }
+            } catch {}
+        }
+    });
+
+    streamResp.data.on('end', async () => {
+        res.write('data: [DONE]\n\n');
+        res.end();
+        await logUsage(req.userId, 'chat', { model, provider: 'gemini', tokens: totalContent.length });
+    });
+
+    streamResp.data.on('error', (err) => {
+        console.error('Gemini stream hiba:', err.message);
+        res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+        res.end();
+    });
+
+    return;
+}
 
         // ── OpenRouter — SSE Streaming ────────────────────
         else if (provider === 'openrouter') {
