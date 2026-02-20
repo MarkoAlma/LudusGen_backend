@@ -216,6 +216,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             let totalContent = '';
             let buf = '';
+            
 
             streamResp.data.on('data', (chunk) => {
                 buf += chunk.toString('utf8');
