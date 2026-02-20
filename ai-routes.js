@@ -192,24 +192,25 @@ else if (provider === 'openrouter') {
     console.log("MODEL:", model);
     console.log("API KEY:", process.env.OPENROUTER_API_KEY ? "OK" : "NINCS");
         
-const response = await axios.post(
-    'https://openrouter.ai/api/v1/chat/completions',
-    {
-        model,
-        messages: chatMsgs,
-        temperature: Math.min(Math.max(0, temperature), 2),
-        max_tokens: safeMax,
-        top_p: Math.min(Math.max(0, top_p), 1),
-        stream: false
+    const response = await axios.post(
+  'https://openrouter.ai/api/v1/chat/completions',
+  {
+    model,
+    messages: chatMsgs,
+    temperature: Math.min(Math.max(0, temperature), 2),
+    max_tokens: safeMax,
+    top_p: Math.min(Math.max(0, top_p), 1),
+    stream: false,
+  },
+  {
+    headers: {
+      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'http://localhost:5173', // OpenRouter requires this
     },
-    {
-        headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        httpsAgent,   // 👈 EZ FONTOS
-        timeout: 10000
-    }
+    // httpsAgent,  ← comment out to test
+    timeout: 15000, // ← increase from 10s to 30s
+  }
 );
 
 
