@@ -10,14 +10,11 @@ import dns from "dns";
 dns.setDefaultResultOrder("ipv4first");
 import https from "https";
 
-const httpsAgent = new https.Agent({
-  family: 4
-});
+const httpsAgent = new https.Agent({ family: 4 });
 
 dotenv.config();
 
 const router = express.Router();
-
 
 // ── .env változók ellenőrzése induláskor ──────────────
 const REQUIRED_KEYS = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'FAL_KEY', 'OPENROUTER_API_KEY', 'DEEPSEEK_API_KEY'];
@@ -26,17 +23,10 @@ REQUIRED_KEYS.forEach((key) => {
 });
 
 // ── API kliensek inicializálása ───────────────────────
-const anthropic = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY,
-});
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-});
-
-fal.config({
-    credentials: process.env.FAL_KEY,
-});
+fal.config({ credentials: process.env.FAL_KEY });
 
 // ── Firebase Auth middleware ──────────────────────────
 const verifyFirebaseToken = async (req, res, next) => {
@@ -78,19 +68,17 @@ const audioLimiter = rateLimit({
 
 // ── Firestore usage log ───────────────────────────────
 async function logUsage(userId, type, meta = {}) {
-  try {
-    // undefined mezők kiszűrése
-    const cleanMeta = Object.fromEntries(
-      Object.entries(meta).filter(([, v]) => v !== undefined && v !== null)
-    );
-
-    await admin.firestore().collection('usage_logs').add({
-      userId, type, ...cleanMeta,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  } catch (e) {
-    console.warn('Usage log failed:', e.message);
-  }
+    try {
+        const cleanMeta = Object.fromEntries(
+            Object.entries(meta).filter(([, v]) => v !== undefined && v !== null)
+        );
+        await admin.firestore().collection('usage_logs').add({
+            userId, type, ...cleanMeta,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+    } catch (e) {
+        console.warn('Usage log failed:', e.message);
+    }
 }
 
 // ════════════════════════════════════════════════════
@@ -121,7 +109,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         let content = '';
         let usage = {};
 
-            console.log("kugyafaja provie",provider);
         // ── Anthropic ────────────────────────────────────
         if (provider === 'anthropic') {
             if (!process.env.ANTHROPIC_API_KEY) {
@@ -147,6 +134,9 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 output_tokens: resp.usage?.output_tokens || 0,
                 total_tokens: (resp.usage?.input_tokens || 0) + (resp.usage?.output_tokens || 0),
             };
+
+            await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
+            return res.json({ success: true, content, usage });
         }
 
         // ── OpenAI ───────────────────────────────────────
@@ -171,87 +161,112 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 output_tokens: resp.usage?.completion_tokens || 0,
                 total_tokens: resp.usage?.total_tokens || 0,
             };
+
+            await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
+            return res.json({ success: true, content, usage });
         }
 
-        // ── OpenRouter ───────────────────────────────────
+        // ── OpenRouter — SSE Streaming ────────────────────
+        else if (provider === 'openrouter') {
+            if (!process.env.OPENROUTER_API_KEY) {
+                return res.status(500).json({ success: false, message: 'OPENROUTER_API_KEY nincs beállítva a .env-ben' });
+            }
 
-else if (provider === 'openrouter') {
+            const chatMsgs = messages.map((m) => ({
+                role: m.role,
+                content: String(m.content),
+            }));
 
-    if (!process.env.OPENROUTER_API_KEY) {
-        return res.status(500).json({ success: false, message: 'OPENROUTER_API_KEY nincs beállítva a .env-ben' });
-    }
+            // SSE fejlécek — a tokenek azonnal folynak a kliensnek
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
 
-    const chatMsgs = messages.map((m) => ({
-        role: m.role,
-        content: String(m.content)
-    }));
+            let streamResp;
+            try {
+                streamResp = await axios.post(
+                    'https://openrouter.ai/api/v1/chat/completions',
+                    {
+                        model,
+                        messages: chatMsgs,
+                        temperature: Math.min(Math.max(0, temperature), 2),
+                        max_tokens: safeMax,
+                        top_p: Math.min(Math.max(0, top_p), 1),
+                        stream: true,
+                    },
+                    {
+                        headers: {
+                            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                            'Content-Type': 'application/json',
+                            'HTTP-Referer': process.env.SITE_URL || 'http://localhost:5173',
+                            'X-Title': 'AI Chat App',
+                        },
+                        httpsAgent,
+                        responseType: 'stream',
+                        timeout: 120000,
+                    }
+                );
+            } catch (err) {
+                console.error('OpenRouter kapcsolódási hiba:', err.message);
+                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                return res.end();
+            }
 
-        console.log("kutya");
-    try {
-    console.log("➡️ AXIOS ELŐTT");
-    console.log("MODEL:", model);
-    console.log("API KEY:", process.env.OPENROUTER_API_KEY ? "OK" : "NINCS");
-        
-    const response = await axios.post(
-  'https://openrouter.ai/api/v1/chat/completions',
-  {
-    model,
-    messages: chatMsgs,
-    temperature: Math.min(Math.max(0, temperature), 2),
-    max_tokens: safeMax,
-    top_p: Math.min(Math.max(0, top_p), 1),
-    stream: false,
-  },
-  {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'http://localhost:5173', // OpenRouter requires this
-    },
-    // httpsAgent,  ← comment out to test
-    timeout: 15000, // ← increase from 10s to 30s
-  }
-);
+            let totalContent = '';
+            let buf = '';
 
+            streamResp.data.on('data', (chunk) => {
+                buf += chunk.toString('utf8');
+                const lines = buf.split('\n');
+                buf = lines.pop(); // utolsó (esetleg csonka) sor visszatartva
 
-const data = response.data;
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const raw = trimmed.slice(6);
+                    if (raw === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(raw);
+                        const delta = parsed.choices?.[0]?.delta?.content || '';
+                        if (delta) {
+                            totalContent += delta;
+                            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                        }
+                    } catch { /* csonka JSON — kihagyjuk */ }
+                }
+            });
 
-console.log("FULL RESPONSE:", response);
-console.log("DATA:", response.data);
+            streamResp.data.on('end', async () => {
+                res.write('data: [DONE]\n\n');
+                res.end();
+                await logUsage(req.userId, 'chat', { model, provider: 'openrouter', tokens: totalContent.length });
+            });
 
+            streamResp.data.on('error', (err) => {
+                console.error('OpenRouter stream hiba:', err.message);
+                res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+                res.end();
+            });
 
-        if (data.error) {
-            return res.status(500).json({ success: false, message: data.error.message });
+            return; // válasz streamelve megy, nem kell json()
         }
 
-        content = data.choices?.[0]?.message?.content ?? '';
-
-        usage = {
-            input_tokens: data.usage?.prompt_tokens ?? 0,
-            output_tokens: data.usage?.completion_tokens ?? 0,
-            total_tokens: data.usage?.total_tokens ?? 0
-        };
-
-    } catch (err) {
-        console.error("OpenRouter hiba:", err.response?.data || err.message);
-        return res.status(500).json({ success: false, message: 'OpenRouter API hiba' });
-    }
-
-    await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
-    return res.json({ success: true, content, usage });
-}
-
-
-
+        else {
+            return res.status(400).json({ success: false, message: `Ismeretlen provider: ${provider}` });
+        }
 
     } catch (err) {
         console.error('❌ Chat error:', err);
-        return res.status(500).json({
-            success: false,
-            message: err?.status === 429
-                ? 'API rate limit — próbáld újra pár perc múlva'
-                : err?.message || 'Chat hiba',
-        });
+        if (!res.headersSent) {
+            return res.status(500).json({
+                success: false,
+                message: err?.status === 429
+                    ? 'API rate limit — próbáld újra pár perc múlva'
+                    : err?.message || 'Chat hiba',
+            });
+        }
     }
 });
 
@@ -261,20 +276,16 @@ console.log("DATA:", response.data);
 router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, res) => {
     try {
         const {
-            apiId,
-            prompt,
-            negative_prompt,
+            apiId, prompt, negative_prompt,
             image_size = { width: 1024, height: 1024 },
             num_inference_steps = 28,
             guidance_scale = 7.5,
-            seed,
-            num_images = 1,
+            seed, num_images = 1,
         } = req.body;
 
         if (!apiId || !prompt?.trim()) {
             return res.status(400).json({ success: false, message: 'Hiányzó apiId vagy prompt' });
         }
-
         if (!process.env.FAL_KEY) {
             return res.status(500).json({ success: false, message: 'FAL_KEY nincs beállítva a .env-ben' });
         }
@@ -319,12 +330,8 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res) => {
     try {
         const {
-            model = 'tts-1',
-            provider = 'openai',
-            text,
-            voice = 'nova',
-            speed = 1.0,
-            format = 'mp3',
+            model = 'tts-1', provider = 'openai', text,
+            voice = 'nova', speed = 1.0, format = 'mp3',
         } = req.body;
 
         if (!text?.trim()) return res.status(400).json({ success: false, message: 'Hiányzó szöveg' });
@@ -334,62 +341,41 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
         const safeFormat = ['mp3', 'opus', 'aac', 'flac'].includes(format) ? format : 'mp3';
         let audioUrl = '';
 
-        // ── OpenAI TTS ───────────────────────────────────
         if (provider === 'openai') {
             if (!process.env.OPENAI_API_KEY) {
                 return res.status(500).json({ success: false, message: 'OPENAI_API_KEY nincs beállítva a .env-ben' });
             }
-
             const safeVoice = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'].includes(voice) ? voice : 'nova';
-
             const resp = await openai.audio.speech.create({
-                model,
-                voice: safeVoice,
-                input: text.trim(),
-                speed: safeSpeed,
-                response_format: safeFormat,
+                model, voice: safeVoice, input: text.trim(), speed: safeSpeed, response_format: safeFormat,
             });
-
             const mimeTypes = { mp3: 'audio/mpeg', opus: 'audio/ogg', aac: 'audio/aac', flac: 'audio/flac' };
             const buffer = Buffer.from(await resp.arrayBuffer());
             audioUrl = `data:${mimeTypes[safeFormat]};base64,${buffer.toString('base64')}`;
         }
 
-        // ── ElevenLabs ───────────────────────────────────
         else if (provider === 'elevenlabs') {
             if (!process.env.ELEVENLABS_API_KEY) {
                 return res.status(500).json({ success: false, message: 'ELEVENLABS_API_KEY nincs beállítva a .env-ben' });
             }
-
             const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
-
-            const resp = await fetch(
-                `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'xi-api-key': process.env.ELEVENLABS_API_KEY,
-                        'Content-Type': 'application/json',
-                        Accept: 'audio/mpeg',
-                    },
-                    body: JSON.stringify({
-                        text: text.trim(),
-                        model_id: model,
-                        voice_settings: {
-                            stability: 0.75,
-                            similarity_boost: 0.85,
-                            style: 0.0,
-                            use_speaker_boost: true,
-                        },
-                    }),
-                }
-            );
-
+            const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+                method: 'POST',
+                headers: {
+                    'xi-api-key': process.env.ELEVENLABS_API_KEY,
+                    'Content-Type': 'application/json',
+                    Accept: 'audio/mpeg',
+                },
+                body: JSON.stringify({
+                    text: text.trim(),
+                    model_id: model,
+                    voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.0, use_speaker_boost: true },
+                }),
+            });
             if (!resp.ok) {
                 const err = await resp.json().catch(() => ({}));
                 throw new Error(err?.detail?.message || `ElevenLabs hiba: ${resp.status}`);
             }
-
             const buffer = Buffer.from(await resp.arrayBuffer());
             audioUrl = `data:audio/mpeg;base64,${buffer.toString('base64')}`;
         }
@@ -413,18 +399,12 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
 router.post('/generate-music', verifyFirebaseToken, audioLimiter, async (req, res) => {
     try {
         const {
-            apiId,
-            prompt,
-            genre = '',
-            mood = '',
-            duration = 30,
-            instrumental = true,
+            apiId, prompt, genre = '', mood = '', duration = 30, instrumental = true,
         } = req.body;
 
         if (!apiId || !prompt?.trim()) {
             return res.status(400).json({ success: false, message: 'Hiányzó apiId vagy prompt' });
         }
-
         if (!process.env.FAL_KEY) {
             return res.status(500).json({ success: false, message: 'FAL_KEY nincs beállítva a .env-ben' });
         }
@@ -439,7 +419,6 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, async (req, re
 
         let audioUrl = '';
 
-        // ── MusicGen ─────────────────────────────────────
         if (apiId.includes('musicgen')) {
             const result = await fal.subscribe(apiId, {
                 input: { prompt: fullPrompt, duration: safeDuration },
@@ -448,7 +427,6 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, async (req, re
             audioUrl = result.data?.audio?.url || result.data?.audio_file?.url || '';
         }
 
-        // ── Stable Audio ─────────────────────────────────
         else if (apiId.includes('stable-audio')) {
             const result = await fal.subscribe(apiId, {
                 input: { prompt: fullPrompt, seconds_total: safeDuration, steps: 100 },
