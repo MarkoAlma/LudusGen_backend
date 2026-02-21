@@ -407,7 +407,7 @@ app.post("/api/register-user", async (req, res) => {
       });
     }
     
-    if (displayName.trim().length < 2) {
+    if (displayName.trim().length < 1) {
       return res.status(400).json({ 
         success: false, 
         message: "A név legalább 2 karakter hosszú legyen" 
@@ -479,7 +479,7 @@ app.post("/api/register-user", async (req, res) => {
     if (error.code === 'auth/invalid-email') {
       return res.status(400).json({ 
         success: false, 
-        message: "Érvénytelen email cím formátum" 
+        message: "Érvénytelen email cím" 
       });
     }
     
@@ -1031,7 +1031,7 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     console.log('📥 Update profile request for user:', userId);
     console.log('📥 Received data:', { name, displayName, bio });
 
-    if (displayName !== undefined && (!displayName || displayName.trim().length < 2)) {
+    if (displayName !== undefined && (!displayName || displayName.trim().length < 1)) {
       return res.status(400).json({ 
         success: false, 
         message: "A név legalább 2 karakter hosszú legyen" 
@@ -1536,5 +1536,4 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
 // ==================== SERVER START ====================
 
 app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));
-
 
