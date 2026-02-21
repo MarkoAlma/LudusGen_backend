@@ -673,6 +673,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
         }
 
         // ── Cloudflare Workers AI ─────────────────────────
+        
         else if (provider === 'cloudflare') {
             if (!process.env.CLOUDFLARE_API_KEY) {
                 return res.status(500).json({ success: false, message: 'CLOUDFLARE_API_KEY nincs beállítva a .env-ben' });
