@@ -9,6 +9,8 @@ import axios from 'axios';
 import dns from "dns";
 dns.setDefaultResultOrder("ipv4first");
 import https from "https";
+import { log } from 'console';
+
 
 const httpsAgent = new https.Agent({ family: 4 });
 
@@ -25,6 +27,7 @@ REQUIRED_KEYS.forEach((key) => {
 // ── API kliensek inicializálása ───────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 
 fal.config({ credentials: process.env.FAL_KEY });
 
@@ -164,331 +167,332 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
             return res.json({ success: true, content, usage });
-        }// PROVIDER BLOKK (a többi else if után):
-else if (provider === 'cerebras') {
-    if (!process.env.CEREBRAS_API_KEY) {
-        return res.status(500).json({ success: false, message: 'CEREBRAS_API_KEY nincs beállítva' });
-    }
+        }
 
-    const chatMsgs = messages.map(m => ({ role: m.role, content: String(m.content) }));
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    let streamResp;
-    try {
-        streamResp = await axios.post(
-            'https://api.cerebras.ai/v1/chat/completions',
-            {
-                model,
-                messages: chatMsgs,
-                temperature: Math.min(Math.max(0, temperature), 1.5),
-                max_tokens: safeMax,
-                top_p: Math.min(Math.max(0, top_p), 1),
-                stream: true,
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${process.env.CEREBRAS_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'Accept-Encoding': 'identity',
-                },
-                responseType: 'stream',
-                decompress: false,
-                timeout: 60000,
+        // ── Cerebras ─────────────────────────────────────
+        else if (provider === 'cerebras') {
+            if (!process.env.CEREBRAS_API_KEY) {
+                return res.status(500).json({ success: false, message: 'CEREBRAS_API_KEY nincs beállítva' });
             }
-        );
-    } catch (err) {
-        console.error('Cerebras hiba:', err.response?.data || err.message);
-        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-        return res.end();
-    }
 
-    let totalContent = '';
-    let buf = '';
+            const chatMsgs = messages.map(m => ({ role: m.role, content: String(m.content) }));
 
-    streamResp.data.on('data', (chunk) => {
-        buf += chunk.toString('utf8');
-        const lines = buf.split('\n');
-        buf = lines.pop();
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data: ')) continue;
-            const raw = trimmed.slice(6);
-            if (raw === '[DONE]') continue;
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
+
+            let streamResp;
             try {
-                const parsed = JSON.parse(raw);
-                const delta = parsed.choices?.[0]?.delta?.content || '';
-                if (delta) {
-                    totalContent += delta;
-                    res.write(`data: ${JSON.stringify({ delta })}\n\n`);
-                }
-            } catch {}
-        }
-    });
-
-    streamResp.data.on('end', async () => {
-        res.write('data: [DONE]\n\n');
-        res.end();
-        await logUsage(req.userId, 'chat', { model, provider: 'cerebras', tokens: totalContent.length });
-    });
-
-    streamResp.data.on('error', () => {
-        res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
-        res.end();
-    });
-
-    return;
-}
-else if (provider === 'mistral') {
-    if (!process.env.MISTRAL_API_KEY) {
-        return res.status(500).json({ success: false, message: 'MISTRAL_API_KEY nincs beállítva' });
-    }
-
-    const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    let streamResp;
-    try {
-        streamResp = await axios.post(
-            'https://api.mistral.ai/v1/chat/completions',
-            {
-                model,
-                messages: chatMsgs,
-                temperature: Math.min(Math.max(0, temperature), 1),
-                max_tokens: safeMax,
-                top_p: Math.min(Math.max(0, top_p), 1),
-                stream: true,
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${process.env.MISTRAL_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'Accept-Encoding': 'identity',
-                },
-                responseType: 'stream',
-                decompress: false,
-                timeout: 60000,
+                streamResp = await axios.post(
+                    'https://api.cerebras.ai/v1/chat/completions',
+                    {
+                        model,
+                        messages: chatMsgs,
+                        temperature: Math.min(Math.max(0, temperature), 1.5),
+                        max_tokens: safeMax,
+                        top_p: Math.min(Math.max(0, top_p), 1),
+                        stream: true,
+                    },
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${process.env.CEREBRAS_API_KEY}`,
+                            'Content-Type': 'application/json',
+                            'Accept-Encoding': 'identity',
+                        },
+                        responseType: 'stream',
+                        decompress: false,
+                        timeout: 60000,
+                    }
+                );
+            } catch (err) {
+                console.error('Cerebras hiba:', err.response?.data || err.message);
+                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                return res.end();
             }
-        );
-    } catch (err) {
-        console.error('Mistral hiba:', err.response?.data || err.message);
-        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-        return res.end();
-    }
 
-    let totalContent = '';
-    let buf = '';
+            let totalContent = '';
+            let buf = '';
 
-    streamResp.data.on('data', (chunk) => {
-        buf += chunk.toString('utf8');
-        const lines = buf.split('\n');
-        buf = lines.pop();
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data: ')) continue;
-            const raw = trimmed.slice(6);
-            if (raw === '[DONE]') continue;
-            try {
-                const parsed = JSON.parse(raw);
-                const delta = parsed.choices?.[0]?.delta?.content || '';
-                if (delta) {
-                    totalContent += delta;
-                    res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+            streamResp.data.on('data', (chunk) => {
+                buf += chunk.toString('utf8');
+                const lines = buf.split('\n');
+                buf = lines.pop();
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const raw = trimmed.slice(6);
+                    if (raw === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(raw);
+                        const delta = parsed.choices?.[0]?.delta?.content || '';
+                        if (delta) {
+                            totalContent += delta;
+                            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                        }
+                    } catch {}
                 }
-            } catch {}
-        }
-    });
+            });
 
-    streamResp.data.on('end', async () => {
-        res.write('data: [DONE]\n\n');
-        res.end();
-        await logUsage(req.userId, 'chat', { model, provider: 'mistral', tokens: totalContent.length });
-    });
+            streamResp.data.on('end', async () => {
+                res.write('data: [DONE]\n\n');
+                res.end();
+                await logUsage(req.userId, 'chat', { model, provider: 'cerebras', tokens: totalContent.length });
+            });
 
-    streamResp.data.on('error', () => {
-        res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
-        res.end();
-    });
+            streamResp.data.on('error', () => {
+                res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+                res.end();
+            });
 
-    return;
-}
-
-    else if (provider === 'groq') {
-        if (!process.env.GROQ_API_KEY) {
-            return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
+            return;
         }
 
-    const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    let streamResp;
-    try {
-        streamResp = await axios.post(
-            'https://api.groq.com/openai/v1/chat/completions',
-            {
-                model,
-                messages: chatMsgs,
-                temperature: Math.min(Math.max(0, temperature), 2),
-                max_tokens: safeMax,
-                top_p: Math.min(Math.max(0, top_p), 1),
-                stream: true,
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-                    'Content-Type': 'application/json',
-                },
-                responseType: 'stream',
-                timeout: 60000,
+        // ── Mistral ───────────────────────────────────────
+        else if (provider === 'mistral') {
+            if (!process.env.MISTRAL_API_KEY) {
+                return res.status(500).json({ success: false, message: 'MISTRAL_API_KEY nincs beállítva' });
             }
-        );
-    } catch (err) {
-        console.error('Groq hiba:', err.response?.data || err.message);
-        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-        return res.end();
-    }
 
-    let totalContent = '';
-    let buf = '';
+            const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
 
-    streamResp.data.on('data', (chunk) => {
-        buf += chunk.toString('utf8');
-        const lines = buf.split('\n');
-        buf = lines.pop();
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data: ')) continue;
-            const raw = trimmed.slice(6);
-            if (raw === '[DONE]') continue;
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
+
+            let streamResp;
             try {
-                const parsed = JSON.parse(raw);
-                const delta = parsed.choices?.[0]?.delta?.content || '';
-                if (delta) {
-                    totalContent += delta;
-                    res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                streamResp = await axios.post(
+                    'https://api.mistral.ai/v1/chat/completions',
+                    {
+                        model,
+                        messages: chatMsgs,
+                        temperature: Math.min(Math.max(0, temperature), 1),
+                        max_tokens: safeMax,
+                        top_p: Math.min(Math.max(0, top_p), 1),
+                        stream: true,
+                    },
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${process.env.MISTRAL_API_KEY}`,
+                            'Content-Type': 'application/json',
+                            'Accept-Encoding': 'identity',
+                        },
+                        responseType: 'stream',
+                        decompress: false,
+                        timeout: 60000,
+                    }
+                );
+            } catch (err) {
+                console.error('Mistral hiba:', err.response?.data || err.message);
+                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                return res.end();
+            }
+
+            let totalContent = '';
+            let buf = '';
+
+            streamResp.data.on('data', (chunk) => {
+                buf += chunk.toString('utf8');
+                const lines = buf.split('\n');
+                buf = lines.pop();
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const raw = trimmed.slice(6);
+                    if (raw === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(raw);
+                        const delta = parsed.choices?.[0]?.delta?.content || '';
+                        if (delta) {
+                            totalContent += delta;
+                            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                        }
+                    } catch {}
                 }
-            } catch {}
+            });
+
+            streamResp.data.on('end', async () => {
+                res.write('data: [DONE]\n\n');
+                res.end();
+                await logUsage(req.userId, 'chat', { model, provider: 'mistral', tokens: totalContent.length });
+            });
+
+            streamResp.data.on('error', () => {
+                res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+                res.end();
+            });
+
+            return;
         }
-    });
 
-    streamResp.data.on('end', async () => {
-        res.write('data: [DONE]\n\n');
-        res.end();
-        await logUsage(req.userId, 'chat', { model, provider: 'groq', tokens: totalContent.length });
-    });
+        // ── Groq ──────────────────────────────────────────
+        else if (provider === 'groq') {
+            if (!process.env.GROQ_API_KEY) {
+                return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
+            }
 
-    streamResp.data.on('error', (err) => {
-        res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
-        res.end();
-    });
+            const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
 
-    return;
-}
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
 
+            let streamResp;
+            try {
+                streamResp = await axios.post(
+                    'https://api.groq.com/openai/v1/chat/completions',
+                    {
+                        model,
+                        messages: chatMsgs,
+                        temperature: Math.min(Math.max(0, temperature), 2),
+                        max_tokens: safeMax,
+                        top_p: Math.min(Math.max(0, top_p), 1),
+                        stream: true,
+                    },
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                            'Content-Type': 'application/json',
+                        },
+                        responseType: 'stream',
+                        timeout: 60000,
+                    }
+                );
+            } catch (err) {
+                console.error('Groq hiba:', err.response?.data || err.message);
+                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                return res.end();
+            }
 
+            let totalContent = '';
+            let buf = '';
+
+            streamResp.data.on('data', (chunk) => {
+                buf += chunk.toString('utf8');
+                const lines = buf.split('\n');
+                buf = lines.pop();
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const raw = trimmed.slice(6);
+                    if (raw === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(raw);
+                        const delta = parsed.choices?.[0]?.delta?.content || '';
+                        if (delta) {
+                            totalContent += delta;
+                            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                        }
+                    } catch {}
+                }
+            });
+
+            streamResp.data.on('end', async () => {
+                res.write('data: [DONE]\n\n');
+                res.end();
+                await logUsage(req.userId, 'chat', { model, provider: 'groq', tokens: totalContent.length });
+            });
+
+            streamResp.data.on('error', (err) => {
+                res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+                res.end();
+            });
+
+            return;
+        }
+
+        // ── Gemini ────────────────────────────────────────
         else if (provider === 'gemini') {
-    if (!process.env.GEMINI_API_KEY) {
-        return res.status(500).json({ success: false, message: 'GEMINI_API_KEY nincs beállítva' });
-    }
-
-    // OpenAI messages → Gemini contents konverzió
-    const systemMsg = messages.find((m) => m.role === 'system');
-    const contents = messages
-        .filter((m) => m.role !== 'system')
-        .map((m) => ({
-            role: m.role === 'assistant' ? 'model' : 'user',  // Gemini "model"-t használ "assistant" helyett
-            parts: [{ text: String(m.content) }],
-        }));
-
-    // SSE fejlécek
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    let streamResp;
-    try {
-        // :streamGenerateContent?alt=sse → valós idejű streaming
-        streamResp = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
-            {
-                contents,
-                ...(systemMsg ? {
-                    systemInstruction: { parts: [{ text: systemMsg.content }] }
-                } : {}),
-                generationConfig: {
-                    temperature: Math.min(Math.max(0, temperature), 2),
-                    maxOutputTokens: safeMax,
-                    topP: Math.min(Math.max(0, top_p), 1),
-                },
-            },
-            {
-                headers: {
-                    'x-goog-api-key': process.env.GEMINI_API_KEY,
-                    'Content-Type': 'application/json',
-                },
-                responseType: 'stream',
-                timeout: 60000,
+            if (!process.env.GEMINI_API_KEY) {
+                return res.status(500).json({ success: false, message: 'GEMINI_API_KEY nincs beállítva' });
             }
-        );
-    } catch (err) {
-        console.error('Gemini kapcsolódási hiba:', err.message);
-        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-        return res.end();
-    }
 
-    let totalContent = '';
-    let buf = '';
+            const systemMsg = messages.find((m) => m.role === 'system');
+            const contents = messages
+                .filter((m) => m.role !== 'system')
+                .map((m) => ({
+                    role: m.role === 'assistant' ? 'model' : 'user',
+                    parts: [{ text: String(m.content) }],
+                }));
 
-    streamResp.data.on('data', (chunk) => {
-        buf += chunk.toString('utf8');
-        const lines = buf.split('\n');
-        buf = lines.pop();
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data: ')) continue;
-            const raw = trimmed.slice(6);
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
+
+            let streamResp;
             try {
-                const parsed = JSON.parse(raw);
-                // Gemini válasz struktúra: candidates[0].content.parts[0].text
-                const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
-                if (delta) {
-                    totalContent += delta;
-                    res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                streamResp = await axios.post(
+                    `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
+                    {
+                        contents,
+                        ...(systemMsg ? {
+                            systemInstruction: { parts: [{ text: systemMsg.content }] }
+                        } : {}),
+                        generationConfig: {
+                            temperature: Math.min(Math.max(0, temperature), 2),
+                            maxOutputTokens: safeMax,
+                            topP: Math.min(Math.max(0, top_p), 1),
+                        },
+                    },
+                    {
+                        headers: {
+                            'x-goog-api-key': process.env.GEMINI_API_KEY,
+                            'Content-Type': 'application/json',
+                        },
+                        responseType: 'stream',
+                        timeout: 60000,
+                    }
+                );
+            } catch (err) {
+                console.error('Gemini kapcsolódási hiba:', err.message);
+                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                return res.end();
+            }
+
+            let totalContent = '';
+            let buf = '';
+
+            streamResp.data.on('data', (chunk) => {
+                buf += chunk.toString('utf8');
+                const lines = buf.split('\n');
+                buf = lines.pop();
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const raw = trimmed.slice(6);
+                    try {
+                        const parsed = JSON.parse(raw);
+                        const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                        if (delta) {
+                            totalContent += delta;
+                            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                        }
+                    } catch {}
                 }
-            } catch {}
+            });
+
+            streamResp.data.on('end', async () => {
+                res.write('data: [DONE]\n\n');
+                res.end();
+                await logUsage(req.userId, 'chat', { model, provider: 'gemini', tokens: totalContent.length });
+            });
+
+            streamResp.data.on('error', (err) => {
+                console.error('Gemini stream hiba:', err.message);
+                res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+                res.end();
+            });
+
+            return;
         }
-    });
-
-    streamResp.data.on('end', async () => {
-        res.write('data: [DONE]\n\n');
-        res.end();
-        await logUsage(req.userId, 'chat', { model, provider: 'gemini', tokens: totalContent.length });
-    });
-
-    streamResp.data.on('error', (err) => {
-        console.error('Gemini stream hiba:', err.message);
-        res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
-        res.end();
-    });
-
-    return;
-}
 
         // ── OpenRouter — SSE Streaming ────────────────────
         else if (provider === 'openrouter') {
@@ -501,7 +505,6 @@ else if (provider === 'mistral') {
                 content: String(m.content),
             }));
 
-            // SSE fejlécek — a tokenek azonnal folynak a kliensnek
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
@@ -540,12 +543,11 @@ else if (provider === 'mistral') {
 
             let totalContent = '';
             let buf = '';
-            
 
             streamResp.data.on('data', (chunk) => {
                 buf += chunk.toString('utf8');
                 const lines = buf.split('\n');
-                buf = lines.pop(); // utolsó (esetleg csonka) sor visszatartva
+                buf = lines.pop();
 
                 for (const line of lines) {
                     const trimmed = line.trim();
@@ -575,7 +577,7 @@ else if (provider === 'mistral') {
                 res.end();
             });
 
-            return; // válasz streamelve megy, nem kell json()
+            return;
         }
 
         else {
@@ -601,45 +603,166 @@ else if (provider === 'mistral') {
 router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, res) => {
     try {
         const {
-            apiId, prompt, negative_prompt,
+            apiId, prompt, negative_prompt, provider,
             image_size = { width: 1024, height: 1024 },
             num_inference_steps = 28,
             guidance_scale = 7.5,
             seed, num_images = 1,
+            aspect_ratio = '1:1',
         } = req.body;
 
-        if (!apiId || !prompt?.trim()) {
-            return res.status(400).json({ success: false, message: 'Hiányzó apiId vagy prompt' });
-        }
-        if (!process.env.FAL_KEY) {
-            return res.status(500).json({ success: false, message: 'FAL_KEY nincs beállítva a .env-ben' });
+        if (!prompt?.trim()) {
+            return res.status(400).json({ success: false, message: 'Hiányzó prompt' });
         }
 
-        const result = await fal.subscribe(apiId, {
-            input: {
-                prompt: prompt.trim(),
-                image_size,
-                num_inference_steps: Math.min(Math.max(1, num_inference_steps), 50),
-                guidance_scale: Math.min(Math.max(1, guidance_scale), 15),
-                num_images: Math.min(Math.max(1, num_images), 4),
-                enable_safety_checker: true,
-                ...(negative_prompt ? { negative_prompt } : {}),
-                ...(seed ? { seed: parseInt(seed) } : {}),
-            },
-            logs: false,
-        });
+        // ── Google Gemini Image Generation ───────────────
+        if (provider === 'google-image') {
+            if (!process.env.GEMINI_API_KEY) {
+                return res.status(500).json({ success: false, message: 'GEMINI_API_KEY nincs beállítva a .env-ben' });
+            }
 
-        const images = (result.data?.images || []).map((img) => ({
-            url: img.url, width: img.width, height: img.height,
-        }));
+            console.log('🎨 Gemini image generation:', prompt.trim());
 
-        if (images.length === 0) throw new Error('Nem érkezett kép');
+            // gemini-2.5-flash-image uses 'generateContent'
+            // response_modalities must be lowercase per new API spec
+            const response = await axios.post(
+                `https://generativelanguage.googleapis.com/v1beta/models/${apiId}:generateContent`,
+                {
+                    contents: [{
+                        parts: [{ text: prompt.trim() }]
+                    }],
+                    generationConfig: {
+                        response_modalities: ['TEXT', 'IMAGE'],
+                    },
+                },
+                {
+                    headers: {
+                        'x-goog-api-key': process.env.GEMINI_API_KEY,
+                        'Content-Type': 'application/json',
+                    },
+                    timeout: 120000,
+                }
+            );
 
-        await logUsage(req.userId, 'image', { apiId, numImages: num_images });
-        return res.json({ success: true, images });
+            const parts = response.data?.candidates?.[0]?.content?.parts || [];
+            const images = [];
+
+            for (const part of parts) {
+                if (part.inlineData?.mimeType?.startsWith('image/')) {
+                    const base64 = part.inlineData.data;
+                    const mimeType = part.inlineData.mimeType;
+                    images.push({
+                        url: `data:${mimeType};base64,${base64}`,
+                        width: image_size.width || 1024,
+                        height: image_size.height || 1024,
+                    });
+                }
+            }
+
+            if (images.length === 0) {
+                throw new Error('A Gemini nem adott vissza képet. Próbálj más promptot!');
+            }
+
+            await logUsage(req.userId, 'image', { provider: 'google-image', apiId, numImages: images.length });
+            return res.json({ success: true, images });
+        }
+
+        // ── Cloudflare Workers AI ─────────────────────────
+        else if (provider === 'cloudflare') {
+            if (!process.env.CLOUDFLARE_API_KEY) {
+                return res.status(500).json({ success: false, message: 'CLOUDFLARE_API_KEY nincs beállítva a .env-ben' });
+            }
+            if (!process.env.CLOUDFLARE_ACCOUNT_ID) {
+                return res.status(500).json({ success: false, message: 'CLOUDFLARE_ACCOUNT_ID nincs beállítva a .env-ben' });
+            }
+
+            console.log('🎨 Cloudflare AI image generation:', apiId, prompt.trim());
+
+            const cfResp = await axios.post(
+                `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/run/${apiId}`,
+                {
+                    prompt: prompt.trim(),
+                    ...(negative_prompt ? { negative_prompt: negative_prompt.trim() } : {}),
+                    ...(seed ? { seed: parseInt(seed) } : {}),
+                    num_steps: Math.min(Math.max(1, num_inference_steps), 20),
+                    guidance: Math.min(Math.max(1, guidance_scale), 20),
+                    width: image_size.width || 1024,
+                    height: image_size.height || 1024,
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${process.env.CLOUDFLARE_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    responseType: 'arraybuffer',
+                    timeout: 120000,
+                }
+            );
+
+            const base64 = Buffer.from(cfResp.data).toString('base64');
+            // Cloudflare image models return image/png directly
+            const contentType = cfResp.headers['content-type']?.split(';')[0] || 'image/png';
+
+            const images = [{
+                url: `data:${contentType};base64,${base64}`,
+                width: image_size.width || 1024,
+                height: image_size.height || 1024,
+            }];
+
+            await logUsage(req.userId, 'image', { provider: 'cloudflare', apiId, numImages: 1 });
+            return res.json({ success: true, images });
+        }
+
+        // ── fal.ai (eredeti) ──────────────────────────────
+        else {
+            if (!apiId) {
+                return res.status(400).json({ success: false, message: 'Hiányzó apiId' });
+            }
+            if (!process.env.FAL_KEY) {
+                return res.status(500).json({ success: false, message: 'FAL_KEY nincs beállítva a .env-ben' });
+            }
+
+            const result = await fal.subscribe(apiId, {
+                input: {
+                    prompt: prompt.trim(),
+                    image_size,
+                    num_inference_steps: Math.min(Math.max(1, num_inference_steps), 50),
+                    guidance_scale: Math.min(Math.max(1, guidance_scale), 15),
+                    num_images: Math.min(Math.max(1, num_images), 4),
+                    enable_safety_checker: true,
+                    ...(negative_prompt ? { negative_prompt } : {}),
+                    ...(seed ? { seed: parseInt(seed) } : {}),
+                },
+                logs: false,
+            });
+
+            const images = (result.data?.images || []).map((img) => ({
+                url: img.url, width: img.width, height: img.height,
+            }));
+
+            if (images.length === 0) throw new Error('Nem érkezett kép');
+
+            await logUsage(req.userId, 'image', { apiId, numImages: num_images });
+            return res.json({ success: true, images });
+        }
 
     } catch (err) {
         console.error('❌ Image gen error:', err);
+
+        // Stability AI specifikus hibák
+        if (err.response?.status === 402) {
+            return res.status(402).json({
+                success: false,
+                message: 'Nincs elegendő Stability AI kredit',
+            });
+        }
+        if (err.response?.status === 403) {
+            return res.status(403).json({
+                success: false,
+                message: 'Érvénytelen Stability AI API kulcs',
+            });
+        }
+
         return res.status(500).json({
             success: false,
             message: err?.message?.includes('safety')
