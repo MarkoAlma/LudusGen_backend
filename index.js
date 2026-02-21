@@ -1537,4 +1537,3 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
 
 app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));
 
-
