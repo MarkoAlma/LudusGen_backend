@@ -151,14 +151,199 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         total_tokens:  (resp.usage?.input_tokens || 0) + (resp.usage?.output_tokens || 0),
       };
 
-      await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
-      return res.json({ success: true, content, usage });
+            await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
+            return res.json({ success: true, content, usage });
+        }
+
+        // ── OpenAI ───────────────────────────────────────
+        else if (provider === 'openai') {
+            if (!process.env.OPENAI_API_KEY) {
+                return res.status(500).json({ success: false, message: 'OPENAI_API_KEY nincs beállítva a .env-ben' });
+            }
+
+            const resp = await openai.chat.completions.create({
+                model,
+                messages: messages.map((m) => ({ role: m.role, content: String(m.content) })),
+                temperature: Math.min(Math.max(0, temperature), 2),
+                max_tokens: safeMax,
+                top_p: Math.min(Math.max(0, top_p), 1),
+                frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
+                presence_penalty: Math.min(Math.max(-2, presence_penalty), 2),
+            });
+
+            content = resp.choices?.[0]?.message?.content || '';
+            usage = {
+                input_tokens: resp.usage?.prompt_tokens || 0,
+                output_tokens: resp.usage?.completion_tokens || 0,
+                total_tokens: resp.usage?.total_tokens || 0,
+            };
+
+            await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
+            return res.json({ success: true, content, usage });
+        }// PROVIDER BLOKK (a többi else if után):
+else if (provider === 'cerebras') {
+    if (!process.env.CEREBRAS_API_KEY) {
+        return res.status(500).json({ success: false, message: 'CEREBRAS_API_KEY nincs beállítva' });
     }
 
-    // ── OpenAI ───────────────────────────────────────
-    else if (provider === 'openai') {
-      if (!process.env.OPENAI_API_KEY)
-        return res.status(500).json({ success: false, message: 'OPENAI_API_KEY nincs beállítva a .env-ben' });
+    const chatMsgs = messages.map(m => ({ role: m.role, content: String(m.content) }));
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    let streamResp;
+    try {
+        streamResp = await axios.post(
+            'https://api.cerebras.ai/v1/chat/completions',
+            {
+                model,
+                messages: chatMsgs,
+                temperature: Math.min(Math.max(0, temperature), 1.5),
+                max_tokens: safeMax,
+                top_p: Math.min(Math.max(0, top_p), 1),
+                stream: true,
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.CEREBRAS_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Accept-Encoding': 'identity',
+                },
+                responseType: 'stream',
+                decompress: false,
+                timeout: 60000,
+            }
+        );
+    } catch (err) {
+        console.error('Cerebras hiba:', err.response?.data || err.message);
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        return res.end();
+    }
+
+    let totalContent = '';
+    let buf = '';
+
+    streamResp.data.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data: ')) continue;
+            const raw = trimmed.slice(6);
+            if (raw === '[DONE]') continue;
+            try {
+                const parsed = JSON.parse(raw);
+                const delta = parsed.choices?.[0]?.delta?.content || '';
+                if (delta) {
+                    totalContent += delta;
+                    res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                }
+            } catch {}
+        }
+    });
+
+    streamResp.data.on('end', async () => {
+        res.write('data: [DONE]\n\n');
+        res.end();
+        await logUsage(req.userId, 'chat', { model, provider: 'cerebras', tokens: totalContent.length });
+    });
+
+    streamResp.data.on('error', () => {
+        res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+        res.end();
+    });
+
+    return;
+}
+else if (provider === 'mistral') {
+    if (!process.env.MISTRAL_API_KEY) {
+        return res.status(500).json({ success: false, message: 'MISTRAL_API_KEY nincs beállítva' });
+    }
+
+    const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    let streamResp;
+    try {
+        streamResp = await axios.post(
+            'https://api.mistral.ai/v1/chat/completions',
+            {
+                model,
+                messages: chatMsgs,
+                temperature: Math.min(Math.max(0, temperature), 1),
+                max_tokens: safeMax,
+                top_p: Math.min(Math.max(0, top_p), 1),
+                stream: true,
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.MISTRAL_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Accept-Encoding': 'identity',
+                },
+                responseType: 'stream',
+                decompress: false,
+                timeout: 60000,
+            }
+        );
+    } catch (err) {
+        console.error('Mistral hiba:', err.response?.data || err.message);
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        return res.end();
+    }
+
+    let totalContent = '';
+    let buf = '';
+
+    streamResp.data.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data: ')) continue;
+            const raw = trimmed.slice(6);
+            if (raw === '[DONE]') continue;
+            try {
+                const parsed = JSON.parse(raw);
+                const delta = parsed.choices?.[0]?.delta?.content || '';
+                if (delta) {
+                    totalContent += delta;
+                    res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                }
+            } catch {}
+        }
+    });
+
+    streamResp.data.on('end', async () => {
+        res.write('data: [DONE]\n\n');
+        res.end();
+        await logUsage(req.userId, 'chat', { model, provider: 'mistral', tokens: totalContent.length });
+    });
+
+    streamResp.data.on('error', () => {
+        res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+        res.end();
+    });
+
+    return;
+}
+
+    else if (provider === 'groq') {
+        if (!process.env.GROQ_API_KEY) {
+            return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
+        }
+
+    const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
 
       const resp = await openai.chat.completions.create({
         model,
