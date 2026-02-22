@@ -9,7 +9,7 @@ import axios from 'axios';
 import dns from "dns";
 dns.setDefaultResultOrder("ipv4first");
 import https from "https";
-import { log } from 'console';
+import sharp from 'sharp';
 
 
 const httpsAgent = new https.Agent({ family: 4 });
@@ -73,6 +73,7 @@ const genLimiter = rateLimit({
   keyGenerator: (req) => req.userId || ipKeyGenerator(req),
   message: { success: false, message: 'Túl sok generálás – próbáld újra 1 óra múlva' },
 });
+
 
 // ── Firestore usage log ───────────────────────────────
 async function logUsage(userId, type, meta = {}) {
@@ -499,6 +500,89 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             return;
         }
 
+        // ── NVIDIA ────────────────────────────────────────
+        else if (provider === 'nvidia') {
+            if (!process.env.NVIDIA_API_KEY) {
+                return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
+            }
+
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
+
+            let streamResp;
+            try {
+                streamResp = await axios.post(
+                    'https://integrate.api.nvidia.com/v1/chat/completions',
+                    {
+                        model,
+                        messages,
+                        temperature: Math.min(Math.max(0, temperature), 2),
+                        max_tokens: safeMax,
+                        top_p: Math.min(Math.max(0, top_p), 1),
+                        stream: true,
+                    },
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
+                            'Content-Type': 'application/json',
+                        },
+                        responseType: 'stream',
+                        timeout: 300000,
+                    }
+                );
+            } catch (err) {
+                console.error('NVIDIA kapcsolódási hiba:', err.message);
+                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                return res.end();
+            }
+
+            const keepAlive = setInterval(() => {
+                res.write(': ping\n\n');
+            }, 15000);
+
+            let totalContent = '';
+            let buf = '';
+
+            streamResp.data.on('data', (chunk) => {
+                buf += chunk.toString('utf8');
+                const lines = buf.split('\n');
+                buf = lines.pop();
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const raw = trimmed.slice(6);
+                    if (raw === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(raw);
+                        const delta = parsed.choices?.[0]?.delta?.content || '';
+                        if (delta) {
+                            totalContent += delta;
+                            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                        }
+                    } catch {}
+                }
+            });
+
+            streamResp.data.on('end', async () => {
+                clearInterval(keepAlive);
+                res.write('data: [DONE]\n\n');
+                res.end();
+                await logUsage(req.userId, 'chat', { model, provider: 'nvidia', tokens: totalContent.length });
+            });
+
+            streamResp.data.on('error', (err) => {
+                clearInterval(keepAlive);
+                console.error('NVIDIA stream hiba:', err.message);
+                res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+                res.end();
+            });
+
+            return;
+        }
+
         // ── OpenRouter — SSE Streaming ────────────────────
         else if (provider === 'openrouter') {
             if (!process.env.OPENROUTER_API_KEY) {
@@ -614,6 +698,8 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             guidance_scale = 7.5,
             seed, num_images = 1,
             aspect_ratio = '1:1',
+            // FLUX Kontext: szerkesztendő kép (data URL)
+            input_image,
         } = req.body;
 
         if (!prompt?.trim()) {
@@ -628,8 +714,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
             console.log('🎨 Gemini image generation:', prompt.trim());
 
-            // gemini-2.5-flash-image uses 'generateContent'
-            // response_modalities must be lowercase per new API spec
             const response = await axios.post(
                 `https://generativelanguage.googleapis.com/v1beta/models/${apiId}:generateContent`,
                 {
@@ -706,7 +790,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             );
 
             const base64 = Buffer.from(cfResp.data).toString('base64');
-            // Cloudflare image models return image/png directly
             const contentType = cfResp.headers['content-type']?.split(';')[0] || 'image/png';
 
             const images = [{
@@ -716,6 +799,182 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             }];
 
             await logUsage(req.userId, 'image', { provider: 'cloudflare', apiId, numImages: 1 });
+            return res.json({ success: true, images });
+        }
+
+        // ── NVIDIA NIM Image Generation ───────────────────
+        else if (provider === 'nvidia-image') {
+            if (!process.env.NVIDIA_API_KEY) {
+                return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
+            }
+
+            console.log('🎨 NVIDIA NIM image generation:', apiId, prompt.trim());
+
+            const id = apiId.toLowerCase();
+            // Fontos: kontext ellenőrzés ELŐBB, mert tartalmazza a "flux" szót is
+            const isFluxKontext = id.includes('kontext');
+            const isFlux        = id.includes('flux') && !isFluxKontext;
+            const isSD3         = id.includes('stable-diffusion-3');
+
+            // Seed validálás — NaN-t soha ne küldjük
+            const safeSeed = seed !== undefined && seed !== null && seed !== '' && !isNaN(parseInt(seed))
+                ? parseInt(seed)
+                : undefined;
+
+            let requestBody;
+
+// if (isFluxKontext) {
+//     if (!input_image) {
+//         return res.status(400).json({ 
+//             success: false, 
+//             message: 'A FLUX Kontext modellhez input kép szükséges.' 
+//         });
+//     }
+
+//     const VALID_SIZES = [
+//         [672,1568], [688,1504], [720,1456],
+//         [752,1392], [800,1328], [832,1248],
+//         [880,1184], [944,1104], [1024,1024], [1104,944],
+//         [1184,880], [1248,832], [1328,800], [1392,752],
+//         [1456,720], [1504,688], [1568,672]
+//     ];
+
+//     function closestSize(w, h) {
+//         const ratio = w / h;
+//         return VALID_SIZES.reduce(
+//             (best, [rw, rh]) =>
+//                 Math.abs(rw / rh - ratio) < Math.abs(best[0] / best[1] - ratio)
+//                     ? [rw, rh]
+//                     : best
+//         );
+//     }
+
+//     const inputBuffer = Buffer.from(input_image.split(',')[1], 'base64');
+//     const meta = await sharp(inputBuffer).metadata();
+//     const [tw, th] = closestSize(meta.width, meta.height);
+
+// const resizedBuffer = await sharp(inputBuffer)
+//     .resize(tw, th, { fit: 'cover' })
+//     .png()                          // ← PNG output
+//     .toBuffer();
+
+// const imageB64 = `data:image/png;base64,${resizedBuffer.toString('base64')}`;  // ← png MIME type
+
+//     console.log(`Kontext: ${meta.width}x${meta.height} → ${tw}x${th}, b64 length: ${imageB64.length}`);
+
+//     const requestBody = {
+//         prompt: "Using the input image as context, modify the image so that it shows a photo of a landscape",
+//         image: imageB64,
+//         steps: 30,
+//         seed: safeSeed ?? 0,
+//         cfg_scale: 3.5
+//     };
+
+//     let nimResp;
+//     try {
+//         nimResp = await axios.post(
+//             `https://ai.api.nvidia.com/v1/genai/${apiId}`,
+//             requestBody,
+//             {
+//                 headers: {
+//                     'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
+//                     'Content-Type': 'application/json',
+//                     'Accept': 'application/json'
+//                 },
+//                 timeout: 180000
+//             }
+//         );
+//     } catch (err) {
+//         console.error('NVIDIA image hiba:', err.response?.data || err.message);
+//         return res.status(500).json({
+//             success: false,
+//             message: err.response?.data?.detail || err.response?.data?.title || err.message,
+//         });
+//     }
+
+//     const base64Image =
+//         nimResp.data?.image ??
+//         nimResp.data?.artifacts?.[0]?.base64;
+
+//     if (!base64Image) {
+//         return res.status(500).json({ success: false, message: 'Nem érkezett kép az NVIDIA API-tól' });
+//     }
+
+//     const images = [{
+//         url: `data:image/png;base64,${base64Image}`,
+//         width: tw,
+//         height: th
+//     }];
+    
+//     await logUsage(req.userId, 'image', { provider: 'nvidia-image', apiId, numImages: 1 });
+//     return res.json({ success: true, images });
+// }
+    if (isFlux) {
+                // ── FLUX.1 dev / schnell: text-to-image ───────────
+                requestBody = {
+                    prompt: prompt.trim(),
+                    mode: 'base',
+                    cfg_scale: Math.min(Math.max(1, guidance_scale), 30),
+                    width: image_size?.width || 1024,
+                    height: image_size?.height || 1024,
+                    steps: Math.min(Math.max(1, num_inference_steps), 50),
+                    ...(safeSeed !== undefined ? { seed: safeSeed } : {}),
+                };
+            } else if (isSD3) {
+                // ── Stable Diffusion 3 Medium ──────────────────────
+                requestBody = {
+                    prompt: prompt.trim(),
+                    cfg_scale: Math.min(Math.max(1, guidance_scale), 20),
+                    aspect_ratio: aspect_ratio || '1:1',
+                    steps: Math.min(Math.max(1, num_inference_steps), 50),
+                    ...(safeSeed !== undefined ? { seed: safeSeed } : {}),
+                    ...(negative_prompt ? { negative_prompt: negative_prompt.trim() } : {}),
+                };
+            } else {
+                requestBody = {
+                    prompt: prompt.trim(),
+                    ...(safeSeed !== undefined ? { seed: safeSeed } : {}),
+                    ...(negative_prompt ? { negative_prompt: negative_prompt.trim() } : {}),
+                };
+            }
+
+            let nimResp;
+            try {
+                nimResp = await axios.post(
+                    `https://ai.api.nvidia.com/v1/genai/${apiId}`,
+                    requestBody,
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                        },
+                        timeout: 180000,
+                    }
+                );
+            } catch (err) {
+                console.error('NVIDIA image hiba:', err.response?.data || err.message);
+                return res.status(500).json({
+                    success: false,
+                    message: err.response?.data?.detail || err.response?.data?.title || err.message,
+                });
+            }
+
+            // SD3  → { image: "base64..." }
+            // FLUX → { artifacts: [{ base64: "...", finishReason, seed }] }
+            const base64Image = nimResp.data?.image ?? nimResp.data?.artifacts?.[0]?.base64;
+
+            if (!base64Image) {
+                return res.status(500).json({ success: false, message: 'Nem érkezett kép az NVIDIA API-tól' });
+            }
+
+            const images = [{
+                url: `data:image/png;base64,${base64Image}`,
+                width: image_size.width || 1024,
+                height: image_size.height || 1024,
+            }];
+
+            await logUsage(req.userId, 'image', { provider: 'nvidia-image', apiId, numImages: 1 });
             return res.json({ success: true, images });
         }
 
@@ -755,7 +1014,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
     } catch (err) {
         console.error('❌ Image gen error:', err);
 
-        // Stability AI specifikus hibák
         if (err.response?.status === 402) {
             return res.status(402).json({
                 success: false,
