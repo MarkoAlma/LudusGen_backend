@@ -1420,8 +1420,100 @@ router.get('/meshy/task/:type/:taskId', verifyFirebaseToken, async (req, res) =>
 // Ha WSL-ben fut a NIM és Windowson a Node: http://localhost:8000/v1/infer (WSL portforward miatt is működik)
 import fetch from 'node-fetch';
 
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+
 const TRELLIS_NIM_URL = 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis';
 
+// ── Backblaze B2 kliens (S3-kompatibilis API, private bucket) ─────────────────
+// Env változók (Backblaze dashboard → App Keys):
+//   B2_ENDPOINT       pl. https://s3.us-west-004.backblazeb2.com
+//   B2_KEY_ID         applicationKeyId
+//   B2_APP_KEY        applicationKey
+//   B2_BUCKET_NAME    bucket neve
+//   B2_PRESIGN_TTL    presigned URL lejárat másodpercben (default: 604800 = 7 nap)
+
+const b2 = new S3Client({
+  region:      'us-east-005',   // B2 figyelmen kívül hagyja, de kötelező mező
+  endpoint:    process.env.B2_ENDPOINT,
+  credentials: {
+    accessKeyId:     process.env.B2_KEY_ID,
+    secretAccessKey: process.env.B2_APP_KEY,
+  },
+  forcePathStyle: true,   // B2-höz szükséges
+});
+
+async function uploadGlbToB2(base64Glb, filename) {
+  const buffer = Buffer.from(base64Glb, 'base64');
+  const key    = `trellis/${filename}`;
+
+  await b2.send(new PutObjectCommand({
+    Bucket:      process.env.B2_BUCKET_NAME,
+    Key:         key,
+    Body:        buffer,
+    ContentType: 'model/gltf-binary',
+  }));
+
+  console.log(`☁️  B2 feltöltve: ${key}`);
+  return key;   // csak a kulcsot adjuk vissza, URL-t a proxy adja
+}
+
+// ── B2 proxy — a böngésző saját backenden keresztül tölti le a GLB-t ─────────
+// CORS és private bucket probléma megkerülése: a frontend nem nyúl közvetlenül B2-höz.
+//
+// Két végpont:
+//   GET /api/trellis/model/:filename   — új generálásokhoz (kulcs alapján)
+//   GET /api/trellis/proxy             — régi presigned URL-ekhez (?key=trellis/...)
+
+// Közös stream helper
+async function streamB2Key(key, filename, res) {
+  const cmd  = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key });
+  const data = await b2.send(cmd);
+  res.setHeader('Content-Type', 'model/gltf-binary');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  data.Body.pipe(res);
+}
+
+// Új URL formátum: /api/trellis/model/trellis_1234_0.glb
+router.get('/trellis/model/:filename', verifyFirebaseToken, async (req, res) => {
+  const key = `trellis/${req.params.filename}`;
+  try {
+    await streamB2Key(key, req.params.filename, res);
+  } catch (err) {
+    console.error('❌ B2 proxy hiba:', err.message);
+    res.status(404).json({ success: false, message: 'Fájl nem található' });
+  }
+});
+
+// Fallback presigned/teljes URL-hez: ?key=trellis/fájlnév.glb
+// A frontend ezt hívja ha a history-ban még régi presigned URL van tárolva
+router.get('/trellis/proxy', verifyFirebaseToken, async (req, res) => {
+  // key query param vagy a presigned URL-ből kinyert útvonal
+  let key = req.query.key;
+
+  if (!key && req.query.url) {
+    // Presigned URL-ből kinyerjük a path-t: /BUCKET/trellis/fájl.glb?...
+    try {
+      const u = new URL(req.query.url);
+      // path: /LudusGen/trellis/fájl.glb  → key: trellis/fájl.glb
+      key = u.pathname.replace(/^\/[^/]+\//, '');
+    } catch {
+      return res.status(400).json({ success: false, message: 'Érvénytelen URL' });
+    }
+  }
+
+  if (!key) return res.status(400).json({ success: false, message: 'Hiányzó key vagy url param' });
+
+  const filename = key.split('/').pop();
+  try {
+    await streamB2Key(key, filename, res);
+  } catch (err) {
+    console.error('❌ B2 proxy (fallback) hiba:', err.message);
+    res.status(404).json({ success: false, message: 'Fájl nem található' });
+  }
+});
+
+// ── Route ─────────────────────────────────────────────────────────────────────
 router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
   const {
     prompt,
@@ -1432,7 +1524,6 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     ss_sampling_steps   = 25,
   } = req.body;
 
-  // ── Validation ────────────────────────────────────────────────────────
   if (!prompt || !String(prompt).trim()) {
     return res.status(400).json({ success: false, message: 'A prompt megadása kötelező' });
   }
@@ -1445,7 +1536,6 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
   }
 
-  // ── Build payload ─────────────────────────────────────────────────────
   const payload = {
     prompt:              String(prompt).trim(),
     seed:                Math.min(2147483647, Math.max(0, Math.floor(Number(seed) || 0))),
@@ -1466,22 +1556,19 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
         'Accept':        'application/json',
         'Authorization': `Bearer ${apiKey}`,
       },
-      body:    JSON.stringify(payload),
-      // node-fetch v3 doesn't have timeout built-in, use AbortController
-      signal:  AbortSignal.timeout(300_000),
+      body:   JSON.stringify(payload),
+      signal: AbortSignal.timeout(300_000),
     });
 
     if (!nimResp.ok) {
       const errText = await nimResp.text();
       console.error(`❌ Trellis HTTP ${nimResp.status}:`, errText.slice(0, 400));
-
       const msg =
         nimResp.status === 401 ? 'Érvénytelen NVIDIA API kulcs' :
         nimResp.status === 422 ? `Érvénytelen kérés: ${errText}` :
         nimResp.status === 429 ? 'NVIDIA rate limit — próbáld újra később' :
         nimResp.status === 503 ? 'NVIDIA szerver nem elérhető' :
         `Trellis hiba (${nimResp.status}): ${errText.slice(0, 200)}`;
-
       return res.status(nimResp.status).json({ success: false, message: msg });
     }
 
@@ -1489,47 +1576,48 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     console.log('🧊 Trellis response keys:', Object.keys(body));
 
     // ── Extract base64 GLB ────────────────────────────────────────────
-    // NVIDIA docs: artifacts[0].base64
     let base64Glb = null;
-
     if (Array.isArray(body.artifacts) && body.artifacts.length > 0) {
       const art = body.artifacts[0];
       base64Glb = art.base64 ?? art.glb ?? art.model ?? art.data ?? null;
     }
-
-    // Fallback: top-level
-    if (!base64Glb) {
-      base64Glb = body.base64 ?? body.glb ?? body.model ?? null;
-    }
+    if (!base64Glb) base64Glb = body.base64 ?? body.glb ?? body.model ?? null;
 
     if (!base64Glb) {
       console.error('🧊 Trellis: nincs base64 GLB:', JSON.stringify(body).slice(0, 400));
-      return res.status(500).json({
-        success: false,
-        message: 'A Trellis API nem adott vissza 3D modellt',
-      });
+      return res.status(500).json({ success: false, message: 'A Trellis API nem adott vissza 3D modellt' });
     }
 
-    // Return as data URI — Three.js GLTFLoader can load this directly
-    const glbDataUri = `data:model/gltf-binary;base64,${base64Glb}`;
+    // ── Backblaze B2 feltöltés ────────────────────────────────────────
+    const filename = `trellis_${Date.now()}_${payload.seed}.glb`;
+    let glbUrl;
+
+    try {
+      const b2Key = await uploadGlbToB2(base64Glb, filename);
+      // Proxy URL — a frontend a saját backenden keresztül kéri le (nincs CORS gond)
+      glbUrl = `/api/trellis/model/${filename}`;
+    } catch (b2Err) {
+      // Ha B2 nem elérhető, data URI fallback
+      console.warn('⚠️  B2 feltöltés sikertelen, data URI fallback:', b2Err.message);
+      glbUrl = `data:model/gltf-binary;base64,${base64Glb}`;
+    }
 
     await logUsage(req.userId, 'trellis', {
       prompt: payload.prompt.slice(0, 80),
       seed:   payload.seed,
+      b2_key: `trellis/${filename}`,
     });
 
-    return res.json({ success: true, glb_url: glbDataUri });
+    return res.json({ success: true, glb_url: glbUrl });
 
   } catch (err) {
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
       return res.status(504).json({ success: false, message: 'Trellis időtúllépés (>5 perc)' });
     }
-
     console.error('❌ Trellis fetch hiba:', err.message);
     return res.status(500).json({ success: false, message: err.message ?? 'Hálózati hiba' });
   }
 });
-
 // ════════════════════════════════════════════════════
 // 10. MESHY — Előzmények
 //     GET /api/meshy/history
