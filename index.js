@@ -22,7 +22,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/api', aiRoutes);     // Add routes after middlewares
 
 // ==================== CLOUDINARY CONFIG ====================
