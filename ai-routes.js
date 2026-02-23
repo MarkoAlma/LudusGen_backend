@@ -9,8 +9,81 @@ import axios from 'axios';
 import dns from "dns";
 dns.setDefaultResultOrder("ipv4first");
 import https from "https";
-import sharp from 'sharp';
 
+import grpc from '@grpc/grpc-js';
+import protoLoader from '@grpc/proto-loader';
+import { createWriteStream, mkdirSync } from 'fs';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+import { existsSync, writeFileSync, unlinkSync } from 'fs';
+
+// ── Riva proto letöltés + betöltés (egyszer, induláskor) ───────────
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PROTO_DIR  = path.join(__dirname, 'protos');
+const PROTO_PATH = path.join(PROTO_DIR, 'riva_tts.proto');
+
+const INLINE_PROTO = `
+syntax = "proto3";
+package nvidia.riva.tts;
+enum AudioEncoding { ENCODING_UNSPECIFIED = 0; LINEAR_PCM = 1; FLAC = 2; MULAW = 3; ALAW = 20; }
+message SynthesizeSpeechRequest {
+  string text = 1;
+  string language_code = 2;
+  AudioEncoding encoding = 3;
+  int32 sample_rate_hz = 4;
+  string voice_name = 5;
+}
+message SynthesizeSpeechResponse {
+  bytes audio = 1;
+}
+service RivaSpeechSynthesis {
+  rpc Synthesize(SynthesizeSpeechRequest) returns (SynthesizeSpeechResponse);
+}
+`;
+
+function ensureProtoSync() {
+    mkdirSync(PROTO_DIR, { recursive: true });
+    writeFileSync(PROTO_PATH, INLINE_PROTO);
+}
+ensureProtoSync();
+
+function createRivaClient() {
+    const packageDef = protoLoader.loadSync(PROTO_PATH, {
+        keepCase: true,
+        longs: String,
+        enums: String,
+        defaults: true,
+        oneofs: true,
+    });
+    const proto = grpc.loadPackageDefinition(packageDef).nvidia.riva.tts;
+    const sslCreds = grpc.credentials.createSsl();
+    return new proto.RivaSpeechSynthesis('grpc.nvcf.nvidia.com:443', sslCreds);
+}
+
+function pcmToWav(pcmBuffer, sampleRate = 22050, channels = 1, bitDepth = 16) {
+    const dataSize   = pcmBuffer.length;
+    const byteRate   = sampleRate * channels * (bitDepth / 8);
+    const blockAlign = channels * (bitDepth / 8);
+    const buf = Buffer.alloc(44 + dataSize);
+
+    buf.write('RIFF', 0);
+    buf.writeUInt32LE(36 + dataSize, 4);
+    buf.write('WAVE', 8);
+    buf.write('fmt ', 12);
+    buf.writeUInt32LE(16, 16);
+    buf.writeUInt16LE(1, 20);
+    buf.writeUInt16LE(channels, 22);
+    buf.writeUInt32LE(sampleRate, 24);
+    buf.writeUInt32LE(byteRate, 28);
+    buf.writeUInt16LE(blockAlign, 32);
+    buf.writeUInt16LE(bitDepth, 34);
+    buf.write('data', 36);
+    buf.writeUInt32LE(dataSize, 40);
+    pcmBuffer.copy(buf, 44);
+
+    return buf;
+}
 
 const httpsAgent = new https.Agent({ family: 4 });
 
@@ -27,7 +100,6 @@ REQUIRED_KEYS.forEach((key) => {
 // ── API kliensek inicializálása ───────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 
 fal.config({ credentials: process.env.FAL_KEY });
 
@@ -74,7 +146,6 @@ const genLimiter = rateLimit({
   message: { success: false, message: 'Túl sok generálás – próbáld újra 1 óra múlva' },
 });
 
-
 // ── Firestore usage log ───────────────────────────────
 async function logUsage(userId, type, meta = {}) {
     try {
@@ -88,6 +159,20 @@ async function logUsage(userId, type, meta = {}) {
     } catch (e) {
         console.warn('Usage log failed:', e.message);
     }
+}
+
+// ── Segédfüggvény: messages normalizálása (vision support) ──────────
+// Ha egy üzenet content-je array (multimodális), azt változatlanul hagyjuk.
+// Ha string, azt is változatlanul hagyjuk. Ez biztosítja, hogy az
+// OpenAI-kompatibilis végpontok (NVIDIA, OpenRouter, Groq stb.) megkapják
+// a helyes formátumot vision üzeneteknél is.
+function normalizeMessages(messages) {
+    return messages.map((m) => ({
+        role: m.role,
+        content: Array.isArray(m.content)
+            ? m.content  // multimodális array — változatlanul
+            : String(m.content),
+    }));
 }
 
 // ════════════════════════════════════════════════════
@@ -156,7 +241,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             const resp = await openai.chat.completions.create({
                 model,
-                messages: messages.map((m) => ({ role: m.role, content: String(m.content) })),
+                messages: normalizeMessages(messages),
                 temperature: Math.min(Math.max(0, temperature), 2),
                 max_tokens: safeMax,
                 top_p: Math.min(Math.max(0, top_p), 1),
@@ -181,7 +266,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'CEREBRAS_API_KEY nincs beállítva' });
             }
 
-            const chatMsgs = messages.map(m => ({ role: m.role, content: String(m.content) }));
+            const chatMsgs = normalizeMessages(messages);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -261,7 +346,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'MISTRAL_API_KEY nincs beállítva' });
             }
 
-            const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
+            const chatMsgs = normalizeMessages(messages);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -341,7 +426,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
             }
 
-            const chatMsgs = messages.map((m) => ({ role: m.role, content: String(m.content) }));
+            const chatMsgs = normalizeMessages(messages);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -500,11 +585,14 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             return;
         }
 
-        // ── NVIDIA ────────────────────────────────────────
+        // ── NVIDIA — SSE Streaming + Vision támogatás ─────
         else if (provider === 'nvidia') {
             if (!process.env.NVIDIA_API_KEY) {
                 return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
             }
+
+            // normalizeMessages kezeli az array content-ű (vision) üzeneteket is
+            const nvidiaMsgs = normalizeMessages(messages);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -518,7 +606,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     'https://integrate.api.nvidia.com/v1/chat/completions',
                     {
                         model,
-                        messages,
+                        messages: nvidiaMsgs,
                         temperature: Math.min(Math.max(0, temperature), 2),
                         max_tokens: safeMax,
                         top_p: Math.min(Math.max(0, top_p), 1),
@@ -589,10 +677,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'OPENROUTER_API_KEY nincs beállítva a .env-ben' });
             }
 
-            const chatMsgs = messages.map((m) => ({
-                role: m.role,
-                content: String(m.content),
-            }));
+            const chatMsgs = normalizeMessages(messages);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -698,7 +783,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             guidance_scale = 7.5,
             seed, num_images = 1,
             aspect_ratio = '1:1',
-            // FLUX Kontext: szerkesztendő kép (data URL)
             input_image,
         } = req.body;
 
@@ -811,106 +895,17 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             console.log('🎨 NVIDIA NIM image generation:', apiId, prompt.trim());
 
             const id = apiId.toLowerCase();
-            // Fontos: kontext ellenőrzés ELŐBB, mert tartalmazza a "flux" szót is
             const isFluxKontext = id.includes('kontext');
             const isFlux        = id.includes('flux') && !isFluxKontext;
             const isSD3         = id.includes('stable-diffusion-3');
 
-            // Seed validálás — NaN-t soha ne küldjük
             const safeSeed = seed !== undefined && seed !== null && seed !== '' && !isNaN(parseInt(seed))
                 ? parseInt(seed)
                 : undefined;
 
             let requestBody;
 
-// if (isFluxKontext) {
-//     if (!input_image) {
-//         return res.status(400).json({ 
-//             success: false, 
-//             message: 'A FLUX Kontext modellhez input kép szükséges.' 
-//         });
-//     }
-
-//     const VALID_SIZES = [
-//         [672,1568], [688,1504], [720,1456],
-//         [752,1392], [800,1328], [832,1248],
-//         [880,1184], [944,1104], [1024,1024], [1104,944],
-//         [1184,880], [1248,832], [1328,800], [1392,752],
-//         [1456,720], [1504,688], [1568,672]
-//     ];
-
-//     function closestSize(w, h) {
-//         const ratio = w / h;
-//         return VALID_SIZES.reduce(
-//             (best, [rw, rh]) =>
-//                 Math.abs(rw / rh - ratio) < Math.abs(best[0] / best[1] - ratio)
-//                     ? [rw, rh]
-//                     : best
-//         );
-//     }
-
-//     const inputBuffer = Buffer.from(input_image.split(',')[1], 'base64');
-//     const meta = await sharp(inputBuffer).metadata();
-//     const [tw, th] = closestSize(meta.width, meta.height);
-
-// const resizedBuffer = await sharp(inputBuffer)
-//     .resize(tw, th, { fit: 'cover' })
-//     .png()                          // ← PNG output
-//     .toBuffer();
-
-// const imageB64 = `data:image/png;base64,${resizedBuffer.toString('base64')}`;  // ← png MIME type
-
-//     console.log(`Kontext: ${meta.width}x${meta.height} → ${tw}x${th}, b64 length: ${imageB64.length}`);
-
-//     const requestBody = {
-//         prompt: "Using the input image as context, modify the image so that it shows a photo of a landscape",
-//         image: imageB64,
-//         steps: 30,
-//         seed: safeSeed ?? 0,
-//         cfg_scale: 3.5
-//     };
-
-//     let nimResp;
-//     try {
-//         nimResp = await axios.post(
-//             `https://ai.api.nvidia.com/v1/genai/${apiId}`,
-//             requestBody,
-//             {
-//                 headers: {
-//                     'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
-//                     'Content-Type': 'application/json',
-//                     'Accept': 'application/json'
-//                 },
-//                 timeout: 180000
-//             }
-//         );
-//     } catch (err) {
-//         console.error('NVIDIA image hiba:', err.response?.data || err.message);
-//         return res.status(500).json({
-//             success: false,
-//             message: err.response?.data?.detail || err.response?.data?.title || err.message,
-//         });
-//     }
-
-//     const base64Image =
-//         nimResp.data?.image ??
-//         nimResp.data?.artifacts?.[0]?.base64;
-
-//     if (!base64Image) {
-//         return res.status(500).json({ success: false, message: 'Nem érkezett kép az NVIDIA API-tól' });
-//     }
-
-//     const images = [{
-//         url: `data:image/png;base64,${base64Image}`,
-//         width: tw,
-//         height: th
-//     }];
-    
-//     await logUsage(req.userId, 'image', { provider: 'nvidia-image', apiId, numImages: 1 });
-//     return res.json({ success: true, images });
-// }
-    if (isFlux) {
-                // ── FLUX.1 dev / schnell: text-to-image ───────────
+            if (isFlux) {
                 requestBody = {
                     prompt: prompt.trim(),
                     mode: 'base',
@@ -921,7 +916,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                     ...(safeSeed !== undefined ? { seed: safeSeed } : {}),
                 };
             } else if (isSD3) {
-                // ── Stable Diffusion 3 Medium ──────────────────────
                 requestBody = {
                     prompt: prompt.trim(),
                     cfg_scale: Math.min(Math.max(1, guidance_scale), 20),
@@ -960,8 +954,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 });
             }
 
-            // SD3  → { image: "base64..." }
-            // FLUX → { artifacts: [{ base64: "...", finishReason, seed }] }
             const base64Image = nimResp.data?.image ?? nimResp.data?.artifacts?.[0]?.base64;
 
             if (!base64Image) {
@@ -1064,6 +1056,51 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
             const mimeTypes = { mp3: 'audio/mpeg', opus: 'audio/ogg', aac: 'audio/aac', flac: 'audio/flac' };
             const buffer = Buffer.from(await resp.arrayBuffer());
             audioUrl = `data:${mimeTypes[safeFormat]};base64,${buffer.toString('base64')}`;
+        }
+
+        else if (provider === 'nvidia-riva') {
+            if (!process.env.NVIDIA_API_KEY) {
+                return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
+            }
+
+            const FUNCTION_ID = '877104f7-e885-42b9-8de8-f6e4c6303969';
+            const { voice = 'Magpie-Multilingual.EN-US.Aria', language_code = 'en-US' } = req.body;
+
+            const client = createRivaClient();
+
+            const meta = new grpc.Metadata();
+            meta.add('authorization', `Bearer ${process.env.NVIDIA_API_KEY}`);
+            meta.add('function-id', FUNCTION_ID);
+
+            const audioBuffer = await new Promise((resolve, reject) => {
+                client.synthesize(
+                    {
+                        text: text.trim(),
+                        language_code,
+                        voice_name: voice,
+                        encoding: 'LINEAR_PCM',
+                        sample_rate_hz: 22050,
+                    },
+                    meta,
+                    (err, response) => {
+                        if (err) {
+                            console.error('Riva gRPC error details:', err.code, err.message, err.details);
+                            reject(new Error(`gRPC hiba: ${err.message} (code: ${err.code})`));
+                        } else {
+                            resolve(response.audio);
+                        }
+                    }
+                );
+            });
+
+            const wavBuffer = pcmToWav(audioBuffer, 22050, 1, 16);
+            audioUrl = `data:audio/wav;base64,${wavBuffer.toString('base64')}`;
+
+            await logUsage(req.userId, 'tts', {
+                provider: 'nvidia-riva',
+                model: 'magpie-tts-multilingual',
+                chars: text.length,
+            });
         }
 
         else if (provider === 'elevenlabs') {
