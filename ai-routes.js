@@ -1369,6 +1369,165 @@ router.get('/meshy/task/:type/:taskId', verifyFirebaseToken, async (req, res) =>
       message: err.response?.data?.message || 'Taszk lekérdezési hiba',
     });
   }
+});// ════════════════════════════════════════════════════════════════════════
+// TRELLIS — POST /api/trellis
+// NVIDIA microsoft/trellis: Image → 3D (GLB)
+//
+// Body: {
+//   image:               string  (data URI, base64 PNG/JPG/WEBP)
+//   slat_cfg_scale:      number  (default 3,   range 1–10)
+//   ss_cfg_scale:        number  (default 7.5, range 1–15)
+//   slat_sampling_steps: number  (default 25,  range 10–50)
+//   ss_sampling_steps:   number  (default 25,  range 10–50)
+//   seed:                number  (default 0,   range 0–2147483647)
+// }
+//
+// Response: {
+//   success:   boolean
+//   glb_url:   string | null    (data URI or external URL of the GLB model)
+//   message?:  string           (on error)
+// }
+// ════════════════════════════════════════════════════════════════════════
+
+
+// ════════════════════════════════════════════════════════════════════════
+// TRELLIS — POST /api/trellis
+//
+// Lokális NVIDIA NIM szerver (WSL / NVIDIA Workbench):
+//   podman run ... -p 8000:8000 nvcr.io/nim/microsoft/trellis:latest
+//   → elérhető: http://localhost:8000/v1/infer
+//
+// NIM API:
+//   POST http://localhost:8000/v1/infer
+//   Body:     { prompt: string, seed: number }
+//   Response: { artifacts: [{ base64: string }] }   ← raw GLB binary
+//
+// Frontend → backend body:
+//   prompt               string   required
+//   seed                 number   optional (default 0)
+//   slat_cfg_scale       number   optional
+//   ss_cfg_scale         number   optional
+//   slat_sampling_steps  number   optional
+//   ss_sampling_steps    number   optional
+//
+// Backend → frontend response:
+//   { success: true,  glb_url: "data:model/gltf-binary;base64,..." }
+//   { success: false, message: string }
+// ════════════════════════════════════════════════════════════════════════
+
+// A lokális NIM szerver URL-je (az Express backend oldaláról elérhető)
+// Ha a backend és a NIM ugyanazon a gépen fut: http://localhost:8000/v1/infer
+// Ha WSL-ben fut a NIM és Windowson a Node: http://localhost:8000/v1/infer (WSL portforward miatt is működik)
+import fetch from 'node-fetch';
+
+const TRELLIS_NIM_URL = 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis';
+
+router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
+  const {
+    prompt,
+    seed                = 0,
+    slat_cfg_scale      = 3,
+    ss_cfg_scale        = 7.5,
+    slat_sampling_steps = 25,
+    ss_sampling_steps   = 25,
+  } = req.body;
+
+  // ── Validation ────────────────────────────────────────────────────────
+  if (!prompt || !String(prompt).trim()) {
+    return res.status(400).json({ success: false, message: 'A prompt megadása kötelező' });
+  }
+  if (String(prompt).length > 1000) {
+    return res.status(400).json({ success: false, message: 'A prompt maximum 1000 karakter lehet' });
+  }
+
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
+  }
+
+  // ── Build payload ─────────────────────────────────────────────────────
+  const payload = {
+    prompt:              String(prompt).trim(),
+    seed:                Math.min(2147483647, Math.max(0, Math.floor(Number(seed) || 0))),
+    slat_cfg_scale:      Number(slat_cfg_scale),
+    ss_cfg_scale:        Number(ss_cfg_scale),
+    slat_sampling_steps: Math.round(Number(slat_sampling_steps)),
+    ss_sampling_steps:   Math.round(Number(ss_sampling_steps)),
+  };
+
+  console.log(`🧊 Trellis → ${TRELLIS_NIM_URL}`);
+  console.log(`   prompt: "${payload.prompt.slice(0, 80)}" | seed: ${payload.seed}`);
+
+  try {
+    const nimResp = await fetch(TRELLIS_NIM_URL, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body:    JSON.stringify(payload),
+      // node-fetch v3 doesn't have timeout built-in, use AbortController
+      signal:  AbortSignal.timeout(300_000),
+    });
+
+    if (!nimResp.ok) {
+      const errText = await nimResp.text();
+      console.error(`❌ Trellis HTTP ${nimResp.status}:`, errText.slice(0, 400));
+
+      const msg =
+        nimResp.status === 401 ? 'Érvénytelen NVIDIA API kulcs' :
+        nimResp.status === 422 ? `Érvénytelen kérés: ${errText}` :
+        nimResp.status === 429 ? 'NVIDIA rate limit — próbáld újra később' :
+        nimResp.status === 503 ? 'NVIDIA szerver nem elérhető' :
+        `Trellis hiba (${nimResp.status}): ${errText.slice(0, 200)}`;
+
+      return res.status(nimResp.status).json({ success: false, message: msg });
+    }
+
+    const body = await nimResp.json();
+    console.log('🧊 Trellis response keys:', Object.keys(body));
+
+    // ── Extract base64 GLB ────────────────────────────────────────────
+    // NVIDIA docs: artifacts[0].base64
+    let base64Glb = null;
+
+    if (Array.isArray(body.artifacts) && body.artifacts.length > 0) {
+      const art = body.artifacts[0];
+      base64Glb = art.base64 ?? art.glb ?? art.model ?? art.data ?? null;
+    }
+
+    // Fallback: top-level
+    if (!base64Glb) {
+      base64Glb = body.base64 ?? body.glb ?? body.model ?? null;
+    }
+
+    if (!base64Glb) {
+      console.error('🧊 Trellis: nincs base64 GLB:', JSON.stringify(body).slice(0, 400));
+      return res.status(500).json({
+        success: false,
+        message: 'A Trellis API nem adott vissza 3D modellt',
+      });
+    }
+
+    // Return as data URI — Three.js GLTFLoader can load this directly
+    const glbDataUri = `data:model/gltf-binary;base64,${base64Glb}`;
+
+    await logUsage(req.userId, 'trellis', {
+      prompt: payload.prompt.slice(0, 80),
+      seed:   payload.seed,
+    });
+
+    return res.json({ success: true, glb_url: glbDataUri });
+
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return res.status(504).json({ success: false, message: 'Trellis időtúllépés (>5 perc)' });
+    }
+
+    console.error('❌ Trellis fetch hiba:', err.message);
+    return res.status(500).json({ success: false, message: err.message ?? 'Hálózati hiba' });
+  }
 });
 
 // ════════════════════════════════════════════════════
