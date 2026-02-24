@@ -455,6 +455,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
+            
 
             let totalContent = '';
             let buf = '';
