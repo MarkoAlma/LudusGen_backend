@@ -162,15 +162,11 @@ async function logUsage(userId, type, meta = {}) {
 }
 
 // ── Segédfüggvény: messages normalizálása (vision support) ──────────
-// Ha egy üzenet content-je array (multimodális), azt változatlanul hagyjuk.
-// Ha string, azt is változatlanul hagyjuk. Ez biztosítja, hogy az
-// OpenAI-kompatibilis végpontok (NVIDIA, OpenRouter, Groq stb.) megkapják
-// a helyes formátumot vision üzeneteknél is.
 function normalizeMessages(messages) {
     return messages.map((m) => ({
         role: m.role,
         content: Array.isArray(m.content)
-            ? m.content  // multimodális array — változatlanul
+            ? m.content
             : String(m.content),
     }));
 }
@@ -303,6 +299,15 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.end();
             }
 
+            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
+            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
+            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
+            req.on('close', () => {
+                if (!res.writableEnded) {
+                    streamResp.data.destroy();
+                }
+            });
+
             let totalContent = '';
             let buf = '';
 
@@ -383,6 +388,15 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.end();
             }
 
+            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
+            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
+            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
+            req.on('close', () => {
+                if (!res.writableEnded) {
+                    streamResp.data.destroy();
+                }
+            });
+
             let totalContent = '';
             let buf = '';
 
@@ -460,7 +474,15 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
-            
+
+            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
+            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
+            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
+            req.on('close', () => {
+                if (!res.writableEnded) {
+                    streamResp.data.destroy();
+                }
+            });
 
             let totalContent = '';
             let buf = '';
@@ -549,6 +571,15 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.end();
             }
 
+            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
+            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
+            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
+            req.on('close', () => {
+                if (!res.writableEnded) {
+                    streamResp.data.destroy();
+                }
+            });
+
             let totalContent = '';
             let buf = '';
 
@@ -592,7 +623,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
             }
 
-            // normalizeMessages kezeli az array content-ű (vision) üzeneteket is
             const nvidiaMsgs = normalizeMessages(messages);
 
             res.setHeader('Content-Type', 'text/event-stream');
@@ -631,6 +661,14 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             const keepAlive = setInterval(() => {
                 res.write(': ping\n\n');
             }, 15000);
+
+            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
+            req.on('close', () => {
+                if (!res.writableEnded) {
+                    clearInterval(keepAlive);
+                    streamResp.data.destroy();
+                }
+            });
 
             let totalContent = '';
             let buf = '';
@@ -715,6 +753,15 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
+
+            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
+            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
+            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
+            req.on('close', () => {
+                if (!res.writableEnded) {
+                    streamResp.data.destroy();
+                }
+            });
 
             let totalContent = '';
             let buf = '';
@@ -842,7 +889,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
         }
 
         // ── Cloudflare Workers AI ─────────────────────────
-        
         else if (provider === 'cloudflare') {
             if (!process.env.CLOUDFLARE_API_KEY) {
                 return res.status(500).json({ success: false, message: 'CLOUDFLARE_API_KEY nincs beállítva a .env-ben' });
@@ -1230,6 +1276,7 @@ router.get('/usage-stats', verifyFirebaseToken, async (req, res) => {
         return res.status(500).json({ success: false, message: 'Statisztika hiba' });
     }
 });
+
 // ════════════════════════════════════════════════════
 router.post('/meshy/text-to-3d', verifyFirebaseToken, genLimiter, async (req, res) => {
   if (!MESHY_KEY)
@@ -1277,11 +1324,6 @@ router.post('/meshy/text-to-3d', verifyFirebaseToken, genLimiter, async (req, re
 
 // ════════════════════════════════════════════════════
 // 7.  MESHY — Image to 3D
-//     POST /api/meshy/image-to-3d
-//     Body: { image_url, model_type?, ai_model?, topology?,
-//             target_polycount?, symmetry_mode?, should_remesh?,
-//             should_texture?, enable_pbr?, pose_mode?,
-//             texture_prompt?, moderation? }
 // ════════════════════════════════════════════════════
 router.post('/meshy/image-to-3d', verifyFirebaseToken, genLimiter, async (req, res) => {
   if (!MESHY_KEY)
@@ -1334,9 +1376,6 @@ router.post('/meshy/image-to-3d', verifyFirebaseToken, genLimiter, async (req, r
 
 // ════════════════════════════════════════════════════
 // 8.  MESHY — Text to 3D Refine
-//     POST /api/meshy/refine
-//     Body: { preview_task_id, enable_pbr?, texture_prompt?,
-//             texture_image_url?, ai_model?, moderation? }
 // ════════════════════════════════════════════════════
 router.post('/meshy/refine', verifyFirebaseToken, async (req, res) => {
   if (!MESHY_KEY)
@@ -1378,8 +1417,6 @@ router.post('/meshy/refine', verifyFirebaseToken, async (req, res) => {
 
 // ════════════════════════════════════════════════════
 // 9.  MESHY — Task státusz lekérdezés
-//     GET /api/meshy/task/:type/:taskId
-//     type: "text-to-3d" | "image-to-3d"
 // ════════════════════════════════════════════════════
 router.get('/meshy/task/:type/:taskId', verifyFirebaseToken, async (req, res) => {
   if (!MESHY_KEY)
@@ -1407,77 +1444,21 @@ router.get('/meshy/task/:type/:taskId', verifyFirebaseToken, async (req, res) =>
       message: err.response?.data?.message || 'Taszk lekérdezési hiba',
     });
   }
-});// ════════════════════════════════════════════════════════════════════════
-// TRELLIS — POST /api/trellis
-// NVIDIA microsoft/trellis: Image → 3D (GLB)
-//
-// Body: {
-//   image:               string  (data URI, base64 PNG/JPG/WEBP)
-//   slat_cfg_scale:      number  (default 3,   range 1–10)
-//   ss_cfg_scale:        number  (default 7.5, range 1–15)
-//   slat_sampling_steps: number  (default 25,  range 10–50)
-//   ss_sampling_steps:   number  (default 25,  range 10–50)
-//   seed:                number  (default 0,   range 0–2147483647)
-// }
-//
-// Response: {
-//   success:   boolean
-//   glb_url:   string | null    (data URI or external URL of the GLB model)
-//   message?:  string           (on error)
-// }
-// ════════════════════════════════════════════════════════════════════════
+});
 
-
-// ════════════════════════════════════════════════════════════════════════
-// TRELLIS — POST /api/trellis
-//
-// Lokális NVIDIA NIM szerver (WSL / NVIDIA Workbench):
-//   podman run ... -p 8000:8000 nvcr.io/nim/microsoft/trellis:latest
-//   → elérhető: http://localhost:8000/v1/infer
-//
-// NIM API:
-//   POST http://localhost:8000/v1/infer
-//   Body:     { prompt: string, seed: number }
-//   Response: { artifacts: [{ base64: string }] }   ← raw GLB binary
-//
-// Frontend → backend body:
-//   prompt               string   required
-//   seed                 number   optional (default 0)
-//   slat_cfg_scale       number   optional
-//   ss_cfg_scale         number   optional
-//   slat_sampling_steps  number   optional
-//   ss_sampling_steps    number   optional
-//
-// Backend → frontend response:
-//   { success: true,  glb_url: "data:model/gltf-binary;base64,..." }
-//   { success: false, message: string }
-// ════════════════════════════════════════════════════════════════════════
-
-// A lokális NIM szerver URL-je (az Express backend oldaláról elérhető)
-// Ha a backend és a NIM ugyanazon a gépen fut: http://localhost:8000/v1/infer
-// Ha WSL-ben fut a NIM és Windowson a Node: http://localhost:8000/v1/infer (WSL portforward miatt is működik)
 import fetch from 'node-fetch';
-
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 
 const TRELLIS_NIM_URL = 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis';
 
-// ── Backblaze B2 kliens (S3-kompatibilis API, private bucket) ─────────────────
-// Env változók (Backblaze dashboard → App Keys):
-//   B2_ENDPOINT       pl. https://s3.us-west-004.backblazeb2.com
-//   B2_KEY_ID         applicationKeyId
-//   B2_APP_KEY        applicationKey
-//   B2_BUCKET_NAME    bucket neve
-//   B2_PRESIGN_TTL    presigned URL lejárat másodpercben (default: 604800 = 7 nap)
-
 const b2 = new S3Client({
-  region:      'us-east-005',   // B2 figyelmen kívül hagyja, de kötelező mező
+  region:      'us-east-005',
   endpoint:    process.env.B2_ENDPOINT,
   credentials: {
     accessKeyId:     process.env.B2_KEY_ID,
     secretAccessKey: process.env.B2_APP_KEY,
   },
-  forcePathStyle: true,   // B2-höz szükséges
+  forcePathStyle: true,
 });
 
 async function uploadGlbToB2(base64Glb, filename) {
@@ -1492,17 +1473,9 @@ async function uploadGlbToB2(base64Glb, filename) {
   }));
 
   console.log(`☁️  B2 feltöltve: ${key}`);
-  return key;   // csak a kulcsot adjuk vissza, URL-t a proxy adja
+  return key;
 }
 
-// ── B2 proxy — a böngésző saját backenden keresztül tölti le a GLB-t ─────────
-// CORS és private bucket probléma megkerülése: a frontend nem nyúl közvetlenül B2-höz.
-//
-// Két végpont:
-//   GET /api/trellis/model/:filename   — új generálásokhoz (kulcs alapján)
-//   GET /api/trellis/proxy             — régi presigned URL-ekhez (?key=trellis/...)
-
-// Közös stream helper
 async function streamB2Key(key, filename, res) {
   const cmd  = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key });
   const data = await b2.send(cmd);
@@ -1512,7 +1485,6 @@ async function streamB2Key(key, filename, res) {
   data.Body.pipe(res);
 }
 
-// Új URL formátum: /api/trellis/model/trellis_1234_0.glb
 router.get('/trellis/model/:filename', verifyFirebaseToken, async (req, res) => {
   const key = `trellis/${req.params.filename}`;
   try {
@@ -1523,17 +1495,12 @@ router.get('/trellis/model/:filename', verifyFirebaseToken, async (req, res) => 
   }
 });
 
-// Fallback presigned/teljes URL-hez: ?key=trellis/fájlnév.glb
-// A frontend ezt hívja ha a history-ban még régi presigned URL van tárolva
 router.get('/trellis/proxy', verifyFirebaseToken, async (req, res) => {
-  // key query param vagy a presigned URL-ből kinyert útvonal
   let key = req.query.key;
 
   if (!key && req.query.url) {
-    // Presigned URL-ből kinyerjük a path-t: /BUCKET/trellis/fájl.glb?...
     try {
       const u = new URL(req.query.url);
-      // path: /LudusGen/trellis/fájl.glb  → key: trellis/fájl.glb
       key = u.pathname.replace(/^\/[^/]+\//, '');
     } catch {
       return res.status(400).json({ success: false, message: 'Érvénytelen URL' });
@@ -1551,7 +1518,6 @@ router.get('/trellis/proxy', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// ── Route ─────────────────────────────────────────────────────────────────────
 router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
   const {
     prompt,
@@ -1613,7 +1579,6 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     const body = await nimResp.json();
     console.log('🧊 Trellis response keys:', Object.keys(body));
 
-    // ── Extract base64 GLB ────────────────────────────────────────────
     let base64Glb = null;
     if (Array.isArray(body.artifacts) && body.artifacts.length > 0) {
       const art = body.artifacts[0];
@@ -1626,16 +1591,13 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
       return res.status(500).json({ success: false, message: 'A Trellis API nem adott vissza 3D modellt' });
     }
 
-    // ── Backblaze B2 feltöltés ────────────────────────────────────────
     const filename = `trellis_${Date.now()}_${payload.seed}.glb`;
     let glbUrl;
 
     try {
       const b2Key = await uploadGlbToB2(base64Glb, filename);
-      // Proxy URL — a frontend a saját backenden keresztül kéri le (nincs CORS gond)
       glbUrl = `/api/trellis/model/${filename}`;
     } catch (b2Err) {
-      // Ha B2 nem elérhető, data URI fallback
       console.warn('⚠️  B2 feltöltés sikertelen, data URI fallback:', b2Err.message);
       glbUrl = `data:model/gltf-binary;base64,${base64Glb}`;
     }
@@ -1656,9 +1618,10 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     return res.status(500).json({ success: false, message: err.message ?? 'Hálózati hiba' });
   }
 });
+
+
 // ════════════════════════════════════════════════════
 // 10. MESHY — Előzmények
-//     GET /api/meshy/history
 // ════════════════════════════════════════════════════
 router.get('/meshy/history', verifyFirebaseToken, async (req, res) => {
   try {
@@ -1677,4 +1640,5 @@ router.get('/meshy/history', verifyFirebaseToken, async (req, res) => {
     return res.status(500).json({ success: false, message: 'Előzmény lekérdezési hiba' });
   }
 });
+
 export default router;
