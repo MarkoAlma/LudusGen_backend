@@ -1552,6 +1552,14 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
   console.log(`🧊 Trellis → ${TRELLIS_NIM_URL}`);
   console.log(`   prompt: "${payload.prompt.slice(0, 80)}" | seed: ${payload.seed}`);
 
+  // ── Abort: ha a kliens megszakítja → az NVIDIA fetch is megszakad ──────────
+  const controller = new AbortController();
+  const onClose = () => {
+    console.log('🧊 Trellis: kliens megszakította, abort...');
+    controller.abort();
+  };
+  req.on('close', onClose);
+
   try {
     const nimResp = await fetch(TRELLIS_NIM_URL, {
       method:  'POST',
@@ -1561,7 +1569,10 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
         'Authorization': `Bearer ${apiKey}`,
       },
       body:   JSON.stringify(payload),
-      signal: AbortSignal.timeout(300_000),
+      signal: AbortSignal.any([
+        controller.signal,
+        AbortSignal.timeout(300_000),
+      ]),
     });
 
     if (!nimResp.ok) {
@@ -1611,14 +1622,20 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     return res.json({ success: true, glb_url: glbUrl });
 
   } catch (err) {
-    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+    if (err.name === 'AbortError') {
+      console.log('🧊 Trellis: generálás megszakítva (kliens vagy timeout)');
+      if (!res.headersSent) res.status(499).json({ success: false, message: 'Generálás megszakítva' });
+      return;
+    }
+    if (err.name === 'TimeoutError') {
       return res.status(504).json({ success: false, message: 'Trellis időtúllépés (>5 perc)' });
     }
     console.error('❌ Trellis fetch hiba:', err.message);
     return res.status(500).json({ success: false, message: err.message ?? 'Hálózati hiba' });
+  } finally {
+    req.off('close', onClose);
   }
 });
-
 
 // ════════════════════════════════════════════════════
 // 10. MESHY — Előzmények
