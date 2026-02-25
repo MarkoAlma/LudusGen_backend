@@ -888,6 +888,96 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             return res.json({ success: true, images });
         }
 
+        // ── ModelScope (Z-Image-Turbo) ────────────────────────
+else if (provider === 'modelscope') {
+    if (!process.env.MODELSCOPE_API_KEY) {
+        return res.status(500).json({ success: false, message: 'MODELSCOPE_API_KEY nincs beállítva a .env-ben' });
+    }
+
+    const msHeaders = {
+        'Authorization': `Bearer ${process.env.MODELSCOPE_API_KEY}`,
+        'Content-Type': 'application/json',
+    };
+
+    // Próbáljuk ki több paraméter formátumot
+    const requestBody = {
+        model: apiId,
+        prompt: prompt.trim(),
+        ...(negative_prompt ? { negative_prompt: negative_prompt.trim() } : {}),
+        ...(seed ? { seed: parseInt(seed) } : {}),
+        
+        // Próbáljuk mindhárom formátumot
+        // width: image_size.width || 1920,
+        // height: image_size.height || 1080,
+        size: `${image_size.width || 1024}x${image_size.height || 1024}`, // string formátum
+
+    };
+
+    // 1. Aszinkron generálás indítása
+    const genResp = await axios.post(
+        'https://api-inference.modelscope.ai/v1/images/generations',
+        requestBody,
+        {
+            headers: { ...msHeaders, 'X-ModelScope-Async-Mode': 'true' },
+            timeout: 30000,
+        }
+    );
+
+    console.log('ModelScope request body:', JSON.stringify(requestBody, null, 2)); // DEBUG
+
+    const taskId = genResp.data?.task_id;
+    if (!taskId) {
+        return res.status(500).json({ success: false, message: 'ModelScope nem adott vissza task_id-t' });
+    }
+
+    // 2. Polling
+    let imageUrl = null;
+    let actualSize = null; // Tároljuk a valódi méretet
+    for (let i = 0; i < 24; i++) {
+        await new Promise((r) => setTimeout(r, 5000));
+
+        const pollResp = await axios.get(
+            `https://api-inference.modelscope.ai/v1/tasks/${taskId}`,
+            {
+                headers: { ...msHeaders, 'X-ModelScope-Task-Type': 'image_generation' },
+                timeout: 15000,
+            }
+        );
+
+        const status = pollResp.data?.task_status;
+
+        if (status === 'SUCCEED') {
+            imageUrl = pollResp.data?.output_images?.[0];
+            
+            // DEBUG: nézd meg a teljes választ
+            console.log('ModelScope response:', JSON.stringify(pollResp.data, null, 2));
+            
+            // Próbáld kiolvasni a valódi méretet, ha van
+            actualSize = pollResp.data?.image_size || pollResp.data?.size;
+            
+            break;
+        } else if (status === 'FAILED') {
+            console.error('ModelScope failure:', pollResp.data);
+            return res.status(500).json({ success: false, message: 'ModelScope generálás sikertelen' });
+        }
+    }
+
+    if (!imageUrl) {
+        return res.status(504).json({ success: false, message: 'ModelScope időtúllépés (>120s)' });
+    }
+
+    await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
+    return res.json({
+        success: true,
+        images: [{
+            url: imageUrl,
+            width: actualSize?.width || image_size?.width || 1024,
+            height: actualSize?.height || image_size?.height || 1024,
+            note: actualSize ? 'Actual size from API' : 'Requested size (may differ)'
+        }],
+    });
+}
+
         // ── Cloudflare Workers AI ─────────────────────────
         else if (provider === 'cloudflare') {
             if (!process.env.CLOUDFLARE_API_KEY) {
