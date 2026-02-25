@@ -888,6 +888,72 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             return res.json({ success: true, images });
         }
 
+        // ── ModelScope (Z-Image-Turbo) ────────────────────────
+else if (provider === 'modelscope') {
+    if (!process.env.MODELSCOPE_API_KEY) {
+        return res.status(500).json({ success: false, message: 'MODELSCOPE_API_KEY nincs beállítva a .env-ben' });
+    }
+
+    const msHeaders = {
+        'Authorization': `Bearer ${process.env.MODELSCOPE_API_KEY}`,
+        'Content-Type': 'application/json',
+    };
+
+    // 1. Aszinkron generálás indítása
+    const genResp = await axios.post(
+        'https://api-inference.modelscope.ai/v1/images/generations',
+        {
+            model: apiId,
+            prompt: prompt.trim(),
+            ...(negative_prompt ? { negative_prompt: negative_prompt.trim() } : {}),
+            ...(seed ? { seed: parseInt(seed) } : {}),
+        },
+        {
+            headers: { ...msHeaders, 'X-ModelScope-Async-Mode': 'true' },
+            timeout: 30000,
+        }
+    );
+
+    const taskId = genResp.data?.task_id;
+    if (!taskId) {
+        return res.status(500).json({ success: false, message: 'ModelScope nem adott vissza task_id-t' });
+    }
+
+    // 2. Polling – max 120 másodperc (24 × 5s)
+    let imageUrl = null;
+    for (let i = 0; i < 24; i++) {
+        await new Promise((r) => setTimeout(r, 5000));
+
+        const pollResp = await axios.get(
+            `https://api-inference.modelscope.ai/v1/tasks/${taskId}`,
+            {
+                headers: { ...msHeaders, 'X-ModelScope-Task-Type': 'image_generation' },
+                timeout: 15000,
+            }
+        );
+
+        const status = pollResp.data?.task_status;
+
+        if (status === 'SUCCEED') {
+            imageUrl = pollResp.data?.output_images?.[0];
+            break;
+        } else if (status === 'FAILED') {
+            return res.status(500).json({ success: false, message: 'ModelScope generálás sikertelen' });
+        }
+        // PENDING / RUNNING → folytatjuk a pollingot
+    }
+
+    if (!imageUrl) {
+        return res.status(504).json({ success: false, message: 'ModelScope időtúllépés (>120s)' });
+    }
+
+    await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
+    return res.json({
+        success: true,
+        images: [{ url: imageUrl, width: image_size?.width || 1024, height: image_size?.height || 1024 }],
+    });
+}
+
         // ── Cloudflare Workers AI ─────────────────────────
         else if (provider === 'cloudflare') {
             if (!process.env.CLOUDFLARE_API_KEY) {
