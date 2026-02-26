@@ -1535,9 +1535,18 @@ router.get('/meshy/task/:type/:taskId', verifyFirebaseToken, async (req, res) =>
     });
   }
 });
+// ════════════════════════════════════════════════════════════════════════════
+// Backend változtatások - trellis.js
+// ════════════════════════════════════════════════════════════════════════════
+//
+// ✅ ÚJ ENDPOINT: DELETE /api/trellis/history/:id
+// - Törli az egyedi Trellis modellt a Firestore-ból
+// - Opcionálisan törli a B2-ből is a GLB fájlt
+//
+// ════════════════════════════════════════════════════════════════════════════
 
 import fetch from 'node-fetch';
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 
 const TRELLIS_NIM_URL = 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis';
 
@@ -1575,6 +1584,23 @@ async function streamB2Key(key, filename, res) {
   data.Body.pipe(res);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ✅ ÚJ: B2-ből való törlés helper
+// ════════════════════════════════════════════════════════════════════════════
+async function deleteFromB2(key) {
+  try {
+    await b2.send(new DeleteObjectCommand({
+      Bucket: process.env.B2_BUCKET_NAME,
+      Key:    key,
+    }));
+    console.log(`🗑️  B2-ből törölve: ${key}`);
+    return true;
+  } catch (err) {
+    console.warn('⚠️  B2 törlés sikertelen:', err.message);
+    return false;
+  }
+}
+
 router.get('/trellis/model/:filename', verifyFirebaseToken, async (req, res) => {
   const key = `trellis/${req.params.filename}`;
   try {
@@ -1605,6 +1631,126 @@ router.get('/trellis/proxy', verifyFirebaseToken, async (req, res) => {
   } catch (err) {
     console.error('❌ B2 proxy (fallback) hiba:', err.message);
     res.status(404).json({ success: false, message: 'Fájl nem található' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ✅ ÚJ ENDPOINT: Egyedi Trellis modell törlése
+// ════════════════════════════════════════════════════════════════════════════
+router.delete('/trellis/history/:id', verifyFirebaseToken, async (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Hiányzó modell ID' });
+  }
+
+  try {
+    // 1. Firestore dokumentum lekérése
+    const docRef = admin.firestore().collection('trellis_history').doc(id);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: 'Modell nem található' });
+    }
+
+    const data = doc.data();
+
+    // 2. Ellenőrizzük, hogy a felhasználó tulajdonosa-e a modellnek
+    if (data.userId !== userId) {
+      return res.status(403).json({ success: false, message: 'Nincs jogosultság a törléshez' });
+    }
+
+    // 3. B2-ből való törlés (ha van b2_key)
+    if (data.b2_key) {
+      await deleteFromB2(data.b2_key);
+    } else if (data.model_url && data.model_url.includes('/api/trellis/model/')) {
+      // Ha csak model_url van, próbáljuk kinyerni a filename-t
+      const filename = data.model_url.split('/').pop();
+      const b2Key = `trellis/${filename}`;
+      await deleteFromB2(b2Key);
+    }
+
+    // 4. Firestore dokumentum törlése
+    await docRef.delete();
+
+    console.log(`🗑️  Trellis modell törölve: ${id} (user: ${userId})`);
+
+    return res.json({ 
+      success: true, 
+      message: 'Modell sikeresen törölve',
+      deletedId: id,
+    });
+
+  } catch (err) {
+    console.error('❌ Trellis modell törlés hiba:', err.message);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Szerverhiba a törlés során',
+      error: err.message,
+    });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ✅ MÓDOSÍTOTT: Összes előzmény törlése endpoint (már létezik, de javítva)
+// ════════════════════════════════════════════════════════════════════════════
+router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
+  const userId = req.userId;
+
+  try {
+    // 1. Összes Trellis dokumentum lekérése a felhasználóhoz
+    const snapshot = await admin.firestore()
+      .collection('trellis_history')
+      .where('userId', '==', userId)
+      .get();
+
+    if (snapshot.empty) {
+      return res.json({ 
+        success: true, 
+        message: 'Nincs törlendő előzmény',
+        deletedCount: 0,
+      });
+    }
+
+    // 2. B2-ből való törlések
+    const deletePromises = [];
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      
+      if (data.b2_key) {
+        deletePromises.push(deleteFromB2(data.b2_key));
+      } else if (data.model_url && data.model_url.includes('/api/trellis/model/')) {
+        const filename = data.model_url.split('/').pop();
+        const b2Key = `trellis/${filename}`;
+        deletePromises.push(deleteFromB2(b2Key));
+      }
+    }
+
+    await Promise.allSettled(deletePromises);
+
+    // 3. Firestore dokumentumok törlése
+    const batch = admin.firestore().batch();
+    snapshot.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+    await batch.commit();
+
+    console.log(`🗑️  Összes Trellis előzmény törölve: ${snapshot.size} db (user: ${userId})`);
+
+    return res.json({ 
+      success: true, 
+      message: `${snapshot.size} modell sikeresen törölve`,
+      deletedCount: snapshot.size,
+    });
+
+  } catch (err) {
+    console.error('❌ Összes Trellis előzmény törlés hiba:', err.message);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Szerverhiba a törlés során',
+      error: err.message,
+    });
   }
 });
 
@@ -1642,7 +1788,6 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
   console.log(`🧊 Trellis → ${TRELLIS_NIM_URL}`);
   console.log(`   prompt: "${payload.prompt.slice(0, 80)}" | seed: ${payload.seed}`);
 
-  // ── Abort: ha a kliens megszakítja → az NVIDIA fetch is megszakad ──────────
   const controller = new AbortController();
   const onClose = () => {
     console.log('🧊 Trellis: kliens megszakította, abort...');
@@ -1694,9 +1839,10 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
 
     const filename = `trellis_${Date.now()}_${payload.seed}.glb`;
     let glbUrl;
+    let b2Key = null;
 
     try {
-      const b2Key = await uploadGlbToB2(base64Glb, filename);
+      b2Key = await uploadGlbToB2(base64Glb, filename);
       glbUrl = `/api/trellis/model/${filename}`;
     } catch (b2Err) {
       console.warn('⚠️  B2 feltöltés sikertelen, data URI fallback:', b2Err.message);
@@ -1706,10 +1852,14 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     await logUsage(req.userId, 'trellis', {
       prompt: payload.prompt.slice(0, 80),
       seed:   payload.seed,
-      b2_key: `trellis/${filename}`,
+      b2_key: b2Key,
     });
 
-    return res.json({ success: true, glb_url: glbUrl });
+    return res.json({ 
+      success: true, 
+      glb_url: glbUrl,
+      b2_key: b2Key, // ✅ Visszaadjuk a b2_key-t is, hogy a frontend tudja menteni
+    });
 
   } catch (err) {
     if (err.name === 'AbortError') {
@@ -1726,6 +1876,57 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     req.off('close', onClose);
   }
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// HASZNÁLATI ÚTMUTATÓ
+// ════════════════════════════════════════════════════════════════════════════
+/**
+ * ÚJ ENDPOINTOK:
+ * 
+ * 1. DELETE /api/trellis/history/:id
+ *    - Törli az egyedi Trellis modellt
+ *    - Authorization: Bearer token (Firebase)
+ *    - Response: { success: true, deletedId: string }
+ * 
+ * 2. DELETE /api/trellis/history
+ *    - Törli az összes Trellis modellt a felhasználóhoz
+ *    - Authorization: Bearer token (Firebase)
+ *    - Response: { success: true, deletedCount: number }
+ * 
+ * FRONTEND HASZNÁLAT:
+ * 
+ * // Egyedi törlés
+ * const handleDeleteHistoryItem = async (item) => {
+ *   const headers = await authHeaders();
+ *   const res = await fetch(`http://localhost:3001/api/trellis/history/${item.id}`, {
+ *     method: 'DELETE',
+ *     headers,
+ *   });
+ *   const data = await res.json();
+ *   if (data.success) {
+ *     setHistory(h => h.filter(i => i.id !== item.id));
+ *     if (activeItem?.id === item.id) {
+ *       setActiveItem(null);
+ *       setModelUrl(null);
+ *     }
+ *   }
+ * };
+ * 
+ * // Összes törlés
+ * const handleClearHistory = async () => {
+ *   const headers = await authHeaders();
+ *   const res = await fetch('http://localhost:3001/api/trellis/history', {
+ *     method: 'DELETE',
+ *     headers,
+ *   });
+ *   const data = await res.json();
+ *   if (data.success) {
+ *     setHistory([]);
+ *     setActiveItem(null);
+ *     setModelUrl(null);
+ *   }
+ * };
+ */
 
 // ════════════════════════════════════════════════════
 // 10. MESHY — Előzmények
