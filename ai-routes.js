@@ -129,22 +129,22 @@ const verifyFirebaseToken = async (req, res, next) => {
 
 // ── Rate limitek ─────────────────────────────────────
 const chatLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 60,
+    windowMs: 60 * 60 * 1000, max: 600,
     keyGenerator: (req) => req.userId || ipKeyGenerator(req),
     message: { success: false, message: 'Túl sok kérés — próbáld újra 1 óra múlva' },
 });
 const imageLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 20,
+    windowMs: 60 * 60 * 1000, max: 200,
     keyGenerator: (req) => req.userId || ipKeyGenerator(req),
     message: { success: false, message: 'Túl sok képgenerálás — próbáld újra 1 óra múlva' },
 });
 const audioLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 30,
+    windowMs: 60 * 60 * 1000, max: 300,
     keyGenerator: (req) => req.userId || ipKeyGenerator(req),
     message: { success: false, message: 'Túl sok hanggenerálás — próbáld újra 1 óra múlva' },
 });
 const genLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, max: 30,
+  windowMs: 60 * 60 * 1000, max: 300,
   keyGenerator: (req) => req.userId || ipKeyGenerator(req),
   message: { success: false, message: 'Túl sok generálás – próbáld újra 1 óra múlva' },
 });
@@ -1856,6 +1856,9 @@ import { log } from 'console';
 
 const TRELLIS_NIM_URL = 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis';
 
+// ── Keep-alive HTTPS agent — elkerüli az ismételt TCP/TLS handshake overhead-et
+const keepAliveAgent = new https.Agent({ keepAlive: true, timeout: 190_000 });
+
 const b2 = new S3Client({
   region:      'us-east-005',
   endpoint:    process.env.B2_ENDPOINT,
@@ -1890,9 +1893,6 @@ async function streamB2Key(key, filename, res) {
   data.Body.pipe(res);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// ✅ ÚJ: B2-ből való törlés helper
-// ════════════════════════════════════════════════════════════════════════════
 async function deleteFromB2(key) {
   try {
     await b2.send(new DeleteObjectCommand({
@@ -1941,7 +1941,7 @@ router.get('/trellis/proxy', verifyFirebaseToken, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// ✅ ÚJ ENDPOINT: Egyedi Trellis modell törlése
+// Egyedi Trellis modell törlése
 // ════════════════════════════════════════════════════════════════════════════
 router.delete('/trellis/history/:id', verifyFirebaseToken, async (req, res) => {
   const { id } = req.params;
@@ -1952,7 +1952,6 @@ router.delete('/trellis/history/:id', verifyFirebaseToken, async (req, res) => {
   }
 
   try {
-    // 1. Firestore dokumentum lekérése
     const docRef = admin.firestore().collection('trellis_history').doc(id);
     const doc = await docRef.get();
 
@@ -1962,22 +1961,18 @@ router.delete('/trellis/history/:id', verifyFirebaseToken, async (req, res) => {
 
     const data = doc.data();
 
-    // 2. Ellenőrizzük, hogy a felhasználó tulajdonosa-e a modellnek
     if (data.userId !== userId) {
       return res.status(403).json({ success: false, message: 'Nincs jogosultság a törléshez' });
     }
 
-    // 3. B2-ből való törlés (ha van b2_key)
     if (data.b2_key) {
       await deleteFromB2(data.b2_key);
     } else if (data.model_url && data.model_url.includes('/api/trellis/model/')) {
-      // Ha csak model_url van, próbáljuk kinyerni a filename-t
       const filename = data.model_url.split('/').pop();
       const b2Key = `trellis/${filename}`;
       await deleteFromB2(b2Key);
     }
 
-    // 4. Firestore dokumentum törlése
     await docRef.delete();
 
     console.log(`🗑️  Trellis modell törölve: ${id} (user: ${userId})`);
@@ -1999,13 +1994,12 @@ router.delete('/trellis/history/:id', verifyFirebaseToken, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// ✅ MÓDOSÍTOTT: Összes előzmény törlése endpoint (már létezik, de javítva)
+// Összes előzmény törlése
 // ════════════════════════════════════════════════════════════════════════════
 router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
   const userId = req.userId;
 
   try {
-    // 1. Összes Trellis dokumentum lekérése a felhasználóhoz
     const snapshot = await admin.firestore()
       .collection('trellis_history')
       .where('userId', '==', userId)
@@ -2019,7 +2013,6 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
       });
     }
 
-    // 2. B2-ből való törlések
     const deletePromises = [];
     for (const doc of snapshot.docs) {
       const data = doc.data();
@@ -2035,7 +2028,6 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
 
     await Promise.allSettled(deletePromises);
 
-    // 3. Firestore dokumentumok törlése
     const batch = admin.firestore().batch();
     snapshot.docs.forEach(doc => {
       batch.delete(doc.ref);
@@ -2060,6 +2052,9 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// Trellis generálás
+// ════════════════════════════════════════════════════════════════════════════
 router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
   const {
     prompt,
@@ -2089,12 +2084,22 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     ss_cfg_scale:        Number(ss_cfg_scale),
     slat_sampling_steps: Math.round(Number(slat_sampling_steps)),
     ss_sampling_steps:   Math.round(Number(ss_sampling_steps)),
+
+
+    
   };
 
   console.log(`🧊 Trellis → ${TRELLIS_NIM_URL}`);
   console.log(`   prompt: "${payload.prompt.slice(0, 80)}" | seed: ${payload.seed}`);
 
   const controller = new AbortController();
+
+  // ── Manuális 180s timeout — megbízhatóbb Node 18-on mint AbortSignal.any()
+  let timeoutId = setTimeout(() => {
+    console.log('🧊 Trellis: 180s timeout, abort...');
+    controller.abort();
+  }, 180_000);
+
   const onClose = () => {
     console.log('🧊 Trellis: kliens megszakította, abort...');
     controller.abort();
@@ -2108,13 +2113,16 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
         'Content-Type':  'application/json',
         'Accept':        'application/json',
         'Authorization': `Bearer ${apiKey}`,
+        'Connection':    'keep-alive',
       },
       body:   JSON.stringify(payload),
-      signal: AbortSignal.any([
-        controller.signal,
-        AbortSignal.timeout(300_000),
-      ]),
+      signal: controller.signal,
+      agent:  keepAliveAgent,
     });
+
+    // Sikeres válasz érkezett — timer már nem kell
+    clearTimeout(timeoutId);
+    timeoutId = null;
 
     if (!nimResp.ok) {
       const errText = await nimResp.text();
@@ -2164,25 +2172,22 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     return res.json({ 
       success: true, 
       glb_url: glbUrl,
-      b2_key: b2Key, // ✅ Visszaadjuk a b2_key-t is, hogy a frontend tudja menteni
+      b2_key: b2Key,
     });
 
   } catch (err) {
     if (err.name === 'AbortError') {
-      console.log('🧊 Trellis: generálás megszakítva (kliens vagy timeout)');
+      console.log('🧊 Trellis: generálás megszakítva (kliens vagy 180s timeout)');
       if (!res.headersSent) res.status(499).json({ success: false, message: 'Generálás megszakítva' });
       return;
-    }
-    if (err.name === 'TimeoutError') {
-      return res.status(504).json({ success: false, message: 'Trellis időtúllépés (>5 perc)' });
     }
     console.error('❌ Trellis fetch hiba:', err.message);
     return res.status(500).json({ success: false, message: err.message ?? 'Hálózati hiba' });
   } finally {
+    if (timeoutId) clearTimeout(timeoutId);
     req.off('close', onClose);
   }
 });
-
 // ════════════════════════════════════════════════════════════════════════════
 // HASZNÁLATI ÚTMUTATÓ
 // ════════════════════════════════════════════════════════════════════════════
