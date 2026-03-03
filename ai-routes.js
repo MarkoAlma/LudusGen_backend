@@ -2188,6 +2188,26 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     req.off('close', onClose);
   }
 });
+
+
+
+
+// tripoRouter.js — Tripo3D API backend route
+// Helyezd el ott ahol a többi router van (pl. server.js-be importálva)
+// .env: TRIPO3D_API_KEY=tsk_xxxxxxxxxxxxxxxx
+
+// import { verifyFirebaseToken } from './middleware.js';  // ← a te auth middleware-d
+// import admin from './firebaseAdmin.js';                 // ← Firestore ha kell
+
+// ════════════════════════════════════════════════════════════════════════════
+// SERVER.JS-BE IMPORTÁLÁS:
+//
+// import tripoRouter from './tripoRouter.js';
+// app.use('/api', tripoRouter);
+//
+// .env:
+// TRIPO3D_API_KEY=tsk_xxxxxxxxxxxxxxxx
+// ════════════════════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════════════════════
 // HASZNÁLATI ÚTMUTATÓ
 // ════════════════════════════════════════════════════════════════════════════
@@ -2242,6 +2262,324 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
 // ════════════════════════════════════════════════════
 // 10. MESHY — Előzmények
 // ════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════
+// TRIPO3D — Task indítása
+// ════════════════════════════════════════════════════
+// tripo.routes.js — Teljes Tripo3D API backend
+// Támogatott műveletek: text→3D, image→3D, texture, animate (rig+retarget), refine, convert
+
+import multer  from "multer";
+const upload  = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+// ── Tripo API helper ──────────────────────────────────────────────────────────
+const TRIPO_BASE = "https://api.tripo3d.ai/v2/openapi";
+
+async function tripoFetch(path, options = {}) {
+  const apiKey = process.env.TRIPO3D_API_KEY;
+  if (!apiKey) throw new Error("TRIPO3D_API_KEY nincs beállítva");
+
+  const res = await fetch(`${TRIPO_BASE}${path}`, {
+    ...options,
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      ...(options.headers ?? {}),
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Tripo API hiba (${res.status}): ${text.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+// ── Fájl feltöltés Tripo-ba (image-to-3D-hez) ────────────────────────────────
+router.post("/tripo/upload", verifyFirebaseToken, upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: "Fájl hiányzik" });
+
+  const allowed = ["image/jpeg", "image/png", "image/webp"];
+  if (!allowed.includes(req.file.mimetype))
+    return res.status(400).json({ success: false, message: "Csak JPG/PNG/WEBP fájl engedélyezett" });
+  if (req.file.size > 20 * 1024 * 1024)
+    return res.status(400).json({ success: false, message: "Max. fájlméret 20 MB" });
+
+  try {
+    const form = new FormData();
+    form.append("file", req.file.buffer, {
+      filename: req.file.originalname || "image.jpg",
+      contentType: req.file.mimetype,
+    });
+
+    const apiKey = process.env.TRIPO3D_API_KEY;
+    const uploadRes = await fetch(`${TRIPO_BASE}/upload`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, ...form.getHeaders() },
+      body: form,
+    });
+
+    if (!uploadRes.ok) {
+      const txt = await uploadRes.text().catch(() => "");
+      throw new Error(`Upload hiba (${uploadRes.status}): ${txt.slice(0, 200)}`);
+    }
+
+    const data = await uploadRes.json();
+    const imageToken = data.data?.image_token;
+    if (!imageToken) throw new Error("Nem érkezett image_token");
+
+    console.log(`🖼  Tripo upload sikeres, token: ${imageToken.slice(0, 12)}…`);
+    return res.json({ success: true, imageToken });
+
+  } catch (err) {
+    console.error("❌ Tripo upload hiba:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Egységes task indítás (minden típus) ─────────────────────────────────────
+router.post("/tripo/task", verifyFirebaseToken, genLimiter, async (req, res) => {
+  const { type } = req.body;
+  if (!type) return res.status(400).json({ success: false, message: "type mező kötelező" });
+
+  let taskBody;
+
+  try {
+    switch (type) {
+
+      // ── 1. Szöveg → 3D ───────────────────────────────────────────────────
+      case "text_to_model": {
+        const { prompt, model_version = "v2.5-20250123", negative_prompt,
+                face_limit, texture = true, pbr = true,
+                texture_quality = "detailed", style } = req.body;
+
+        if (!prompt?.trim())
+          return res.status(400).json({ success: false, message: "A prompt megadása kötelező" });
+        if (prompt.length > 1000)
+          return res.status(400).json({ success: false, message: "Max 1000 karakter" });
+
+        taskBody = {
+          type: "text_to_model",
+          prompt: prompt.trim(),
+          model_version,
+          texture,
+          pbr,
+          texture_quality,
+          ...(negative_prompt?.trim() && { negative_prompt: negative_prompt.trim() }),
+          ...(face_limit > 0 && { face_limit: Number(face_limit) }),
+          ...(style && { style }),
+        };
+        break;
+      }
+
+      // ── 2. Kép → 3D ──────────────────────────────────────────────────────
+      case "image_to_model": {
+        const { image_token, model_version = "v2.5-20250123",
+                face_limit, texture = true, pbr = true,
+                texture_quality = "detailed" } = req.body;
+
+        if (!image_token)
+          return res.status(400).json({ success: false, message: "image_token kötelező" });
+
+        taskBody = {
+          type: "image_to_model",
+          file: { type: "jpg", file_token: image_token },
+          model_version,
+          texture,
+          pbr,
+          texture_quality,
+          ...(face_limit > 0 && { face_limit: Number(face_limit) }),
+        };
+        break;
+      }
+
+      // ── 3. Texture generálás meglévő modellre ────────────────────────────
+      case "texture": {
+        const { original_model_task_id, prompt, negative_prompt,
+                texture_quality = "detailed" } = req.body;
+
+        if (!original_model_task_id)
+          return res.status(400).json({ success: false, message: "original_model_task_id kötelező" });
+
+        taskBody = {
+          type: "texture",
+          original_model_task_id,
+          texture_quality,
+          ...(prompt?.trim() && { prompt: prompt.trim() }),
+          ...(negative_prompt?.trim() && { negative_prompt: negative_prompt.trim() }),
+        };
+        break;
+      }
+
+      // ── 4. Rig check (animálhatóság ellenőrzés) ──────────────────────────
+      case "animate_prerigcheck": {
+        const { original_model_task_id } = req.body;
+        if (!original_model_task_id)
+          return res.status(400).json({ success: false, message: "original_model_task_id kötelező" });
+
+        taskBody = { type: "animate_prerigcheck", original_model_task_id };
+        break;
+      }
+
+      // ── 5. Rigging ───────────────────────────────────────────────────────
+      case "animate_rig": {
+        const { original_model_task_id, out_format = "glb" } = req.body;
+        if (!original_model_task_id)
+          return res.status(400).json({ success: false, message: "original_model_task_id kötelező" });
+
+        taskBody = { type: "animate_rig", original_model_task_id, out_format };
+        break;
+      }
+
+      // ── 6. Animáció retarget (preset animációk) ──────────────────────────
+      case "animate_retarget": {
+        const { original_model_task_id, animation, out_format = "glb" } = req.body;
+        if (!original_model_task_id)
+          return res.status(400).json({ success: false, message: "original_model_task_id kötelező" });
+        if (!animation)
+          return res.status(400).json({ success: false, message: "animation kötelező" });
+
+        taskBody = { type: "animate_retarget", original_model_task_id, animation, out_format };
+        break;
+      }
+
+      // ── 7. Modell finomítás (draft → final) ──────────────────────────────
+      case "refine_model": {
+        const { draft_model_task_id } = req.body;
+        if (!draft_model_task_id)
+          return res.status(400).json({ success: false, message: "draft_model_task_id kötelező" });
+
+        taskBody = { type: "refine_model", draft_model_task_id };
+        break;
+      }
+
+      // ── 8. Stílus átalakítás ─────────────────────────────────────────────
+      case "stylize_model": {
+        const { original_model_task_id, style } = req.body;
+        if (!original_model_task_id || !style)
+          return res.status(400).json({ success: false, message: "original_model_task_id és style kötelező" });
+
+        taskBody = { type: "stylize_model", original_model_task_id, style };
+        break;
+      }
+
+      // ── 9. Formátum konverzió ────────────────────────────────────────────
+      case "convert_model": {
+        const { original_model_task_id, format = "glb", quad = false,
+                face_limit, pivot_to_center_bottom = false } = req.body;
+        if (!original_model_task_id)
+          return res.status(400).json({ success: false, message: "original_model_task_id kötelező" });
+
+        taskBody = {
+          type: "convert_model",
+          original_model_task_id, format, quad,
+          pivot_to_center_bottom,
+          ...(face_limit > 0 && { face_limit: Number(face_limit) }),
+        };
+        break;
+      }
+
+      default:
+        return res.status(400).json({ success: false, message: `Ismeretlen task típus: ${type}` });
+    }
+
+    const data   = await tripoFetch("/task", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(taskBody) });
+    const taskId = data.data?.task_id;
+    if (!taskId) throw new Error(`Nem érkezett task_id — válasz: ${JSON.stringify(data).slice(0, 200)}`);
+
+    console.log(`🔺 Tripo [${type}] task indítva: ${taskId}`);
+    return res.json({ success: true, taskId });
+
+  } catch (err) {
+    console.error(`❌ Tripo [${type}] task hiba:`, err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Task poll ─────────────────────────────────────────────────────────────────
+router.get("/tripo/task/:taskId", verifyFirebaseToken, async (req, res) => {
+  try {
+    const data = await tripoFetch(`/task/${req.params.taskId}`);
+    const task = data.data;
+
+    if (task.status === "success") {
+      console.log(`✅ Tripo task [${req.params.taskId}] kész, output:`, JSON.stringify(task.output ?? {}));
+    }
+
+    // Output model URL kinyerése — típustól függően eltérő mezők
+    const modelUrl =
+      task.output?.model        ??
+      task.output?.pbr_model    ??
+      task.output?.base_model   ??
+      task.output?.rigged_model ??
+      task.output?.animated_model ??
+      null;
+
+    // Rig check esetén extra adat
+    const rigCheckResult = task.output?.is_animatable ?? null;
+
+    return res.json({
+      success:        true,
+      status:         task.status,   // queued | running | success | failed | cancelled
+      progress:       task.progress ?? 0,
+      modelUrl,
+      rigCheckResult, // true/false — animate_prerigcheck esetén
+      rawOutput:      task.output ?? null,
+    });
+
+  } catch (err) {
+    console.error("❌ Tripo poll hiba:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Model proxy (autentikált GLB letöltés) ────────────────────────────────────
+router.get("/tripo/model-proxy", verifyFirebaseToken, async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ success: false, message: "URL hiányzik" });
+
+  // Biztonsági ellenőrzés — csak Tripo CDN domain-ről
+  let parsedUrl;
+  try { parsedUrl = new URL(url); } catch { return res.status(400).json({ success: false, message: "Érvénytelen URL" }); }
+
+  const allowedHosts = ["tripo3d.ai", "cdn.tripo3d.ai", "assets.tripo3d.ai"];
+  if (!allowedHosts.some((h) => parsedUrl.hostname.endsWith(h)))
+    return res.status(400).json({ success: false, message: "Nem engedélyezett forrás" });
+
+  try {
+    const apiKey    = process.env.TRIPO3D_API_KEY;
+    const upstream  = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } });
+
+    if (!upstream.ok) {
+      console.error(`❌ Tripo proxy upstream: ${upstream.status} | ${url}`);
+      return res.status(502).json({ success: false, message: `Upstream: ${upstream.status}` });
+    }
+
+    const ct = upstream.headers.get("content-type") || "model/gltf-binary";
+    const cl = upstream.headers.get("content-length");
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Content-Disposition", 'attachment; filename="model.glb"');
+    if (cl) res.setHeader("Content-Length", cl);
+    upstream.body.pipe(res);
+
+  } catch (err) {
+    console.error("❌ Tripo proxy hiba:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 router.get('/meshy/history', verifyFirebaseToken, async (req, res) => {
   try {
     const snap = await admin.firestore()
