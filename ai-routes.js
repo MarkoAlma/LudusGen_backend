@@ -919,6 +919,96 @@ usage = {
         }
     }
 });
+
+router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { images, systemPrompt } = req.body;
+
+    if (!Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({ success: false, message: 'Nincs kép megadva' });
+    }
+    if (images.length > 3) {
+      return res.status(400).json({ success: false, message: 'Max 3 kép engedélyezett' });
+    }
+
+    if (!process.env.NVIDIA_API_KEY) {
+      return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva a szerveren' });
+    }
+
+    // ── Üzenet felépítése: rendszerprompt + képek ──────────────────────────
+    // A Gemma 3 27B IT NVIDIA API-n keresztül OpenAI-kompatibilis formátumot
+    // vár: a képeket image_url típusú content block-ként kell átadni.
+    const userContentBlocks = [
+      {
+        type: 'text',
+        text: systemPrompt || 'Describe the uploaded image(s) in detail.',
+      },
+      ...images.map((dataUrl, idx) => ({
+        type: 'image_url',
+        image_url: {
+          url: dataUrl, // base64 data URL: "data:image/jpeg;base64,..."
+        },
+      })),
+    ];
+
+    let resp;
+    try {
+      resp = await axios.post(
+        'https://integrate.api.nvidia.com/v1/chat/completions',
+        {
+          model:       'google/gemma-3-27b-it',
+          messages: [
+            {
+              role:    'user',
+              content: userContentBlocks,
+            },
+          ],
+          max_tokens:  1500,
+          temperature: 0.2,
+          top_p:       0.7,
+          stream:      false,
+        },
+        {
+          headers: {
+            Authorization:  `Bearer ${process.env.NVIDIA_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 90000, // vision modellek lassabbak
+        }
+      );
+    } catch (err) {
+      const msg = err.response?.data?.message || err.response?.data?.detail || err.message || 'NVIDIA API hiba';
+      console.error('Vision describe NVIDIA hiba:', msg);
+      return res.status(502).json({ success: false, message: `NVIDIA API hiba: ${msg}` });
+    }
+
+    const description = resp.data?.choices?.[0]?.message?.content?.trim() || '';
+
+    if (!description) {
+      console.warn('Vision describe: Gemma üres választ adott');
+      console.warn('finish_reason:', resp.data?.choices?.[0]?.finish_reason);
+      return res.status(500).json({ success: false, message: 'Gemma üres választ adott vissza' });
+    }
+
+    await logUsage(req.userId, 'vision-describe', {
+      model:    'google/gemma-3-27b-it',
+      provider: 'nvidia',
+      tokens:   resp.data?.usage?.total_tokens || 0,
+      images:   images.length,
+    });
+
+    return res.json({ success: true, description });
+
+  } catch (err) {
+    console.error('❌ Vision describe error:', err);
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        message: err?.message || 'Vision describe hiba',
+      });
+    }
+  }
+});
 // ════════════════════════════════════════════════════
 // 2.  KÉPGENERÁLÁS  —  POST /api/generate-image
 // ════════════════════════════════════════════════════
@@ -1004,20 +1094,21 @@ else if (provider === 'modelscope') {
         'Content-Type': 'application/json',
     };
 
+    const isQwenEditModel = apiId === 'Qwen/Qwen-Image-Edit-2511';
+
     // ── input_image (single) vagy input_images (array) támogatás ─
-    // Frontend küldhet egyet (input_image) vagy többet (input_images tömb)
     const rawInputImages = req.body.input_images
-        ? req.body.input_images                          // tömb
+        ? req.body.input_images
         : input_image
-            ? [input_image]                              // single → tömbbé alakítjuk
+            ? [input_image]
             : [];
 
     const isEditModel = rawInputImages.length > 0;
 
-    let imageUrlsForApi  = [];   // signed URL-ek tömbje az API-nak
-    let tempB2Keys       = [];   // cleanup-hoz
+    let imageUrlsForApi  = [];
+    let tempB2Keys       = [];
     let originalWidth    = null;
-    let originalHeight   = null; // az első kép méretét visszuk vissza
+    let originalHeight   = null;
 
     if (isEditModel) {
         try {
@@ -1029,27 +1120,34 @@ else if (provider === 'modelscope') {
 
                 const meta = await sharp(inputBuffer).metadata();
 
-                // Csak az első kép méretét mentjük (ez lesz az output méret)
                 if (idx === 0) {
                     originalWidth  = meta.width;
                     originalHeight = meta.height;
                 }
 
-                const TARGET_PIXELS = 1_000_000;
-                const currentPixels = meta.width * meta.height;
-                const scaleFactor   = Math.sqrt(TARGET_PIXELS / currentPixels);
+                let processedBuffer;
 
-                let newW = Math.round(meta.width  * scaleFactor);
-                let newH = Math.round(meta.height * scaleFactor);
-                newW = Math.round(newW / 16) * 16;
-                newH = Math.round(newH / 16) * 16;
+                if (isQwenEditModel) {
+                    const TARGET_PIXELS = 1_000_000;
+                    const currentPixels = meta.width * meta.height;
+                    const scaleFactor   = Math.sqrt(TARGET_PIXELS / currentPixels);
 
-                console.log(`📐 Kép #${idx + 1}: ${meta.width}x${meta.height} → ${newW}x${newH}`);
+                    let newW = Math.round(meta.width  * scaleFactor);
+                    let newH = Math.round(meta.height * scaleFactor);
+                    newW = Math.round(newW / 16) * 16;
+                    newH = Math.round(newH / 16) * 16;
 
-                const resized = await sharp(inputBuffer)
-                    .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
-                    .png()
-                    .toBuffer();
+                    console.log(`📐 Kép #${idx + 1}: ${meta.width}x${meta.height} → ${newW}x${newH}`);
+
+                    processedBuffer = await sharp(inputBuffer)
+                        .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
+                        .png()
+                        .toBuffer();
+                } else {
+                    // Flux: nincs resize, csak png konverzió
+                    console.log(`📐 Kép #${idx + 1}: ${meta.width}x${meta.height} (nincs resize)`);
+                    processedBuffer = await sharp(inputBuffer).png().toBuffer();
+                }
 
                 const filename = `edit_${Date.now()}_${idx}_${req.userId.slice(0, 8)}.png`;
                 const tempKey  = `temp_edit/${filename}`;
@@ -1058,7 +1156,7 @@ else if (provider === 'modelscope') {
                 await b2.send(new PutObjectCommand({
                     Bucket: process.env.B2_BUCKET_NAME,
                     Key: tempKey,
-                    Body: resized,
+                    Body: processedBuffer,
                     ContentType: 'image/png',
                 }));
 
@@ -1089,7 +1187,7 @@ else if (provider === 'modelscope') {
               negative_prompt: negative_prompt ? negative_prompt.trim() : undefined,
               seed:      seed ? parseInt(seed) : undefined,
               prompt_extend,
-              image_url: imageUrlsForApi,   // API mindig tömböt vár
+              image_url: imageUrlsForApi,
           }
         : {
               model:  apiId,
@@ -1100,7 +1198,7 @@ else if (provider === 'modelscope') {
           };
 
     console.log(imageUrlsForApi);
-    
+
     console.log(
         'ModelScope body:',
         JSON.stringify({ ...msBody, image_url: msBody.image_url ? `[${msBody.image_url.length} URL]` : undefined })
@@ -1167,10 +1265,12 @@ else if (provider === 'modelscope') {
         }
     };
 
-    // ── Utófeldolgozás: fetch + visszaméretezés → base64 ─────────────────────
+    // ── Utófeldolgozás: fetch + visszaméretezés → base64 (csak Qwen) ──────────
 
     const postProcess = async (url) => {
-        if (!isEditModel || !originalWidth || !originalHeight) return { url, base64: null };
+        if (!isQwenEditModel || !isEditModel || !originalWidth || !originalHeight) {
+            return { url, base64: null };
+        }
 
         try {
             const response        = await fetch(url);
@@ -1217,7 +1317,7 @@ else if (provider === 'modelscope') {
 
     let imageUrl = null;
 
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 150; i++) {
         await new Promise((r) => setTimeout(r, i === 0 ? 2000 : 3000));
 
         let pollData;
