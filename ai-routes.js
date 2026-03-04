@@ -1184,6 +1184,8 @@ else if (provider === 'modelscope') {
         ? {
               model:     apiId,
               prompt:    prompt.trim(),
+              steps: Math.min(Math.max(1, num_inference_steps), 50),
+              guidance: Math.min(Math.max(1, guidance_scale), 20),
               negative_prompt: negative_prompt ? negative_prompt.trim() : undefined,
               seed:      seed ? parseInt(seed) : undefined,
               prompt_extend,
