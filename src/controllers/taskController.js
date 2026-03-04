@@ -122,6 +122,8 @@ export async function uploadFile(req, res) {
 /* ─── Model proxy ─────────────────────────────────────────────────────── */
 export async function modelProxy(req, res) {
   const { url } = req.query;
+    console.log("[modelProxy] url:", url, "hostname:", new URL(url).hostname); // ← ADD IDE
+
   if (!url) { res.status(400).json({ success: false, message: "url missing" }); return; }
 
   let parsed;
@@ -129,7 +131,14 @@ export async function modelProxy(req, res) {
     res.status(400).json({ success: false, message: "Invalid URL" }); return;
   }
 
-  const allowedHosts = ["tripo3d.ai", "cdn.tripo3d.ai", "assets.tripo3d.ai"];
+const allowedHosts = [
+  "tripo3d.ai",
+  "tripo3d.com",          // ← új
+  "cdn.tripo3d.ai",
+  "cdn.tripo3d.com",      // ← új
+  "assets.tripo3d.ai",
+  "assets.tripo3d.com",   // ← új
+];
   if (!allowedHosts.some(h => parsed.hostname.endsWith(h))) {
     res.status(400).json({ success: false, message: "Source not allowed" }); return;
   }
