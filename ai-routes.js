@@ -1192,10 +1192,13 @@ else if (provider === 'modelscope') {
         : {
               model:  apiId,
               prompt: prompt.trim(),
+              steps: Math.min(Math.max(1, num_inference_steps), 50),
+              guidance: Math.min(Math.max(1, guidance_scale), 20),
               ...(negative_prompt ? { negative_prompt: negative_prompt.trim() } : {}),
               ...(seed ? { seed: parseInt(seed) } : {}),
               size: `${image_size.width || 1024}x${image_size.height || 1024}`,
           };
+          console.log(msBody)
 
     console.log(imageUrlsForApi);
 
