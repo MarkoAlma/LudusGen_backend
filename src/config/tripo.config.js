@@ -42,15 +42,13 @@ export const RETRY_CONFIG = {
 /**
  * Approximate credit costs per task type / addon.
  * Keys: "type:model_version" for generation, plain "type" for post-process.
- */
-export const CREDIT_COSTS = {
-  // Base = textúra NÉLKÜL (pricing doc: "Without Texture" oszlop)
+ */export const CREDIT_COSTS = {
   "text_to_model:v3.1-20260211":        10,
   "text_to_model:v3.0-20250812":        10,
   "text_to_model:v2.5-20250123":        10,
   "text_to_model:Turbo-v1.0-20250506":  10,
   "text_to_model:v2.0-20240919":        10,
-  "text_to_model:v1.4-20240625":        10,  // V1.4-nél nincs külön adat, feltételezzük same
+  "text_to_model:v1.4-20240625":        10,
 
   "image_to_model:v3.1-20260211":       20,
   "image_to_model:v3.0-20250812":       20,
@@ -70,7 +68,7 @@ export const CREDIT_COSTS = {
   convert_model:         5,
   mesh_segmentation:    40,
   mesh_completion:      50,
-  animate_prerigcheck:   0,   // Free per pricing doc
+  animate_prerigcheck:   0,
   animate_rig:          25,
   animate_retarget:     10,
   stylize_model:        20,
@@ -78,18 +76,18 @@ export const CREDIT_COSTS = {
   import_model:          0,
   text_to_image:         5,
 
+  // Texture addons — v3.0/v3.1 drágább
+  "addon:texture_standard:v3":  20,  // v3.0+v3.1 standard (texture_quality:"detailed")
+  "addon:texture_standard":     10,  // v2.x standard
+  "addon:texture_HD:v3":        30,  // v3.0+v3.1 HD (texture_quality:"HD")
+  "addon:texture_HD":           20,  // v2.x HD
 
-  // Addons (generation-hoz hozzáadódnak a base-re)
-// Addons
-"addon:texture_standard": 10,  // Standard texture (PBR benne van)
-"addon:texture_HD": 20,        // HD texture (4K, PBR benne van)
-"addon:smart_low_poly_gen": 10,// smart_low_poly at generation time
-"addon:generate_parts": 20,    // generate_parts
-"addon:quad": 5,               // quad topology
-"addon:style": 5,              // style param (ha lesz)
-
-"addon:pbr": 5,                // volt: 0 — API külön számolja még HD mellé is
-"addon:geometry_detailed": 10, // volt: 15 — "ultra" szint = 10, nem 20
+  "addon:pbr":               0,   // ingyenes ha texture=true mellé van
+  "addon:geometry_detailed": 10,  // meshQ="ultra" → geometry_quality:"detailed"
+  "addon:smart_low_poly_gen":10,  // smart_low_poly generation-kor
+  "addon:generate_parts":    20,  // generate_parts
+  "addon:quad":               5,  // quad topology
+  "addon:style":              5,  // style param
 };
 
 /**
