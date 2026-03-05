@@ -1009,6 +1009,27 @@ router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
     }
   }
 });
+
+// ── Kontext preferált felbontások ────────────────────────
+const KONTEXT_PREFERRED_RESOLUTIONS = [
+  [672,1568],[688,1504],[720,1456],[752,1392],[800,1328],
+  [832,1248],[880,1184],[944,1104],[1024,1024],[1104,944],
+  [1184,880],[1248,832],[1328,800],[1392,752],[1456,720],
+  [1504,688],[1568,672],
+];
+
+function snapToKontextResolution(origW, origH) {
+  const origAR = origW / origH;
+  let best = KONTEXT_PREFERRED_RESOLUTIONS[0];
+  let bestDiff = Infinity;
+  for (const [w, h] of KONTEXT_PREFERRED_RESOLUTIONS) {
+    const diff = Math.abs(w / h - origAR);
+    if (diff < bestDiff) { bestDiff = diff; best = [w, h]; }
+  }
+  return { w: best[0], h: best[1] };
+}
+
+
 // ════════════════════════════════════════════════════
 // 2.  KÉPGENERÁLÁS  —  POST /api/generate-image
 // ════════════════════════════════════════════════════
@@ -1094,7 +1115,8 @@ else if (provider === 'modelscope') {
         'Content-Type': 'application/json',
     };
 
-    const isQwenEditModel = apiId === 'Qwen/Qwen-Image-Edit-2511';
+    const isQwenEditModel = apiId.includes('Qwen');
+    const isKontextModel  = apiId.includes('Kontext') || apiId.includes('FLUX.1-Kontext');
 
     // ── input_image (single) vagy input_images (array) támogatás ─
     const rawInputImages = req.body.input_images
@@ -1109,7 +1131,7 @@ else if (provider === 'modelscope') {
     let tempB2Keys       = [];
     let originalWidth    = null;
     let originalHeight   = null;
-
+    let resizeMultiplier = 1;
     if (isEditModel) {
         try {
             for (let idx = 0; idx < rawInputImages.length; idx++) {
@@ -1129,23 +1151,30 @@ else if (provider === 'modelscope') {
 
                 if (isQwenEditModel) {
                     const TARGET_PIXELS = 1_000_000;
-                    const currentPixels = meta.width * meta.height;
-                    const scaleFactor   = Math.sqrt(TARGET_PIXELS / currentPixels);
-
-                    let newW = Math.round(meta.width  * scaleFactor);
-                    let newH = Math.round(meta.height * scaleFactor);
-                    newW = Math.round(newW / 16) * 16;
-                    newH = Math.round(newH / 16) * 16;
-
-                    console.log(`📐 Kép #${idx + 1}: ${meta.width}x${meta.height} → ${newW}x${newH}`);
-
+                    const scaleFactor = Math.sqrt(TARGET_PIXELS / (meta.width * meta.height));
+                    let newW = Math.round(meta.width  * scaleFactor / 16) * 16;
+                    let newH = Math.round(meta.height * scaleFactor / 16) * 16;
+                    console.log(`📐 Qwen resize: ${meta.width}x${meta.height} → ${newW}x${newH}`);
+                    const areaScale = (meta.width * meta.height) / (newW * newH);
+                    resizeMultiplier = Math.min(1.5, 0.4 + Math.log2(areaScale) * 0.4);
                     processedBuffer = await sharp(inputBuffer)
                         .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
-                        .png()
-                        .toBuffer();
+                        .png().toBuffer();
+
+                } else if (isKontextModel) {
+                    // Kontext-specifikus: legközelebbi preferált felbontás
+                    const { w: newW, h: newH } = snapToKontextResolution(meta.width, meta.height);
+                    console.log(`📐 Kontext resize: ${meta.width}x${meta.height} → ${newW}x${newH}`);
+                    const areaScale =
+                        (meta.width * meta.height) /
+                        (newW * newH);
+                    resizeMultiplier = Math.min(1.5, 0.4 + Math.log2(areaScale) * 0.4);
+                    processedBuffer = await sharp(inputBuffer)
+                        .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
+                        .png().toBuffer();
+
                 } else {
-                    // Flux: nincs resize, csak png konverzió
-                    console.log(`📐 Kép #${idx + 1}: ${meta.width}x${meta.height} (nincs resize)`);
+                    // más edit modell: nincs resize, csak png konverzió
                     processedBuffer = await sharp(inputBuffer).png().toBuffer();
                 }
 
@@ -1272,41 +1301,52 @@ else if (provider === 'modelscope') {
 
     // ── Utófeldolgozás: fetch + visszaméretezés → base64 (csak Qwen) ──────────
 
-    const postProcess = async (url) => {
-        if (!isQwenEditModel || !isEditModel || !originalWidth || !originalHeight) {
-            return { url, base64: null };
-        }
+const postProcess = async (url, resizeMultiplier) => {
+    if (!isEditModel) {
+        return { url, base64: null };
+    }
 
-        try {
-            const response        = await fetch(url);
-            const generatedBuffer = Buffer.from(await response.arrayBuffer());
+    try {
+        const response        = await fetch(url);
+        const generatedBuffer = Buffer.from(await response.arrayBuffer());
 
-            const genMeta = await sharp(generatedBuffer).metadata();
-            console.log(`📥 Kapott kép: ${genMeta.width}x${genMeta.height}`);
+        const genMeta = await sharp(generatedBuffer).metadata();
+        console.log(`📥 Kapott kép: ${genMeta.width}x${genMeta.height}`);
+        console.log(resizeMultiplier);
+        
+        const restored = await sharp(generatedBuffer)
+            .resize(originalWidth, originalHeight, {
+                fit:    'fill',
+                kernel: 'lanczos3',
+            })
+            .sharpen({
+                sigma:  resizeMultiplier,
+                m1:     0.5,
+                m2:     3.0,
+                x1:     2.0,
+                y2:     15.0,
+                y3:     15.0,
+            })
+            .modulate({ brightness: 1.015 })
+            .png({ compressionLevel: 0 })
+            .toBuffer();
 
-            const restored = await sharp(generatedBuffer)
-                .resize(originalWidth, originalHeight, {
-                    fit:    'fill',
-                    kernel: 'lanczos3',
-                })
-                .png({ compressionLevel: 0 })
-                .toBuffer();
+        const base64 = `data:image/png;base64,${restored.toString('base64')}`;
+        console.log(`✅ Visszaméretezve: ${originalWidth}x${originalHeight}`);
+        return { url: null, base64 };
 
-            const base64 = `data:image/png;base64,${restored.toString('base64')}`;
-            console.log(`✅ Visszaméretezve: ${originalWidth}x${originalHeight}`);
-            return { url: null, base64 };
-
-        } catch (err) {
-            console.error('Post-process hiba:', err.message);
-            return { url, base64: null };
-        }
-    };
-
+    } catch (err) {
+        console.error('Post-process hiba:', err.message);
+        return { url, base64: null };
+    }
+};
     // ── Szinkron eredmény ─────────────────────────────────────────────────────
 
     if (immediateUrl) {
         await cleanupB2();
-        const { url: finalUrl, base64 } = await postProcess(immediateUrl);
+        console.log("Ez fut le (szinkron)");
+        
+        const { url: finalUrl, base64 } = await postProcess(immediateUrl, resizeMultiplier);
         await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
         return res.json({
             success: true,
@@ -1370,13 +1410,12 @@ else if (provider === 'modelscope') {
         // PENDING / PROCESSING → folytatjuk
     }
 
-    await cleanupB2();
-
     if (!imageUrl) {
         return res.status(504).json({ success: false, message: 'ModelScope időtúllépés (>150s)' });
     }
 
-    const { url: finalUrl, base64 } = await postProcess(imageUrl);
+    const { url: finalUrl, base64 } = await postProcess(imageUrl, resizeMultiplier);
+    await cleanupB2();
 
     await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
     return res.json({
