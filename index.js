@@ -1532,6 +1532,24 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
     });
   }
 });
+import { createTripoRouter } from './src/routes/tripo.routes.js';
+
+// 1. RAW body capture — must come BEFORE bodyParser.json()
+app.use("/api/tripo/webhook", express.raw({
+  type: "application/json",
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
+
+// 2. Your existing middleware (cors, bodyParser, etc.)
+// app.use(cors(...))
+// app.use(express.json())
+
+// 3. Your existing routes
+// app.use('/api', aiRoutes)
+
+// 4. Tripo router — after bodyParser, after aiRoutes
+const tripoRouter = createTripoRouter(verifyFirebaseToken);
+app.use("/api", tripoRouter);
 
 // ==================== SERVER START ====================
 
