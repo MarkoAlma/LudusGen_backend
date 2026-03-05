@@ -17,19 +17,20 @@ export function estimateCost(req) {
   breakdown.base = base;
 
   // Texture
-  let texture = 0;
-  if (req.texture) {
-    const key = req.texture_quality === "HD" ? "addon:texture_HD" : "addon:texture_detailed";
-    texture = CREDIT_COSTS[key] ?? 0;
-    breakdown.texture = texture;
-  }
+let texture = 0;
+if (req.texture || req.pbr) {
+  // HD = texture_quality "HD" vagy "detailed" → +20 total
+  // Standard = default → +10 total
+  const isHD = req.texture_quality === "HD" || req.texture_quality === "detailed";
+  texture = isHD
+    ? (CREDIT_COSTS["addon:texture_HD"] ?? 20)
+    : (CREDIT_COSTS["addon:texture_standard"] ?? 10);
+  breakdown.texture = texture;
+}
+// PBR külön cost nincs — benne van a textúrában
 
-  // PBR
-  let pbr = 0;
-  if (req.pbr) {
-    pbr = CREDIT_COSTS["addon:pbr"] ?? 0;
-    breakdown.pbr = pbr;
-  }
+  // PBR: benne van a texture csomagban, külön ár nincs
+  const pbr = 0;
 
   // Geometry quality (v3.0+ only)
   let geometry_quality = 0;
@@ -52,6 +53,11 @@ export function estimateCost(req) {
     breakdown.generate_parts = generate_parts;
   }
 
+  let quad = 0;
+  if (req.quad) {
+    quad = CREDIT_COSTS["addon:quad"] ?? 5;
+    breakdown.quad = quad;
+  }
   // Animation
   let animation = 0;
   if (req.animation) {
@@ -59,8 +65,9 @@ export function estimateCost(req) {
     breakdown.animation = animation;
   }
 
-  const total = base + texture + pbr + geometry_quality + smart_low_poly + generate_parts + animation;
-  return { base, texture, pbr, texture_quality: 0, geometry_quality, smart_low_poly, animation, total, breakdown };
+  const total = base + texture + geometry_quality + smart_low_poly + generate_parts + quad + animation;
+  return { base, texture, pbr: 0, texture_quality: 0, geometry_quality, smart_low_poly, quad, animation, total, breakdown };
+
 }
 
 /**
@@ -76,14 +83,16 @@ export function estimatePipelineCost(req) {
   steps.text_to_model = CREDIT_COSTS[`text_to_model:${modelVersion}`] ?? CREDIT_COSTS.text_to_model ?? 0;
 
   if (req.hasTexture) {
-    const key = req.textureQuality === "HD" ? "addon:texture_HD" : "addon:texture_detailed";
+    const key = req.textureQuality === "HD" || req.textureQuality === "detailed"
+  ? "addon:texture_HD"
+  : "addon:texture_standard";
     steps.texture_addon = CREDIT_COSTS[key] ?? 0;
   }
-  if (req.hasPbr)          steps.pbr_addon          = CREDIT_COSTS["addon:pbr"] ?? 0;
-  if (req.runSmartLowPoly) steps.smart_low_poly      = CREDIT_COSTS.smart_low_poly ?? 0;
+  if (req.hasPbr) steps.pbr_addon = CREDIT_COSTS["addon:pbr"] ?? 0;
+  if (req.runSmartLowPoly) steps.smart_low_poly = CREDIT_COSTS.smart_low_poly ?? 0;
   if (req.runRig) {
     steps.animate_prerigcheck = CREDIT_COSTS.animate_prerigcheck ?? 0;
-    steps.animate_rig         = CREDIT_COSTS.animate_rig ?? 0;
+    steps.animate_rig = CREDIT_COSTS.animate_rig ?? 0;
   }
   if (req.animations?.length) {
     steps.animate_retarget =

@@ -18,17 +18,19 @@ export async function createTask(req, res) {
     const body = { type, ...rest };
 
     if (USE_QUEUE) {
-      const jobId = await enqueueTripoTask({
-        jobType:        "single",
-        taskBody:       body,
-        userId:         req.user?.uid,
-        callbackUrl:    callback_url,
+console.log("[BILLING DEBUG] body:", JSON.stringify(body, null, 2));
+const jobId = await enqueueTripoTask({
+        jobType: "single",
+        taskBody: body,
+        userId: req.user?.uid,
+        callbackUrl: callback_url,
         idempotencyKey: idempotency_key ?? uuid(),
       });
       res.json({ success: true, queued: true, jobId });
     } else {
+      console.log("[BILLING DEBUG] body:", JSON.stringify(body, null, 2));
       const taskId = await taskService.create(body, {
-        callbackUrl:    callback_url,
+        callbackUrl: callback_url,
         idempotencyKey: idempotency_key,
       });
       res.json({ success: true, taskId });
@@ -67,7 +69,7 @@ export async function cancelTask(req, res) {
 export async function listTasks(req, res) {
   try {
     const status = req.query.status;
-    const limit  = req.query.limit ? parseInt(req.query.limit, 10) : 20;
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : 20;
     const cursor = req.query.cursor;
 
     const VALID_STATUSES = ["queued", "running", "success", "failed", "cancelled"];
@@ -88,7 +90,7 @@ export async function listTasks(req, res) {
 export async function getBalance(req, res) {
   try {
     const client = getTripoClient();
-    const data   = await client.getBalance();
+    const data = await client.getBalance();
     res.json({ success: true, ...data });
   } catch (err) {
     console.error("[TaskController] balance error:", err.message);
@@ -108,7 +110,7 @@ export async function uploadFile(req, res) {
   }
 
   try {
-    const client     = getTripoClient();
+    const client = getTripoClient();
     const imageToken = await client.uploadFile(file.buffer, file.originalname || "image.jpg", file.mimetype);
     console.log(`[TaskController] uploaded image token: ${imageToken.slice(0, 12)}…`);
     // FIX: volt itt egy setImgToken(d.imageToken) — az React frontend kód, nem ide való
@@ -122,7 +124,7 @@ export async function uploadFile(req, res) {
 /* ─── Model proxy ─────────────────────────────────────────────────────── */
 export async function modelProxy(req, res) {
   const { url } = req.query;
-    console.log("[modelProxy] url:", url, "hostname:", new URL(url).hostname); // ← ADD IDE
+  console.log("[modelProxy] url:", url, "hostname:", new URL(url).hostname); // ← ADD IDE
 
   if (!url) { res.status(400).json({ success: false, message: "url missing" }); return; }
 
@@ -131,28 +133,28 @@ export async function modelProxy(req, res) {
     res.status(400).json({ success: false, message: "Invalid URL" }); return;
   }
 
-const allowedHosts = [
-  "tripo3d.ai",
-  "tripo3d.com",          // ← új
-  "cdn.tripo3d.ai",
-  "cdn.tripo3d.com",      // ← új
-  "assets.tripo3d.ai",
-  "assets.tripo3d.com",   // ← új
-];
+  const allowedHosts = [
+    "tripo3d.ai",
+    "tripo3d.com",          // ← új
+    "cdn.tripo3d.ai",
+    "cdn.tripo3d.com",      // ← új
+    "assets.tripo3d.ai",
+    "assets.tripo3d.com",   // ← új
+  ];
   if (!allowedHosts.some(h => parsed.hostname.endsWith(h))) {
     res.status(400).json({ success: false, message: "Source not allowed" }); return;
   }
 
   try {
-    const apiKey   = process.env.TRIPO3D_API_KEY;
+    const apiKey = process.env.TRIPO3D_API_KEY;
     const upstream = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } });
 
     if (!upstream.ok) {
       res.status(502).json({ success: false, message: `Upstream ${upstream.status}` }); return;
     }
 
-    const ct  = upstream.headers.get("content-type") || "model/gltf-binary";
-    const cl  = upstream.headers.get("content-length");
+    const ct = upstream.headers.get("content-type") || "model/gltf-binary";
+    const cl = upstream.headers.get("content-length");
     const ext = parsed.pathname.split(".").pop()?.toLowerCase() ?? "glb";
 
     res.setHeader("Content-Type", ct);
@@ -220,25 +222,25 @@ export async function batchGenerate(req, res) {
     return;
   }
 
-  const batchId  = uuid();
+  const batchId = uuid();
   const isPrompt = !!prompts;
-  const mv       = model_version ?? DEFAULT_MODEL;
+  const mv = model_version ?? DEFAULT_MODEL;
 
   try {
     const jobDataList = items.map((item, index) => ({
-      jobType:     "batch_item",
+      jobType: "batch_item",
       batchId,
-      batchIndex:  index,
+      batchIndex: index,
       callbackUrl: callback_url,
       taskBody: {
         type: isPrompt ? "text_to_model" : "image_to_model",
         ...(isPrompt
           ? { prompt: item }
           : { file: { type: "jpg", file_token: item } }),
-        model_version:   mv,
+        model_version: mv,
         // FIX: csak true értéket küldünk, explicit false-t soha
         ...(texture !== false && { texture: true }),
-        ...(pbr === true      && { pbr: true }),
+        ...(pbr === true && { pbr: true }),
         texture_quality: texture_quality ?? "detailed",
       },
     }));
@@ -248,7 +250,7 @@ export async function batchGenerate(req, res) {
       res.json({
         success: true,
         batchId,
-        total:   items.length,
+        total: items.length,
         jobIds,
         message: "Batch enqueued. Track progress via GET /tripo/batch/:batchId",
       });
@@ -259,11 +261,11 @@ export async function batchGenerate(req, res) {
       res.json({
         success: true,
         batchId,
-        total:   items.length,
-        tasks:   taskIds.map((r, i) => ({
-          index:  i,
+        total: items.length,
+        tasks: taskIds.map((r, i) => ({
+          index: i,
           taskId: r.status === "fulfilled" ? r.value : null,
-          error:  r.status === "rejected"  ? r.reason.message : undefined,
+          error: r.status === "rejected" ? r.reason.message : undefined,
         })),
       });
     }

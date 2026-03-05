@@ -7,9 +7,10 @@ export const MAX_POLL_MS     = 600_000;
 export const POLL_INTERVAL   = 4_000;
 
 export const VALID_MODEL_VERSIONS = new Set([
+  "v3.1-20260211",
   "v3.0-20250812",
   "v2.5-20250123",
-  "turbo-v1.0-20250506",
+  "Turbo-v1.0-20250506",   // API docs: nagybetűs T
   "v2.0-20240919",
   "v1.4-20240625",
 ]);
@@ -43,42 +44,52 @@ export const RETRY_CONFIG = {
  * Keys: "type:model_version" for generation, plain "type" for post-process.
  */
 export const CREDIT_COSTS = {
-  "text_to_model:v3.0-20250812":        40,
-  "text_to_model:v2.5-20250123":        20,
-  "text_to_model:turbo-v1.0-20250506":  5,
-  "text_to_model:v2.0-20240919":        20,
-  "text_to_model:v1.4-20240625":        15,
+  // Base = textúra NÉLKÜL (pricing doc: "Without Texture" oszlop)
+  "text_to_model:v3.1-20260211":        10,
+  "text_to_model:v3.0-20250812":        10,
+  "text_to_model:v2.5-20250123":        10,
+  "text_to_model:Turbo-v1.0-20250506":  10,
+  "text_to_model:v2.0-20240919":        10,
+  "text_to_model:v1.4-20240625":        10,  // V1.4-nél nincs külön adat, feltételezzük same
 
-  "image_to_model:v3.0-20250812":       45,
-  "image_to_model:v2.5-20250123":       25,
-  "image_to_model:turbo-v1.0-20250506": 6,
-  "image_to_model:v2.0-20240919":       25,
+  "image_to_model:v3.1-20260211":       20,
+  "image_to_model:v3.0-20250812":       20,
+  "image_to_model:v2.5-20250123":       20,
+  "image_to_model:Turbo-v1.0-20250506": 20,
+  "image_to_model:v2.0-20240919":       20,
   "image_to_model:v1.4-20240625":       20,
 
-  "multiview_to_model:v3.0-20250812":       50,
-  "multiview_to_model:v2.5-20250123":       30,
-  "multiview_to_model:turbo-v1.0-20250506": 8,
+  "multiview_to_model:v3.1-20260211":        20,
+  "multiview_to_model:v3.0-20250812":        20,
+  "multiview_to_model:v2.5-20250123":        20,
+  "multiview_to_model:Turbo-v1.0-20250506":  20,
+  "multiview_to_model:v2.0-20240919":        20,
 
   texture_model:        10,
   smart_low_poly:       10,
-  convert_model:         2,
-  mesh_segmentation:     5,
-  mesh_completion:       5,
-  animate_prerigcheck:   2,
-  animate_rig:          15,
+  convert_model:         5,
+  mesh_segmentation:    40,
+  mesh_completion:      50,
+  animate_prerigcheck:   0,   // Free per pricing doc
+  animate_rig:          25,
   animate_retarget:     10,
-  stylize_model:        10,
-  refine_model:          5,
+  stylize_model:        20,
+  refine_model:         30,
   import_model:          0,
-  text_to_image:         2,
+  text_to_image:         5,
 
-  "addon:texture_detailed":     10,
-  "addon:texture_HD":           20,
-  "addon:pbr":                   5,
-  "addon:geometry_detailed":     5,
-  "addon:smart_low_poly_gen":   10,
-  "addon:generate_parts":       10,
-  "addon:animation_per_preset": 10,
+
+  // Addons (generation-hoz hozzáadódnak a base-re)
+// Addons
+"addon:texture_standard": 10,  // Standard texture (PBR benne van)
+"addon:texture_HD": 20,        // HD texture (4K, PBR benne van)
+"addon:smart_low_poly_gen": 10,// smart_low_poly at generation time
+"addon:generate_parts": 20,    // generate_parts
+"addon:quad": 5,               // quad topology
+"addon:style": 5,              // style param (ha lesz)
+
+"addon:pbr": 5,                // volt: 0 — API külön számolja még HD mellé is
+"addon:geometry_detailed": 10, // volt: 15 — "ultra" szint = 10, nem 20
 };
 
 /**
