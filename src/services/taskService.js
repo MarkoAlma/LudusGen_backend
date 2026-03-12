@@ -108,6 +108,9 @@ class TaskService {
         if (!b["generate_parts"]) delete b["generate_parts"];
 
         // face_limit
+if (b["smart_low_poly"] && !b["face_limit"]) {
+          b["face_limit"] = b["quad"] ? 5_000 : 8_000; // getFaceLimitConfig defaultVal-ok
+        }
         const fl = validateFaceLimit(b["face_limit"], !!b["smart_low_poly"], !!b["quad"]);
         if (fl !== undefined) b["face_limit"] = fl; else delete b["face_limit"];
 

@@ -18,8 +18,8 @@ export async function createTask(req, res) {
     const body = { type, ...rest };
 
     if (USE_QUEUE) {
-console.log("[BILLING DEBUG] body:", JSON.stringify(body, null, 2));
-const jobId = await enqueueTripoTask({
+      console.log("[BILLING DEBUG] body:", JSON.stringify(body, null, 2));
+      const jobId = await enqueueTripoTask({
         jobType: "single",
         taskBody: body,
         userId: req.user?.uid,
@@ -60,8 +60,10 @@ export async function cancelTask(req, res) {
     await taskService.cancel(req.params.taskId);
     res.json({ success: true, cancelled: true });
   } catch (err) {
-    console.error("[TaskController] cancelTask error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    console.warn("[TaskController] cancelTask:", err.message);
+    // Már befejezett/failed task cancel kísérlete nem kritikus hiba
+    // A frontend kezeli, 200-at küldünk vissza hogy ne logoljon hibát
+    res.json({ success: false, message: err.message });
   }
 }
 
