@@ -88,6 +88,42 @@ class TaskService {
           throw new Error(`Invalid model_version "${mv}". Valid: ${[...VALID_MODEL_VERSIONS].join(", ")}`);
         b["model_version"] = mv;
 
+        // ── P1-20260311: csak engedélyezett paraméterek ──────────────────
+        // A P1 modell nem támogatja: quad, smart_low_poly, generate_parts,
+        // geometry_quality, t_pose, negative_prompt, style
+        // Forrás: Tripo API docs – "P1-20260311 Parameter Support"
+        if (mv === "P1-20260311") {
+          const P1_ALLOWED = new Set([
+            "type", "model_version", "prompt", "file", "files",
+            "texture", "pbr", "texture_quality",
+            "face_limit", "model_seed", "texture_seed",
+            "auto_size", "compress", "export_uv",
+            "callback_url",
+          ]);
+          for (const key of Object.keys(b)) {
+            if (!P1_ALLOWED.has(key)) {
+              console.warn(`[TaskService] P1-20260311: dropping unsupported param "${key}"`);
+              delete b[key];
+            }
+          }
+          // face_limit: P1 range = 48–20000
+          if (b["face_limit"] !== undefined) {
+            const fl = Number(b["face_limit"]);
+            if (!Number.isFinite(fl) || fl < 48 || fl > 20_000) {
+              console.warn(`[TaskService] P1-20260311: face_limit ${fl} out of range 48–20000, dropping`);
+              delete b["face_limit"];
+            }
+          }
+          // texture_quality: csak "standard" és "detailed"
+          if (b["texture_quality"] && !["standard", "detailed"].includes(b["texture_quality"])) {
+            b["texture_quality"] = "standard";
+          }
+          if (!b["texture"] && !b["pbr"]) delete b["texture_quality"];
+          if (!b["texture"]) delete b["texture"];
+          if (!b["pbr"])     delete b["pbr"];
+          break; // P1 validáció kész, többi szabály nem vonatkozik rá
+        }
+
         // prompt length
         if (body.type === "text_to_model" || (body.type === "image_to_model" && b["prompt"])) {
           const p = b["prompt"];
@@ -114,11 +150,19 @@ class TaskService {
         const fl = validateFaceLimit(b["face_limit"], !!b["smart_low_poly"], !!b["quad"]);
         if (fl !== undefined) b["face_limit"] = fl; else delete b["face_limit"];
 
-        // texture_quality — csak "detailed" vagy "HD" megengedett
-        if (b["geometry_quality"] === "detailed" || (!b["texture"] && !b["pbr"])) {
+        // texture_quality — "detailed" (default), "HD" vagy "standard" (→ "detailed") megengedett
+        // FIX: "standard" értéket ne írjuk felül "detailed"-re csendben
+        if (!b["texture"] && !b["pbr"]) {
           delete b["texture_quality"];
         } else {
-          b["texture_quality"] = b["texture_quality"] === "HD" ? "HD" : "detailed";
+          // API valid values: "standard" (default) | "detailed" (high-res)
+          // "HD" nem létező API érték — "detailed"-re mappolva
+          const tq = b["texture_quality"];
+          if (tq === "standard") {
+            b["texture_quality"] = "standard";
+          } else {
+            b["texture_quality"] = "detailed"; // "HD", undefined, egyéb → detailed
+          }
         }
         // FIX: texture/pbr false értéket ne küldjük el
         if (!b["texture"]) delete b["texture"];
@@ -214,7 +258,10 @@ class TaskService {
 
       case "texture_model":
         if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
-        b["texture_quality"] = b["texture_quality"] === "HD" ? "HD" : "detailed";
+        // FIX: "standard" is valid, don't coerce to "detailed"
+        if (!["standard", "detailed"].includes(b["texture_quality"])) {
+          b["texture_quality"] = "detailed";
+        }
         if (!b["pbr"]) delete b["pbr"];
         break;
 

@@ -17,7 +17,9 @@ class PipelineService {
    * @param {import("../../src/config/tripo.config.js").GenerateCharacterRequest} req
    */
   async generateCharacter(req) {
-    const pipelineId   = randomUUID();
+    // FIX: ha a controller átadja a pipelineId-t, azt használjuk — így a kliens
+    // és a _pipelines Map ugyanazt az ID-t látja.
+    const pipelineId   = req.pipelineId ?? randomUUID();
     const client       = getTripoClient();
     const enginePreset = req.engine ? resolveEnginePreset(req.engine) : null;
     const genType      = req.image_token ? "image_to_model" : "text_to_model";

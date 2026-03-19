@@ -1,16 +1,21 @@
 // src/config/tripo.config.js
 
 export const TRIPO_BASE_URL  = "https://api.tripo3d.ai/v2/openapi";
-export const DEFAULT_MODEL   = "v3.0-20250812";
+export const DEFAULT_MODEL   = "P1-20260311";
 export const DEFAULT_TIMEOUT = 30_000;
 export const MAX_POLL_MS     = 600_000;
 export const POLL_INTERVAL   = 4_000;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// VALID SETS
+// ─────────────────────────────────────────────────────────────────────────────
+
 export const VALID_MODEL_VERSIONS = new Set([
+  "P1-20260311",
   "v3.1-20260211",
   "v3.0-20250812",
   "v2.5-20250123",
-  "Turbo-v1.0-20250506",   // API docs: nagybetűs T
+  "Turbo-v1.0-20250506",
   "v2.0-20240919",
   "v1.4-20240625",
 ]);
@@ -31,132 +36,130 @@ export const VALID_STYLES = new Set([
   "lego", "voxel", "voronoi", "minecraft", "gold", "ancient_bronze",
 ]);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RETRY CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
+
 export const RETRY_CONFIG = {
   maxRetries:        3,
   baseDelayMs:       1_000,
   maxDelayMs:        32_000,
   jitterMs:          500,
-  retryableStatuses: new Set([429, 500, 502, 503, 504]),
+  retryableStatuses: new Set([500, 502, 503, 504]),
 };
 
-/**
- * Approximate credit costs per task type / addon.
- * Keys: "type:model_version" for generation, plain "type" for post-process.
- */
-export const CREDIT_COSTS = {
-  "text_to_model:v3.1-20260211":        10,
-  "text_to_model:v3.0-20250812":        10,
-  "text_to_model:v2.5-20250123":        10,
-  "text_to_model:Turbo-v1.0-20250506":  10,
-  "text_to_model:v2.0-20240919":        10,
-  "text_to_model:v1.4-20240625":        10,
+// ─────────────────────────────────────────────────────────────────────────────
+// CREDIT COSTS  —  forrás: Tripo hivatalos árszabás
+//
+// A "*_to_model:model" kulcsok = WITHOUT TEXTURE ár (textúra nélküli alap).
+//
+// Összesített árak (tájékoztató):
+//   P1-20260311  text:         30 (no tex) | 40 (std) | 50 (HD)
+//   P1-20260311  image/multi:  40 (no tex) | 50 (std) | 60 (HD)
+//   Többi text:         10 (no tex) | 20 (std) | 30 (HD)
+//   Többi image/multi:  20 (no tex) | 30 (std) | 40 (HD)
+//   V1.4  text: 20  |  image: 30  (lapos, addon nincs)
+//
+// Textúra addonok (mindig +10 / +10, modelltől függetlenül):
+//   Standard Texture: alap + 10
+//   HD Texture:       alap + 20  (standard + HD upgrade)
+// ─────────────────────────────────────────────────────────────────────────────
 
+export const CREDIT_COSTS = {
+
+  // ── 3D GENERÁLÁS — WITHOUT TEXTURE alapár ────────────────────────────────
+
+  "text_to_model:P1-20260311":                30,
+  "text_to_model:v3.1-20260211":       10,
+  "text_to_model:v3.0-20250812":       10,
+  "text_to_model:v2.5-20250123":       10,
+  "text_to_model:Turbo-v1.0-20250506": 10,
+  "text_to_model:v2.0-20240919":       10,
+  "text_to_model:v1.4-20240625":       20,  // lapos, nincs addon
+
+  "image_to_model:P1-20260311":                40,
   "image_to_model:v3.1-20260211":       20,
   "image_to_model:v3.0-20250812":       20,
   "image_to_model:v2.5-20250123":       20,
   "image_to_model:Turbo-v1.0-20250506": 20,
   "image_to_model:v2.0-20240919":       20,
-  "image_to_model:v1.4-20240625":       20,
+  "image_to_model:v1.4-20240625":       30,  // lapos, nincs addon
 
-  "multiview_to_model:v3.1-20260211":        20,
-  "multiview_to_model:v3.0-20250812":        20,
-  "multiview_to_model:v2.5-20250123":        20,
-  "multiview_to_model:Turbo-v1.0-20250506":  20,
-  "multiview_to_model:v2.0-20240919":        20,
+  "multiview_to_model:P1-20260311":                40,
+  "multiview_to_model:v3.1-20260211":       20,
+  "multiview_to_model:v3.0-20250812":       20,
+  "multiview_to_model:v2.5-20250123":       20,
+  "multiview_to_model:Turbo-v1.0-20250506": 20,
+  "multiview_to_model:v2.0-20240919":       20,
+  // V1.4 nem támogatja a multiview-t
 
-  texture_model:        10,
-  smart_low_poly:       10,
-  convert_model:         5,
-  mesh_segmentation:    40,
-  mesh_completion:      50,
-  animate_prerigcheck:   0,
-  animate_rig:          25,
-  animate_retarget:     10,
-  stylize_model:        20,
-  refine_model:         30,
-  import_model:          0,
-  text_to_image:         5,
+  // ── ADVANCED GENERATION SETUP addonok ────────────────────────────────────
+  // Az without_texture alapárra adódnak.
 
-  /*
-   * Texture addons — empirikusan mért értékek:
-   *
-   *   v3 + "detailed" = 20  ✓ (test: text+v3+tex+pbr+quad=35 → 10+20+5)
-   *   v2 + "detailed" = 20  (becsült, nincs ellentétes adat)
-   *   v2 + "standard" = 10  ✓ (docs)
-   *
-   *   FONTOS: ha geometry_quality:"detailed" (Ultra) aktív,
-   *   a texture cost NULLA — az Ultra magában foglalja.
-   *   (test: v3+Ultra+tex+pbr+quad=55 → 10+40+5, texCost=0 ✓)
-   */
-  "addon:texture_standard:v3":  20,  // v3.x, texture_quality:"detailed"
-  "addon:texture_standard":     10,  // v2.x, texture_quality:"detailed"
-  "addon:texture_HD:v3":        30,  // v3.x, texture_quality:"HD" (texture_model task)
-  "addon:texture_HD":           20,  // v2.x, texture_quality:"HD"
+  "addon:texture_standard":   10,  // Standard Texture: +10 (modelltől függetlenül)
+  "addon:texture_HD_upgrade": 10,  // HD Texture upgrade: standard + 10
+  "addon:geometry_detailed":  20,  // Detailed Geometry Quality (Ultra)
+  "addon:smart_low_poly_gen": 10,  // Low Poly
+  "addon:generate_parts":     20,  // Generate in parts
+  "addon:quad":                5,  // Quad Topology
+  "addon:style":               5,  // Style
 
-  "addon:pbr":                0,   // ingyenes texture=true mellé
-  /*
-   * geometry_quality:"detailed" (Ultra gomb) — BIZONYÍTOTT: +40 kredit
-   * test: text+v3+Ultra+quad(tex OFF)=55 → 10+40+5=55 ✓
-   * TARTALMAZZA a texture cost-ot — ha Ultra ON, texCost=0
-   */
-  "addon:geometry_detailed":  40,
-  "addon:smart_low_poly_gen": 10,  // smart_low_poly generáláskor
-  "addon:generate_parts":     20,  // generate_parts
-  "addon:quad":                5,  // quad topology ✓ bizonyított
-  "addon:style":               5,  // style param
+  // ── TEXTURE GENERATION ────────────────────────────────────────────────────
+
+  texture_model:              10,  // Standard Texture (önálló task)
+  "texture_model:HD":         20,  // HD Texture (önálló task)
+  "addon:texture_style_ref":   5,  // Style Reference
+
+  // ── SEGMENTATION AND PARTS COMPLETION ────────────────────────────────────
+
+  mesh_segmentation:          40,
+  mesh_completion:            50,
+
+  // ── POST PROCESSING ───────────────────────────────────────────────────────
+
+  stylize_model:              20,
+  convert_model:               5,
+  "convert_model:advanced":   10,
+  smart_low_poly:             10,
+  refine_model:               30,
+
+  // ── RIGGING AND ANIMATION ─────────────────────────────────────────────────
+
+  animate_prerigcheck:         0,
+  animate_rig:                25,
+  animate_retarget:           10,
+
+  // ── EGYÉB ─────────────────────────────────────────────────────────────────
+
+  import_model:                0,
+  text_to_image:               5,
 };
-/**
- * Engine presets for convert_model.
- * @type {Record<string, { format: string, quad: boolean, face_limit: number|null, scale_factor: number, pivot_to_center_bottom: boolean, description: string }>}
- */
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENGINE PRESETS
+// ─────────────────────────────────────────────────────────────────────────────
+
 export const ENGINE_PRESETS = {
-  unity: {
-    format:                 "glb",
-    quad:                   false,
-    face_limit:             50_000,
-    scale_factor:           1.0,
-    pivot_to_center_bottom: true,
-    description:            "Unity-optimised GLB, 50k triangles, Y-up pivot at base",
-  },
-  unreal: {
-    format:                 "fbx",
-    quad:                   true,
-    face_limit:             50_000,
-    scale_factor:           100.0,  // Unreal uses cm
-    pivot_to_center_bottom: false,
-    description:            "Unreal Engine FBX, quad mesh, 50k faces, cm scale",
-  },
-  webgl: {
-    format:                 "glb",
-    quad:                   false,
-    face_limit:             20_000,
-    scale_factor:           1.0,
-    pivot_to_center_bottom: false,
-    description:            "Web-optimised GLB, 20k triangles",
-  },
-  ios_ar: {
-    format:                 "usdz",
-    quad:                   false,
-    face_limit:             15_000,
-    scale_factor:           1.0,
-    pivot_to_center_bottom: true,
-    description:            "Apple AR / iOS USDZ, 15k triangles",
-  },
-  print: {
-    format:                 "stl",
-    quad:                   false,
-    face_limit:             null,   // auto — max detail
-    scale_factor:           1.0,
-    pivot_to_center_bottom: false,
-    description:            "3D printing STL, auto face count",
-  },
+  unity:  { format: "glb",  quad: false, face_limit: 50_000, scale_factor: 1.0,   pivot_to_center_bottom: true,  description: "Unity-optimised GLB, 50k triangles, Y-up pivot at base" },
+  unreal: { format: "fbx",  quad: true,  face_limit: 50_000, scale_factor: 100.0, pivot_to_center_bottom: false, description: "Unreal Engine FBX, quad mesh, 50k faces, cm scale" },
+  webgl:  { format: "glb",  quad: false, face_limit: 20_000, scale_factor: 1.0,   pivot_to_center_bottom: false, description: "Web-optimised GLB, 20k triangles" },
+  ios_ar: { format: "usdz", quad: false, face_limit: 15_000, scale_factor: 1.0,   pivot_to_center_bottom: true,  description: "Apple AR / iOS USDZ, 15k triangles" },
+  print:  { format: "stl",  quad: false, face_limit: null,   scale_factor: 1.0,   pivot_to_center_bottom: false, description: "3D printing STL, max detail" },
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOD PRESETS
+// ─────────────────────────────────────────────────────────────────────────────
 
 export const LOD_PRESETS = [
   { level: 0, label: "LOD0", face_limit: 50_000 },
   { level: 1, label: "LOD1", face_limit: 20_000 },
   { level: 2, label: "LOD2", face_limit:  5_000 },
 ];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUEUE / ANALYTICS
+// ─────────────────────────────────────────────────────────────────────────────
 
 export const QUEUE_NAMES = {
   TRIPO_TASKS:   "tripo_tasks",
