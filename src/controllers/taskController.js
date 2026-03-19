@@ -18,7 +18,7 @@ export async function createTask(req, res) {
     const body = { type, ...rest };
 
     if (USE_QUEUE) {
-      console.log("[BILLING DEBUG] body:", JSON.stringify(body, null, 2));
+      console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"}`);
       const jobId = await enqueueTripoTask({
         jobType: "single",
         taskBody: body,
@@ -28,7 +28,7 @@ export async function createTask(req, res) {
       });
       res.json({ success: true, queued: true, jobId });
     } else {
-      console.log("[BILLING DEBUG] body:", JSON.stringify(body, null, 2));
+      console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"}`);
       const taskId = await taskService.create(body, {
         callbackUrl: callback_url,
         idempotencyKey: idempotency_key,
@@ -126,8 +126,8 @@ export async function uploadFile(req, res) {
 /* ─── Model proxy ─────────────────────────────────────────────────────── */
 export async function modelProxy(req, res) {
   const { url } = req.query;
-  console.log("[modelProxy] url:", url, "hostname:", new URL(url).hostname); // ← ADD IDE
 
+  // FIX: null-check BEFORE new URL() — korábban crash volt ha url hiányzott
   if (!url) { res.status(400).json({ success: false, message: "url missing" }); return; }
 
   let parsed;
@@ -149,7 +149,11 @@ export async function modelProxy(req, res) {
 
   try {
     const apiKey = process.env.TRIPO3D_API_KEY;
-    const upstream = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } });
+    // FIX: 30s timeout hozzáadva — lógó upstream fetch ellen
+    const upstream = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(30_000),
+    });
 
     if (!upstream.ok) {
       res.status(502).json({ success: false, message: `Upstream ${upstream.status}` }); return;

@@ -4,9 +4,9 @@ import { ANALYTICS_RETENTION_DAYS, MAX_RECENT_ERRORS, CREDIT_COSTS } from "../co
 class AnalyticsService {
   constructor() {
     /** @type {Map<string, object>} taskId → record */
-    this._records     = new Map();
+    this._records      = new Map();
     /** @type {Map<string, object>} "YYYY-MM-DD" → DailyStats */
-    this._daily       = new Map();
+    this._daily        = new Map();
     /** @type {object[]} */
     this._recentErrors = [];
   }
@@ -23,7 +23,7 @@ class AnalyticsService {
       rec.finishedAt = now;
     }
     const actualDuration = durationMs || (rec ? now - rec.startedAt : 0);
-    this._updateDailyStats(rec?.type ?? "unknown", status, actualDuration);
+    this._updateDailyStats(rec?.type ?? "unknown", rec?.modelVersion, status, actualDuration);
     if (this._records.size > 10_000) this._pruneRecords();
   }
 
@@ -32,34 +32,32 @@ class AnalyticsService {
     if (rec) rec.error = error;
     const metric = {
       taskId, type, status: "failed",
-      durationMs: rec ? Date.now() - rec.startedAt : 0,
+      durationMs:   rec ? Date.now() - rec.startedAt : 0,
       modelVersion: rec?.modelVersion,
-      createdAt: rec?.startedAt ?? Date.now(),
+      createdAt:    rec?.startedAt ?? Date.now(),
       error,
     };
     this._recentErrors.unshift(metric);
     if (this._recentErrors.length > MAX_RECENT_ERRORS)
       this._recentErrors = this._recentErrors.slice(0, MAX_RECENT_ERRORS);
-    this._updateDailyStats(type, "failed", metric.durationMs);
+    this._updateDailyStats(type, rec?.modelVersion, "failed", metric.durationMs);
   }
 
   getSummary() {
-    const today    = this._getOrCreateDay(this._todayKey());
-    const last7    = Array.from({ length: 7 }, (_, i) => {
+    const today = this._getOrCreateDay(this._todayKey());
+    const last7 = Array.from({ length: 7 }, (_, i) => {
       const d = new Date(); d.setDate(d.getDate() - i);
       return this._getOrCreateDay(this._dateKey(d));
     });
-
     const durations = [...this._records.values()]
       .filter(r => r.finishedAt)
       .map(r => r.finishedAt - r.startedAt)
       .sort((a, b) => a - b);
-
-    const p50 = durations[Math.floor(durations.length * 0.5)] ?? 0;
+    const p50 = durations[Math.floor(durations.length * 0.5)]  ?? 0;
     const p95 = durations[Math.floor(durations.length * 0.95)] ?? 0;
     const errorRate = today.tasksTotal > 0 ? today.tasksFailed / today.tasksTotal : 0;
-
-    return { today, last7Days: last7, errorRate, p50DurationMs: p50, p95DurationMs: p95, recentErrors: this._recentErrors.slice(0, 10) };
+    return { today, last7Days: last7, errorRate, p50DurationMs: p50, p95DurationMs: p95,
+             recentErrors: this._recentErrors.slice(0, 10) };
   }
 
   getDailyCredits(days = 7) {
@@ -74,11 +72,18 @@ class AnalyticsService {
     return [...this._records.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, limit);
   }
 
-  _updateDailyStats(type, status, durationMs) {
+  // ── Private ──────────────────────────────────────────────────────────────
+
+  _updateDailyStats(type, modelVersion, status, durationMs) {
     const day = this._getOrCreateDay(this._todayKey());
     day.tasksTotal++;
-    if (status === "success") { day.tasksSuccess++; day.creditsUsed += CREDIT_COSTS[type] ?? 0; }
-    if (status === "failed")  day.tasksFailed++;
+    if (status === "success") {
+      day.tasksSuccess++;
+      // FIX: versioned key (pl. "text_to_model:P1.0"), fallback plain type, fallback 0
+      const vKey = modelVersion ? `${type}:${modelVersion}` : type;
+      day.creditsUsed += CREDIT_COSTS[vKey] ?? CREDIT_COSTS[type] ?? 0;
+    }
+    if (status === "failed") day.tasksFailed++;
     day.avgDurationMs = day.tasksTotal > 1
       ? (day.avgDurationMs * (day.tasksTotal - 1) + durationMs) / day.tasksTotal
       : durationMs;
@@ -88,7 +93,11 @@ class AnalyticsService {
 
   _getOrCreateDay(key) {
     if (!this._daily.has(key))
-      this._daily.set(key, { date: key, creditsUsed: 0, tasksTotal: 0, tasksSuccess: 0, tasksFailed: 0, avgDurationMs: 0, byType: {} });
+      this._daily.set(key, {
+        date: key, creditsUsed: 0,
+        tasksTotal: 0, tasksSuccess: 0, tasksFailed: 0,
+        avgDurationMs: 0, byType: {},
+      });
     return this._daily.get(key);
   }
 
@@ -99,12 +108,14 @@ class AnalyticsService {
   }
 
   _pruneRecords() {
-    const oldest = [...this._records.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt).slice(0, 1_000);
+    const oldest = [...this._records.entries()]
+      .sort((a, b) => a[1].startedAt - b[1].startedAt)
+      .slice(0, 1_000);
     oldest.forEach(([k]) => this._records.delete(k));
   }
 
-  _todayKey()     { return this._dateKey(new Date()); }
-  _dateKey(d)     { return d.toISOString().slice(0, 10); }
+  _todayKey()  { return this._dateKey(new Date()); }
+  _dateKey(d)  { return d.toISOString().slice(0, 10); }
 }
 
 export const analyticsService = new AnalyticsService();

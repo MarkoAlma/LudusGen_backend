@@ -3,6 +3,7 @@ import { pipelineService } from "../services/pipelineService.js";
 import { lodService } from "../services/lodService.js";
 import { estimatePipelineCost } from "../lib/creditEstimator.js";
 import { LOD_PRESETS } from "../config/tripo.config.js";
+import { randomUUID } from "crypto";
 
 /* ─── generateCharacter ───────────────────────────────────────────────── */
 export async function generateCharacter(req, res) {
@@ -13,8 +14,9 @@ export async function generateCharacter(req, res) {
     return;
   }
 
-  // Respond immediately with pipelineId, run in background
-  const pipelineId = `pipeline_${Date.now()}`;
+  // FIX: a pipelineId-t a controller generálja és adja át a service-nek,
+  // hogy a kliens és a _pipelines Map ugyanazt az ID-t használja.
+  const pipelineId = randomUUID();
   res.json({
     success:    true,
     pipelineId,
@@ -22,7 +24,7 @@ export async function generateCharacter(req, res) {
   });
 
   // Fire-and-forget
-  pipelineService.generateCharacter({ ...body }).then(result => {
+  pipelineService.generateCharacter({ ...body, pipelineId }).then(result => {
     console.log(`[Pipeline ${result.pipelineId}] final status=${result.status}`);
   }).catch(err => {
     console.error("[pipelineController] generateCharacter error:", err.message);

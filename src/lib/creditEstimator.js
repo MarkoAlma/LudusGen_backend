@@ -1,121 +1,126 @@
 // src/lib/creditEstimator.js
 import { CREDIT_COSTS, DEFAULT_MODEL } from "../config/tripo.config.js";
 
-/**
- * Returns true if the model version is v3.x or newer.
- * @param {string} mv
- */
-function isV3Model(mv) {
-  return mv.startsWith("v3.") || mv.startsWith("v3.1");
-}
+const isV14         = (mv) => mv === "v1.4-20240625";
+const supportsUltra = (mv) => mv === "P1-20260311" || mv.startsWith("v3.");
 
-/**
- * Estimate credit cost for a single task BEFORE creation.
- *
- * Empirikusan bizonyított értékek:
- *   text+v3+tex+pbr+"detailed"+quad        = 35  → base10 + tex20 + quad5       ✓
- *   text+v3+Ultra+quad (tex OFF)           = 55  → base10 + ultra40 + quad5     ✓
- *   text+v3+Ultra+tex+pbr+"detailed"+quad  = 55  → base10 + ultra40 + quad5 (+0)✓
- *
- * @param {{ type: string, model_version?: string, texture?: boolean, pbr?: boolean,
- *           texture_quality?: string, geometry_quality?: string,
- *           smart_low_poly?: boolean, generate_parts?: boolean,
- *           quad?: boolean, animation?: boolean }} req
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERATION COST
+//
+// Alap  = CREDIT_COSTS["type:mv"]            → without_texture ár
+// std   = alap + addon:texture_standard      → +10
+// HD    = alap + addon:texture_standard + addon:texture_HD_upgrade  → +20
+// V1.4  = fix ár, nincs addon
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function estimateCost(req) {
-  const mv = req.model_version ?? DEFAULT_MODEL;
-  const v3 = isV3Model(mv);
-  const breakdown = {};
+  const mv  = req.model_version ?? DEFAULT_MODEL;
+  const key = `${req.type}:${mv}`;
+  const base = CREDIT_COSTS[key] ?? 10;
+  const breakdown = { base };
 
-  /* ── Base ─────────────────────────────────────────────────────────── */
-  const versionedKey = `${req.type}:${mv}`;
-  const base = CREDIT_COSTS[versionedKey] ?? CREDIT_COSTS[req.type] ?? 0;
-  breakdown.base = base;
+  // V1.4: lapos árazás, nincs addon
+  if (isV14(mv)) return { total: base, breakdown };
 
-  /* ── Ultra / geometry_quality:"detailed" ─────────────────────────── */
-  // Ultra = 40 kredit ÉS magában foglalja a texture cost-ot (texCost=0 ha ultra)
-  const isUltra = req.geometry_quality === "detailed";
-  const geometry_quality = isUltra ? (CREDIT_COSTS["addon:geometry_detailed"] ?? 40) : 0;
-  if (geometry_quality) breakdown.geometry_quality = geometry_quality;
-
-  /* ── Texture ──────────────────────────────────────────────────────── */
-  // Ha Ultra aktív, texture cost = 0 (az Ultra tartalmazza)
-  let texture = 0;
-  if (!isUltra && (req.texture || req.pbr)) {
-    const isHD = req.texture_quality === "HD";
-    if (isHD) {
-      texture = v3
-        ? (CREDIT_COSTS["addon:texture_HD:v3"]  ?? 30)
-        : (CREDIT_COSTS["addon:texture_HD"]     ?? 20);
-    } else {
-      // "detailed" (default) vagy "standard"
-      texture = v3
-        ? (CREDIT_COSTS["addon:texture_standard:v3"] ?? 20)
-        : (CREDIT_COSTS["addon:texture_standard"]    ?? 10);
-    }
-    breakdown.texture = texture;
+  // Textúra addonok
+  const hasTex  = req.texture || req.pbr;
+  const isHD    = req.texture_quality === "HD";
+  let texAddon  = 0;
+  if (hasTex) {
+    const std  = CREDIT_COSTS["addon:texture_standard"]   ?? 10;
+    const hdUp = CREDIT_COSTS["addon:texture_HD_upgrade"] ?? 10;
+    texAddon = std + (isHD ? hdUp : 0);
+    breakdown.texture = texAddon;
   }
 
-  /* ── Smart Low Poly at generation time ───────────────────────────── */
-  const smart_low_poly = req.smart_low_poly
-    ? (CREDIT_COSTS["addon:smart_low_poly_gen"] ?? 10)
-    : 0;
-  if (smart_low_poly) breakdown.smart_low_poly = smart_low_poly;
+  // Advanced Generation Setup addonok
+  const ultraAddon = (req.geometry_quality === "detailed" && supportsUltra(mv))
+    ? (CREDIT_COSTS["addon:geometry_detailed"] ?? 20) : 0;
+  const slpAddon   = req.smart_low_poly ? (CREDIT_COSTS["addon:smart_low_poly_gen"] ?? 10) : 0;
+  const partsAddon = req.generate_parts ? (CREDIT_COSTS["addon:generate_parts"]    ?? 20) : 0;
+  const quadAddon  = req.quad           ? (CREDIT_COSTS["addon:quad"]               ??  5) : 0;
+  const styleAddon = req.style          ? (CREDIT_COSTS["addon:style"]              ??  5) : 0;
 
-  /* ── Generate Parts ───────────────────────────────────────────────── */
-  const generate_parts = req.generate_parts
-    ? (CREDIT_COSTS["addon:generate_parts"] ?? 20)
-    : 0;
-  if (generate_parts) breakdown.generate_parts = generate_parts;
+  if (ultraAddon)  breakdown.geometry_detailed = ultraAddon;
+  if (slpAddon)    breakdown.smart_low_poly    = slpAddon;
+  if (partsAddon)  breakdown.generate_parts    = partsAddon;
+  if (quadAddon)   breakdown.quad              = quadAddon;
+  if (styleAddon)  breakdown.style             = styleAddon;
 
-  /* ── Quad ─────────────────────────────────────────────────────────── */
-  const quad = req.quad ? (CREDIT_COSTS["addon:quad"] ?? 5) : 0;
-  if (quad) breakdown.quad = quad;
-
-  /* ── Animation ────────────────────────────────────────────────────── */
-  const animation = req.animation
-    ? (CREDIT_COSTS["addon:animation_per_preset"] ?? 0)
-    : 0;
-  if (animation) breakdown.animation = animation;
-
-  const total = base + texture + geometry_quality + smart_low_poly + generate_parts + quad + animation;
-  return {
-    base, texture, pbr: 0, texture_quality: 0,
-    geometry_quality, smart_low_poly, quad, animation,
-    total, breakdown,
-  };
+  const total = base + texAddon + ultraAddon + slpAddon + partsAddon + quadAddon + styleAddon;
+  return { total, breakdown };
 }
 
-/**
- * Estimate credit cost for a full pipeline.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// TEXTURE GENERATION COST  (önálló texture_model task)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function estimateTextureCost(req) {
+  const isHD     = req.texture_quality === "HD";
+  const base     = isHD ? (CREDIT_COSTS["texture_model:HD"] ?? 20) : (CREDIT_COSTS.texture_model ?? 10);
+  const styleRef = req.style_reference ? (CREDIT_COSTS["addon:texture_style_ref"] ?? 5) : 0;
+  const breakdown = { base, ...(styleRef && { style_reference: styleRef }) };
+  return { total: base + styleRef, breakdown };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST-PROCESSING COST
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function estimatePostCost(req) {
+  let cost;
+  if (req.type === "convert_model") {
+    cost = req.advanced
+      ? (CREDIT_COSTS["convert_model:advanced"] ?? 10)
+      : (CREDIT_COSTS.convert_model             ??  5);
+  } else {
+    cost = CREDIT_COSTS[req.type] ?? 0;
+  }
+  return { total: cost, breakdown: { [req.type]: cost } };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANIMATION COST
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function estimateAnimationCost(req) {
+  const count    = req.animationCount ?? 1;
+  const precheck = CREDIT_COSTS.animate_prerigcheck ?? 0;
+  const rig      = CREDIT_COSTS.animate_rig         ?? 25;
+  const retarget = (CREDIT_COSTS.animate_retarget   ?? 10) * count;
+  const breakdown = { animate_prerigcheck: precheck, animate_rig: rig, animate_retarget: retarget };
+  return { total: precheck + rig + retarget, breakdown };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FULL PIPELINE COST
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function estimatePipelineCost(req) {
-  const mv = req.modelVersion ?? DEFAULT_MODEL;
-  const v3 = isV3Model(mv);
+  const mv    = req.modelVersion ?? DEFAULT_MODEL;
   const steps = {};
 
-  steps.text_to_model = CREDIT_COSTS[`text_to_model:${mv}`] ?? CREDIT_COSTS.text_to_model ?? 0;
+  const genResult = estimateCost({
+    type:             "text_to_model",
+    model_version:    mv,
+    texture:          req.hasTexture,
+    pbr:              req.hasPbr,
+    texture_quality:  req.textureQuality,
+    geometry_quality: req.geometryQuality,
+    smart_low_poly:   req.smartLowPoly,
+    generate_parts:   req.generateParts,
+    quad:             req.quad,
+    style:            req.style,
+  });
+  steps.generation = genResult.total;
 
-  if (req.hasTexture || req.hasPbr) {
-    const isHD = req.textureQuality === "HD";
-    const key = isHD
-      ? (v3 ? "addon:texture_HD:v3"       : "addon:texture_HD")
-      : (v3 ? "addon:texture_standard:v3" : "addon:texture_standard");
-    steps.texture_addon = CREDIT_COSTS[key] ?? 0;
-  }
-
-  if (req.runSmartLowPoly) steps.smart_low_poly = CREDIT_COSTS.smart_low_poly ?? 0;
+  if (req.runSmartLowPoly) steps.smart_low_poly = CREDIT_COSTS.smart_low_poly ?? 10;
   if (req.runRig) {
-    steps.animate_prerigcheck = CREDIT_COSTS.animate_prerigcheck ?? 0;
-    steps.animate_rig = CREDIT_COSTS.animate_rig ?? 0;
-  }
-  if (req.animations?.length) {
-    steps.animate_retarget =
-      (CREDIT_COSTS.animate_retarget ?? 0) +
-      (req.animations.length - 1) * (CREDIT_COSTS["addon:animation_per_preset"] ?? 0);
+    const animResult = estimateAnimationCost({ animationCount: req.animations?.length ?? 1 });
+    Object.assign(steps, animResult.breakdown);
   }
   if (req.lodLevels > 0) {
-    steps.convert_model_lod = (CREDIT_COSTS.convert_model ?? 0) * req.lodLevels;
+    steps.convert_model_lod = (CREDIT_COSTS.convert_model ?? 5) * req.lodLevels;
   }
 
   const total = Object.values(steps).reduce((a, b) => a + b, 0);
