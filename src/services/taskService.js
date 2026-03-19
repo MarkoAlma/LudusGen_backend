@@ -21,7 +21,7 @@ class TaskService {
     if (opts.callbackUrl) validated["callback_url"] = opts.callbackUrl;
 
     const idempotencyKey = opts.idempotencyKey ?? crypto.randomUUID();
-    const client  = getTripoClient();
+    const client = getTripoClient();
     const startMs = Date.now();
 
     try {
@@ -38,7 +38,7 @@ class TaskService {
   /* ── Get ─────────────────────────────────────────────────────────── */
   async get(taskId) {
     const client = getTripoClient();
-    const task   = await client.getTask(taskId);
+    const task = await client.getTask(taskId);
     return this.taskToPollResult(task);
   }
 
@@ -59,7 +59,7 @@ class TaskService {
 
   /* ── Poll ────────────────────────────────────────────────────────── */
   async poll(taskId) {
-    const client  = getTripoClient();
+    const client = getTripoClient();
     const startMs = Date.now();
     try {
       const result = await client.pollTask(taskId, {
@@ -108,15 +108,21 @@ class TaskService {
         if (!b["generate_parts"]) delete b["generate_parts"];
 
         // face_limit
+        if (b["smart_low_poly"] && !b["face_limit"]) {
+          b["face_limit"] = b["quad"] ? 5_000 : 8_000; // getFaceLimitConfig defaultVal-ok
+        }
         const fl = validateFaceLimit(b["face_limit"], !!b["smart_low_poly"], !!b["quad"]);
         if (fl !== undefined) b["face_limit"] = fl; else delete b["face_limit"];
 
         // texture_quality — csak "detailed" vagy "HD" megengedett
-        b["texture_quality"] = b["texture_quality"] === "HD" ? "HD" : "detailed";
-
+        if (b["geometry_quality"] === "detailed" || (!b["texture"] && !b["pbr"])) {
+          delete b["texture_quality"];
+        } else {
+          b["texture_quality"] = b["texture_quality"] === "HD" ? "HD" : "detailed";
+        }
         // FIX: texture/pbr false értéket ne küldjük el
         if (!b["texture"]) delete b["texture"];
-        if (!b["pbr"])     delete b["pbr"];
+        if (!b["pbr"]) delete b["pbr"];
 
         // style
         if (b["style"] && !VALID_STYLES.has(b["style"]))
@@ -152,7 +158,7 @@ class TaskService {
         delete b["is_rigged_input"];
         const fl = validateFaceLimit(b["face_limit"], false, !!b["quad"]);
         if (fl !== undefined) b["face_limit"] = fl; else delete b["face_limit"];
-        if (!b["quad"])               delete b["quad"];
+        if (!b["quad"]) delete b["quad"];
         if (!b["pivot_to_center_bottom"]) delete b["pivot_to_center_bottom"];
         break;
       }
@@ -238,18 +244,18 @@ class TaskService {
   taskToPollResult(task) {
     const out = task.output ?? {};
     return {
-      success:        task.status === "success",
-      status:         task.status,
-      progress:       task.progress ?? 0,
+      success: task.status === "success",
+      status: task.status,
+      progress: task.progress ?? 0,
       modelUrl:
-        out.model          ??
-        out.pbr_model      ??
-        out.base_model     ??
-        out.rigged_model   ??
+        out.model ??
+        out.pbr_model ??
+        out.base_model ??
+        out.rigged_model ??
         out.animated_model ??
         null,
       rigCheckResult: out.is_animatable ?? null,
-      rawOutput:      out,
+      rawOutput: out,
     };
   }
 }

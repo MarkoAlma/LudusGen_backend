@@ -127,9 +127,12 @@ export class TripoClient {
     return res.data;
   }
 
-  async cancelTask(taskId) {
-    await this.post(`/task/${taskId}/cancel`, {});
-  }
+async cancelTask(taskId) {
+  // Tripo API does not support task cancellation.
+  // We only stop polling on the frontend side.
+  console.log(`[TaskService] cancel requested for ${taskId} — no-op (Tripo has no cancel endpoint)`);
+  return { success: true, cancelled: false };
+}
 
   async listTasks({ status, limit = 20, cursor } = {}) {
     const qs = new URLSearchParams();
