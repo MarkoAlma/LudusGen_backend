@@ -149,9 +149,13 @@ export async function modelProxy(req, res) {
 
   try {
     const apiKey = process.env.TRIPO3D_API_KEY;
-    // FIX: 30s timeout hozzáadva — lógó upstream fetch ellen
+    // CloudFront pre-signed URL-ek (Signature query param) nem fogadnak el
+    // Authorization headert — az extra header 403-at okoz.
+    // Csak plain tripo API URL-eknel kell a Bearer token.
+    const isPresigned = parsed.searchParams.has('Signature') || parsed.searchParams.has('Policy');
+    const fetchHeaders = isPresigned ? {} : { Authorization: `Bearer ${apiKey}` };
     const upstream = await fetch(url, {
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: fetchHeaders,
       signal: AbortSignal.timeout(30_000),
     });
 
