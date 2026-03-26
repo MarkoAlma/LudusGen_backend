@@ -16,6 +16,7 @@ export async function getDailyCredits(req, res) {
   res.json({ success: true, days: data });
 }
 
+
 export async function getRecentTasks(req, res) {
   const limit = Math.min(100, parseInt(req.query.limit ?? "20", 10));
   const tasks = analyticsService.getRecentTasks(limit);
