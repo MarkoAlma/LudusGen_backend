@@ -258,6 +258,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
             return res.json({ success: true, content, usage });
         }
+        
 
         // ── Cerebras ─────────────────────────────────────
         else if (provider === 'cerebras') {
