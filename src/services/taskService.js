@@ -90,7 +90,7 @@ class TaskService {
 
         // ── P1-20260311: csak engedélyezett paraméterek ──────────────────
         // A P1 modell nem támogatja: quad, smart_low_poly, generate_parts,
-        // geometry_quality, t_pose, negative_prompt, style
+        // geometry_quality, t_pose, style
         // Forrás: Tripo API docs – "P1-20260311 Parameter Support"
         if (mv === "P1-20260311") {
           const P1_ALLOWED = new Set([
@@ -98,6 +98,7 @@ class TaskService {
             "texture", "pbr", "texture_quality",
             "face_limit", "model_seed", "texture_seed",
             "auto_size", "compress", "export_uv",
+            "negative_prompt",  // FIX: P1 supports negative_prompt
             "callback_url",
           ]);
           for (const key of Object.keys(b)) {

@@ -4,8 +4,9 @@ import { getTripoClient } from "../lib/tripoClient.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
-import { DEFAULT_MODEL, VALID_MODEL_VERSIONS } from "../config/tripo.config.js";
+import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
+import admin from "firebase-admin";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
 
@@ -137,11 +138,12 @@ export async function modelProxy(req, res) {
 
   const allowedHosts = [
     "tripo3d.ai",
-    "tripo3d.com",          // ← új
+    "tripo3d.com",
     "cdn.tripo3d.ai",
-    "cdn.tripo3d.com",      // ← új
+    "cdn.tripo3d.com",
     "assets.tripo3d.ai",
-    "assets.tripo3d.com",   // ← új
+    "assets.tripo3d.com",
+    "data.tripo3d.com",     // ← FIX: tripo-data.rg1.data.tripo3d.com
   ];
   if (!allowedHosts.some(h => parsed.hostname.endsWith(h))) {
     res.status(400).json({ success: false, message: "Source not allowed" }); return;
@@ -152,7 +154,10 @@ export async function modelProxy(req, res) {
     // CloudFront pre-signed URL-ek (Signature query param) nem fogadnak el
     // Authorization headert — az extra header 403-at okoz.
     // Csak plain tripo API URL-eknel kell a Bearer token.
-    const isPresigned = parsed.searchParams.has('Signature') || parsed.searchParams.has('Policy');
+    // FIX: CloudFront pre-signed URL-ek bármilyen extra query param esetén 403-at adnak
+    // ha Authorization headert küldünk. A tripo-data CDN-je is pre-signed URL-eket használ.
+    const isPresigned = parsed.searchParams.has('Signature') || parsed.searchParams.has('Policy')
+      || parsed.searchParams.has('X-Amz-Signature') || parsed.hostname.includes('tripo-data');
     const fetchHeaders = isPresigned ? {} : { Authorization: `Bearer ${apiKey}` };
     const upstream = await fetch(url, {
       headers: fetchHeaders,
@@ -163,9 +168,22 @@ export async function modelProxy(req, res) {
       res.status(502).json({ success: false, message: `Upstream ${upstream.status}` }); return;
     }
 
-    const ct = upstream.headers.get("content-type") || "model/gltf-binary";
+    // FIX: extension kinyerése query paraméterek nélkül (pre-signed URL-eknél
+    // a pathname végén szemét is lehet, pl. "model.glb?Signature=...")
+    const cleanPath = parsed.pathname.split("?")[0];
+    const ext = cleanPath.split(".").pop()?.toLowerCase() ?? "glb";
+
+    // FIX: FBX fájlokat a Tripo néha application/octet-stream-ként küldi,
+    // ami miatt a frontend nem tudja azonosítani a formátumot. Felülírjuk.
+    const EXT_CT_MAP = {
+      glb:  "model/gltf-binary",
+      fbx:  "application/octet-stream; x-format=fbx",
+      obj:  "text/plain",
+      stl:  "model/stl",
+      usdz: "model/vnd.usdz+zip",
+    };
+    const ct = EXT_CT_MAP[ext] ?? upstream.headers.get("content-type") ?? "model/gltf-binary";
     const cl = upstream.headers.get("content-length");
-    const ext = parsed.pathname.split(".").pop()?.toLowerCase() ?? "glb";
 
     res.setHeader("Content-Type", ct);
     res.setHeader("Content-Disposition", `attachment; filename="model.${ext}"`);
@@ -281,6 +299,123 @@ export async function batchGenerate(req, res) {
     }
   } catch (err) {
     console.error("[TaskController] batchGenerate error:", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+/* ─── Model capabilities ──────────────────────────────────────────────────── */
+
+/**
+ * GET /api/tripo/model-capabilities
+ * Returns per-model capability map. Frontend uses this to render/disable
+ * UI controls dynamically — no hardcoding on the client side.
+ */
+export async function getModelCapabilities(req, res) {
+  res.json({
+    success: true,
+    capabilities: MODEL_CAPABILITIES,
+    default: DEFAULT_CAPABILITIES,
+    historyTtlMs: HISTORY_TTL_MS,
+  });
+}
+
+/* ─── History management ──────────────────────────────────────────────────── */
+
+const HISTORY_COLLECTION = "trellis_history";
+
+/**
+ * DELETE /api/tripo/history/:id
+ * Deletes a single history item owned by the authenticated user.
+ */
+export async function deleteHistoryItem(req, res) {
+  const { id } = req.params;
+  const uid = req.user?.uid;
+  if (!id) { res.status(400).json({ success: false, message: "id required" }); return; }
+
+  try {
+    const db = admin.firestore();
+    const ref = db.collection(HISTORY_COLLECTION).doc(id);
+    const doc = await ref.get();
+
+    if (!doc.exists) {
+      res.status(404).json({ success: false, message: "Item not found" });
+      return;
+    }
+    if (doc.data()?.userId !== uid) {
+      res.status(403).json({ success: false, message: "Forbidden" });
+      return;
+    }
+
+    await ref.delete();
+    console.log(`[HistoryController] deleted item ${id} for user ${uid}`);
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error("[HistoryController] deleteHistoryItem error:", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+/**
+ * DELETE /api/tripo/history
+ * Deletes ALL tripo history items for the authenticated user.
+ */
+export async function clearHistory(req, res) {
+  const uid = req.user?.uid;
+  if (!uid) { res.status(401).json({ success: false, message: "Unauthorized" }); return; }
+
+  try {
+    const db = admin.firestore();
+    const snap = await db.collection(HISTORY_COLLECTION)
+      .where("userId", "==", uid)
+      .where("source", "==", "tripo")
+      .get();
+
+    const batch = db.batch();
+    snap.docs.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+
+    console.log(`[HistoryController] cleared ${snap.size} tripo items for user ${uid}`);
+    res.json({ success: true, deleted: snap.size });
+  } catch (err) {
+    console.error("[HistoryController] clearHistory error:", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+/**
+ * DELETE /api/tripo/history/expired
+ * Deletes history items older than HISTORY_TTL_MS for the authenticated user.
+ */
+export async function cleanupExpiredHistory(req, res) {
+  const uid = req.user?.uid;
+  if (!uid) { res.status(401).json({ success: false, message: "Unauthorized" }); return; }
+
+  try {
+    const db = admin.firestore();
+    const cutoffDate = admin.firestore.Timestamp.fromMillis(Date.now() - HISTORY_TTL_MS);
+
+    const snap = await db.collection(HISTORY_COLLECTION)
+      .where("userId", "==", uid)
+      .where("createdAt", "<", cutoffDate)
+      .get();
+
+    if (snap.empty) {
+      res.json({ success: true, deleted: 0, message: "Nothing to clean up" });
+      return;
+    }
+
+    // Firestore batch limit = 500
+    let deleted = 0;
+    for (let i = 0; i < snap.docs.length; i += 500) {
+      const b = db.batch();
+      snap.docs.slice(i, i + 500).forEach(doc => b.delete(doc.ref));
+      await b.commit();
+      deleted += Math.min(500, snap.docs.length - i);
+    }
+
+    console.log(`[HistoryController] cleaned up ${deleted} expired items for user ${uid}`);
+    res.json({ success: true, deleted });
+  } catch (err) {
+    console.error("[HistoryController] cleanupExpiredHistory error:", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 }
