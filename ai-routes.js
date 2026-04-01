@@ -842,6 +842,8 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
             frequency_penalty = 0,
             presence_penalty = 0,
         } = req.body;
+        console.log(messages);
+        
 
         if (!model || !provider) {
             return res.status(400).json({ success: false, message: 'Hiányzó model / provider' });
@@ -856,8 +858,10 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
             return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
         }
 
-        const safeMax = Math.min(Math.max(128, max_tokens), 32768);
+        const safeMax = Math.min(Math.max(128, max_tokens), 1024);
+
         const chatMsgs = normalizeMessages(messages);
+
 
         let resp;
         try {
