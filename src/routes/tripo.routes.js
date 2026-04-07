@@ -19,6 +19,10 @@ import {
   creditEstimate,
   getEnginePreset,
   batchGenerate,
+  getModelCapabilities,
+  deleteHistoryItem,
+  clearHistory,
+  cleanupExpiredHistory,
 } from "../controllers/taskController.js";
 
 import {
@@ -174,6 +178,25 @@ export function createTripoRouter(verifyAuth) {
   router.get("/tripo/analytics/summary", verifyAuth, adminLimiter, getSummary);
   router.get("/tripo/analytics/credits",  verifyAuth, adminLimiter, getDailyCredits);
   router.get("/tripo/analytics/tasks",    verifyAuth, adminLimiter, getRecentTasks);
+
+  /* ════════════════════════════════════════════════════════════════════
+   *  MODEL CAPABILITIES
+   * ════════════════════════════════════════════════════════════════════ */
+
+  /**
+   * Returns per-model capability map so the frontend can render options
+   * dynamically without any hardcoded model-specific logic.
+   */
+  router.get("/tripo/model-capabilities", verifyAuth, getModelCapabilities);
+
+  /* ════════════════════════════════════════════════════════════════════
+   *  HISTORY MANAGEMENT  (Firestore-backed, 7-day TTL)
+   * ════════════════════════════════════════════════════════════════════ */
+
+  /** Delete a single history item */
+  router.delete("/tripo/history/expired", verifyAuth, cleanupExpiredHistory);
+  router.delete("/tripo/history/:id",     verifyAuth, deleteHistoryItem);
+  router.delete("/tripo/history",         verifyAuth, clearHistory);
 
   return router;
 }

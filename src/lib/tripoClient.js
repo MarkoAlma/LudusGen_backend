@@ -179,8 +179,11 @@ async cancelTask(taskId) {
           success:        true,
           status:         "success",
           progress:       100,
+          // FIX: converted_model, stylized_model hozzáadva — history cardban megjelenik
           modelUrl:       out.model ?? out.pbr_model ?? out.base_model
-                          ?? out.rigged_model ?? out.animated_model ?? null,
+                          ?? out.rigged_model ?? out.animated_model
+                          ?? out.converted_model ?? out.stylized_model ?? null,
+          outputFormat:   out.format ?? null,
           rigCheckResult: out.is_animatable ?? null,
           rawOutput:      out,
         };

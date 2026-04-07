@@ -169,3 +169,72 @@ export const QUEUE_NAMES = {
 
 export const ANALYTICS_RETENTION_DAYS = 30;
 export const MAX_RECENT_ERRORS        = 50;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MODEL CAPABILITIES  —  single source of truth
+//
+// Frontend fetches GET /api/tripo/model-capabilities and uses this map to
+// render/disable UI controls dynamically.  Adding a new model only requires
+// updating this object — no hardcoding elsewhere.
+//
+// Key naming matches the frontend MODEL_CAPS convention so the response can
+// be used as a drop-in replacement.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const MODEL_CAPABILITIES = {
+  "P1-20260311": {
+    ultraMesh:    false, texture:   true,  pbr:        true,  tex4K:       true,
+    multiview:    true,  batch:     true,  tPose:      false, inParts:     false,
+    negPrompt:    true,  smartLowPoly: false, quad:    false,
+    autoSize:     true,  exportUv:  true,  makeBetter: true,
+    modelSeed:    true,  imageSeed: false, textureSeed: true,
+  },
+  "v3.1-20260211": {
+    ultraMesh:    true,  texture:   true,  pbr:        true,  tex4K:       true,
+    multiview:    true,  batch:     true,  tPose:      true,  inParts:     true,
+    negPrompt:    true,  smartLowPoly: true, quad:     true,
+    autoSize:     true,  exportUv:  true,  makeBetter: true,
+    modelSeed:    true,  imageSeed: true,  textureSeed: true,
+  },
+  "v3.0-20250812": {
+    ultraMesh:    true,  texture:   true,  pbr:        true,  tex4K:       true,
+    multiview:    true,  batch:     true,  tPose:      true,  inParts:     true,
+    negPrompt:    true,  smartLowPoly: true, quad:     true,
+    autoSize:     true,  exportUv:  true,  makeBetter: true,
+    modelSeed:    true,  imageSeed: true,  textureSeed: true,
+  },
+  "v2.5-20250123": {
+    ultraMesh:    false, texture:   true,  pbr:        true,  tex4K:       true,
+    multiview:    true,  batch:     true,  tPose:      false, inParts:     true,
+    negPrompt:    true,  smartLowPoly: false, quad:    true,
+    autoSize:     true,  exportUv:  true,  makeBetter: true,
+    modelSeed:    true,  imageSeed: true,  textureSeed: true,
+  },
+  "Turbo-v1.0-20250506": {
+    ultraMesh:    false, texture:   false, pbr:        false, tex4K:       false,
+    multiview:    false, batch:     true,  tPose:      false, inParts:     false,
+    negPrompt:    false, smartLowPoly: false, quad:    false,
+    autoSize:     false, exportUv:  true,  makeBetter: true,
+    modelSeed:    true,  imageSeed: false, textureSeed: false,
+  },
+  "v2.0-20240919": {
+    ultraMesh:    false, texture:   true,  pbr:        true,  tex4K:       true,
+    multiview:    true,  batch:     true,  tPose:      false, inParts:     true,
+    negPrompt:    true,  smartLowPoly: false, quad:    true,
+    autoSize:     true,  exportUv:  true,  makeBetter: true,
+    modelSeed:    true,  imageSeed: true,  textureSeed: true,
+  },
+  "v1.4-20240625": {
+    ultraMesh:    false, texture:   true,  pbr:        false, tex4K:       false,
+    multiview:    false, batch:     false, tPose:      false, inParts:     false,
+    negPrompt:    false, smartLowPoly: false, quad:    false,
+    autoSize:     false, exportUv:  true,  makeBetter: true,
+    modelSeed:    false, imageSeed: false, textureSeed: false,
+  },
+};
+
+// Default fallback for unknown model versions
+export const DEFAULT_CAPABILITIES = MODEL_CAPABILITIES["v2.5-20250123"];
+
+// History TTL in milliseconds (7 days)
+export const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
