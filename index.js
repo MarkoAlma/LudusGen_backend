@@ -16,6 +16,7 @@ dotenv.config();
 
 const app = express();          // Initialize app first
 
+
 // Middlewares
 app.use(cors({
   origin: ['http://localhost:5173', 'http://localhost:3001'],
@@ -285,33 +286,33 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
 const verifyFirebaseToken = async (req, res, next) => {
   try {
     const token = req.headers.authorization?.split("Bearer ")[1];
-    
+
     if (!token) {
-      return res.status(401).json({ 
-        success: false, 
-        message: "Nincs autentikációs token" 
+      return res.status(401).json({
+        success: false,
+        message: "Nincs autentikációs token"
       });
     }
 
     const decodedToken = await admin.auth().verifyIdToken(token);
-    
+
     // Email verifikáció ellenőrzése
     const userRecord = await admin.auth().getUser(decodedToken.uid);
     if (!userRecord.emailVerified) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Email nincs megerősítve" 
+      return res.status(403).json({
+        success: false,
+        message: "Email nincs megerősítve"
       });
     }
-    
+
     req.userId = decodedToken.uid;
     req.userEmail = decodedToken.email;
     next();
   } catch (error) {
     console.error("Token verify error:", error);
-    return res.status(401).json({ 
-      success: false, 
-      message: "Érvénytelen token" 
+    return res.status(401).json({
+      success: false,
+      message: "Érvénytelen token"
     });
   }
 };
@@ -322,7 +323,7 @@ async function get2FAData(userId) {
   try {
     const doc = await db.collection("users").doc(userId).get();
     if (!doc.exists) return null;
-    
+
     const data = doc.data();
     return {
       secret: data.twoFA?.secret || null,
@@ -392,31 +393,31 @@ const upload = multer({
 app.post("/api/register-user", async (req, res) => {
   try {
     const { email, password, displayName } = req.body;
-    
+
     // Validáció
     if (!email || !password || !displayName) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Email, jelszó és név szükséges" 
+      return res.status(400).json({
+        success: false,
+        message: "Email, jelszó és név szükséges"
       });
     }
-    
+
     if (password.length < 6) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "A jelszó legalább 6 karakter hosszú legyen" 
+      return res.status(400).json({
+        success: false,
+        message: "A jelszó legalább 6 karakter hosszú legyen"
       });
     }
-    
+
     if (displayName.trim().length < 1) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "A név legalább 2 karakter hosszú legyen" 
+      return res.status(400).json({
+        success: false,
+        message: "A név legalább 2 karakter hosszú legyen"
       });
     }
-    
+
     console.log("📝 Registering new user:", email);
-    
+
     // 1. Firebase Auth user létrehozása (Admin SDK - NEM jelentkeztet be!)
     const userRecord = await admin.auth().createUser({
       email,
@@ -424,28 +425,28 @@ app.post("/api/register-user", async (req, res) => {
       displayName: displayName.trim(),
       emailVerified: false,
     });
-    
+
     console.log("✅ Firebase Auth user created:", userRecord.uid);
-    
+
     // 2. Email verifikációs link generálása
     const verificationLink = await admin.auth().generateEmailVerificationLink(email, {
       url: 'http://localhost:5173', // Ide irányít az email link után
     });
     console.log(verificationLink);
-    
-    
+
+
     console.log("📧 Email verification link generated");
-    
+
     // 3. Email küldése Nodemailer-rel
     const emailSent = await sendVerificationEmail(email, verificationLink, displayName);
-    
+
     if (!emailSent) {
       console.warn('⚠️ Email sending failed, but user created');
       // Opcionális: törölheted a usert, ha az email küldés sikertelen
       // await admin.auth().deleteUser(userRecord.uid);
       // return res.status(500).json({ success: false, message: "Email küldése sikertelen" });
     }
-    
+
     // 4. Firestore dokumentum létrehozása
     await db.collection("users").doc(userRecord.uid).set({
       email,
@@ -458,35 +459,35 @@ app.post("/api/register-user", async (req, res) => {
         backupCodes: [],
       },
     });
-    
+
     console.log("✅ Firestore user document created");
     console.log("✅ Registration complete for:", email);
-    
-    res.json({ 
+
+    res.json({
       success: true,
       message: "Regisztráció sikeres! Elküldtük az email megerősítő linket.",
     });
-    
+
   } catch (error) {
     console.error("❌ Registration error:", error);
-    
+
     if (error.code === 'auth/email-already-exists') {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Ez az email cím már regisztrálva van" 
+      return res.status(400).json({
+        success: false,
+        message: "Ez az email cím már regisztrálva van"
       });
     }
-    
+
     if (error.code === 'auth/invalid-email') {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Érvénytelen email cím" 
+      return res.status(400).json({
+        success: false,
+        message: "Érvénytelen email cím"
       });
     }
-    
-    res.status(500).json({ 
-      success: false, 
-      message: error.message || "Regisztrációs hiba" 
+
+    res.status(500).json({
+      success: false,
+      message: error.message || "Regisztrációs hiba"
     });
   }
 });
@@ -496,28 +497,28 @@ app.post("/api/check-2fa-required", async (req, res) => {
     const { email } = req.body;
 
     if (!email) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Email cím szükséges" 
+      return res.status(400).json({
+        success: false,
+        message: "Email cím szükséges"
       });
     }
 
     const userRecord = await admin.auth().getUserByEmail(email);
     const twoFAData = await get2FAData(userRecord.uid);
-    
-    res.json({ 
+
+    res.json({
       success: true,
       requires2FA: twoFAData?.is2FAEnabled || false,
       userId: userRecord.uid,
     });
   } catch (error) {
     if (error.code === "auth/user-not-found") {
-      return res.json({ 
+      return res.json({
         success: true,
-        requires2FA: false 
+        requires2FA: false
       });
     }
-    
+
     console.error("Check 2FA required error:", error);
     res.status(500).json({ success: false, message: "Szerver hiba" });
   }
@@ -526,22 +527,22 @@ app.post("/api/check-2fa-required", async (req, res) => {
 app.post("/api/validate-password", async (req, res) => {
   try {
     const { email, password } = req.body;
-    
+
     if (!email || !password) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Email és jelszó szükséges" 
+      return res.status(400).json({
+        success: false,
+        message: "Email és jelszó szükséges"
       });
     }
 
     console.log("🔐 Validating password for:", email);
 
     const firebaseApiKey = process.env.FIREBASE_API_KEY;
-    
+
     if (!firebaseApiKey) {
       throw new Error("FIREBASE_API_KEY nincs beállítva a .env fájlban!");
     }
-    
+
     const response = await fetch(
       `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`,
       {
@@ -561,32 +562,32 @@ app.post("/api/validate-password", async (req, res) => {
 
     if (response.ok) {
       console.log("✅ Password is valid for:", email);
-      
+
       // Email verifikáció ellenőrzése
       const userRecord = await admin.auth().getUserByEmail(email);
       if (!userRecord.emailVerified) {
-        return res.status(401).json({ 
-          success: false, 
-          message: "Nincs megerősítve az email!" 
+        return res.status(401).json({
+          success: false,
+          message: "Nincs megerősítve az email!"
         });
       }
-      
-      res.json({ 
+
+      res.json({
         success: true,
         message: "Jelszó helyes"
       });
     } else {
       console.log("❌ Invalid password for:", email);
-      res.status(401).json({ 
-        success: false, 
+      res.status(401).json({
+        success: false,
         message: "Hibás email/jelszó páros"
       });
     }
   } catch (error) {
     console.error("❌ Password validation error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Szerver hiba" 
+    res.status(500).json({
+      success: false,
+      message: "Szerver hiba"
     });
   }
 });
@@ -595,31 +596,31 @@ app.post("/api/login-with-2fa", async (req, res) => {
   try {
     const { email, code } = req.body;
     console.log("🔐 2FA Login attempt:", email);
-    
+
     if (!email || !code) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Email és kód szükséges" 
+      return res.status(400).json({
+        success: false,
+        message: "Email és kód szükséges"
       });
     }
 
     const userRecord = await admin.auth().getUserByEmail(email);
     const userId = userRecord.uid;
-    
+
     // Email verifikáció ellenőrzése
     if (!userRecord.emailVerified) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Email nincs megerősítve!" 
+      return res.status(403).json({
+        success: false,
+        message: "Email nincs megerősítve!"
       });
     }
-    
+
     const twoFAData = await get2FAData(userId);
-    
+
     if (!twoFAData || !twoFAData.is2FAEnabled) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "2FA nincs engedélyezve" 
+      return res.status(400).json({
+        success: false,
+        message: "2FA nincs engedélyezve"
       });
     }
 
@@ -642,27 +643,27 @@ app.post("/api/login-with-2fa", async (req, res) => {
 
     if (isValid) {
       const customToken = await admin.auth().createCustomToken(userId);
-      
-      res.json({ 
+
+      res.json({
         success: true,
         message: "Sikeres 2FA validáció",
         customToken: customToken,
         remainingBackupCodes: twoFAData.backupCodes?.length || 0,
       });
     } else {
-      res.status(400).json({ 
-        success: false, 
-        message: "Érvénytelen kód" 
+      res.status(400).json({
+        success: false,
+        message: "Érvénytelen kód"
       });
     }
   } catch (error) {
     if (error.code === "auth/user-not-found") {
-      return res.status(404).json({ 
-        success: false, 
-        message: "Felhasználó nem található" 
+      return res.status(404).json({
+        success: false,
+        message: "Felhasználó nem található"
       });
     }
-    
+
     console.error("Login 2FA error:", error);
     res.status(500).json({ success: false, message: "Szerver hiba" });
   }
@@ -671,11 +672,11 @@ app.post("/api/login-with-2fa", async (req, res) => {
 app.post("/api/create-user", async (req, res) => {
   try {
     const { uid, email, name, displayName } = req.body;
-    
+
     if (!uid || !email) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "UID és email szükséges" 
+      return res.status(400).json({
+        success: false,
+        message: "UID és email szükséges"
       });
     }
 
@@ -691,9 +692,9 @@ app.post("/api/create-user", async (req, res) => {
       },
     });
 
-    res.json({ 
+    res.json({
       success: true,
-      message: "User dokumentum létrehozva" 
+      message: "User dokumentum létrehozva"
     });
   } catch (error) {
     console.error("Create user error:", error);
@@ -710,19 +711,19 @@ app.get("/api/get-user/:uid", async (req, res) => {
     const token = req.headers.authorization?.split("Bearer ")[1];
 
     if (!token) {
-      return res.status(401).json({ 
-        success: false, 
-        message: "Token hiányzik" 
+      return res.status(401).json({
+        success: false,
+        message: "Token hiányzik"
       });
     }
 
     // Token verifikálás
     const decodedToken = await admin.auth().verifyIdToken(token);
-    
+
     if (decodedToken.uid !== uid) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Hozzáférés megtagadva" 
+      return res.status(403).json({
+        success: false,
+        message: "Hozzáférés megtagadva"
       });
     }
 
@@ -732,7 +733,7 @@ app.get("/api/get-user/:uid", async (req, res) => {
     // 🔥 HA NEM LÉTEZIK, HOZZUK LÉTRE
     if (!userDoc.exists) {
       console.log("⚠️ User document not found, creating it now for:", uid);
-      
+
       const userRecord = await admin.auth().getUser(uid);
       const isGoogleProvider = userRecord.providerData.some(
         p => p.providerId === 'google.com'
@@ -756,22 +757,22 @@ app.get("/api/get-user/:uid", async (req, res) => {
 
       // Frissen létrehozott dokumentum visszaadása
       const newUserDoc = await userDocRef.get();
-      return res.json({ 
-        success: true, 
-        user: newUserDoc.data() 
+      return res.json({
+        success: true,
+        user: newUserDoc.data()
       });
     }
 
-    res.json({ 
-      success: true, 
-      user: userDoc.data() 
+    res.json({
+      success: true,
+      user: userDoc.data()
     });
 
   } catch (error) {
     console.error("Error in get-user:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Szerver hiba" 
+    res.status(500).json({
+      success: false,
+      message: "Szerver hiba"
     });
   }
 });
@@ -779,10 +780,10 @@ app.get("/api/get-user/:uid", async (req, res) => {
 app.get("/api/check-2fa-status", verifyFirebaseToken, async (req, res) => {
   try {
     const twoFAData = await get2FAData(req.userId);
-    
-    res.json({ 
+
+    res.json({
       success: true,
-      is2FAEnabled: twoFAData?.is2FAEnabled || false 
+      is2FAEnabled: twoFAData?.is2FAEnabled || false
     });
   } catch (error) {
     console.error("Check 2FA status error:", error);
@@ -808,13 +809,13 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
       backupCodes = existing2FA.backupCodes;
     } else {
       console.log('🆕 Generating new secret with Speakeasy');
-      
+
       const secretObj = speakeasy.generateSecret({
         name: `LudusGen (${userEmail})`,
         issuer: 'LudusGen',
         length: 32
       });
-      
+
       secret = secretObj.base32;
       backupCodes = generateBackupCodes();
 
@@ -911,7 +912,7 @@ app.post("/api/verify-mfa", verifyFirebaseToken, async (req, res) => {
         encoding: 'base32'
       });
       console.log('❓ Current valid token would be:', currentToken);
-      
+
       return res.status(400).json({
         success: false,
         message: "Érvénytelen kód. Próbáld újra!",
@@ -947,13 +948,13 @@ app.post("/api/disable-2fa", verifyFirebaseToken, async (req, res) => {
   try {
     const userId = req.userId;
     const { code } = req.body;
-    
+
     const twoFAData = await get2FAData(userId);
 
     if (!twoFAData || !twoFAData.is2FAEnabled) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "2FA nincs engedélyezve" 
+      return res.status(400).json({
+        success: false,
+        message: "2FA nincs engedélyezve"
       });
     }
 
@@ -970,17 +971,17 @@ app.post("/api/disable-2fa", verifyFirebaseToken, async (req, res) => {
         is2FAEnabled: false,
         backupCodes: [],
       });
-      
+
       console.log('🔓 2FA disabled for user:', userId);
-      
-      res.json({ 
+
+      res.json({
         success: true,
         message: "2FA kikapcsolva"
       });
     } else {
-      res.status(400).json({ 
-        success: false, 
-        message: "Érvénytelen kód" 
+      res.status(400).json({
+        success: false,
+        message: "Érvénytelen kód"
       });
     }
   } catch (error) {
@@ -992,26 +993,26 @@ app.post("/api/disable-2fa", verifyFirebaseToken, async (req, res) => {
 app.get("/api/get-user/:userId", verifyFirebaseToken, async (req, res) => {
   try {
     const { userId } = req.params;
-    
+
     if (userId !== req.userId) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "Nincs jogosultságod ehhez az adathoz" 
+      return res.status(403).json({
+        success: false,
+        message: "Nincs jogosultságod ehhez az adathoz"
       });
     }
 
     const userDoc = await db.collection("users").doc(userId).get();
-    
+
     if (!userDoc.exists) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "User nem található" 
+      return res.status(404).json({
+        success: false,
+        message: "User nem található"
       });
     }
 
     const userData = userDoc.data();
 
-    res.json({ 
+    res.json({
       success: true,
       user: {
         ...userData,
@@ -1033,29 +1034,29 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     console.log('📥 Received data:', { name, displayName, bio });
 
     if (displayName !== undefined && (!displayName || displayName.trim().length < 1)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "A név legalább 2 karakter hosszú legyen" 
+      return res.status(400).json({
+        success: false,
+        message: "A név legalább 2 karakter hosszú legyen"
       });
     }
 
     const updateData = {};
-    
+
     if (name !== undefined) updateData.name = name.trim();
     if (displayName !== undefined) updateData.displayName = displayName.trim();
     if (bio !== undefined) updateData.bio = bio.trim();
 
     if (Object.keys(updateData).length === 0) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Nincs frissítendő adat" 
+      return res.status(400).json({
+        success: false,
+        message: "Nincs frissítendő adat"
       });
     }
 
     updateData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-    
+
     console.log('💾 Saving to Firestore:', updateData);
-    
+
     await db.collection("users").doc(userId).set(
       updateData,
       { merge: true }
@@ -1068,7 +1069,7 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
 
     console.log('📤 Sending back updated user data');
 
-    res.json({ 
+    res.json({
       success: true,
       message: "Profil sikeresen frissítve",
       user: {
@@ -1078,9 +1079,9 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Update profile error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Szerver hiba" 
+    res.status(500).json({
+      success: false,
+      message: "Szerver hiba"
     });
   }
 });
@@ -1090,11 +1091,11 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
 app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('profilePicture'), async (req, res) => {
   try {
     const userId = req.userId;
-    
+
     if (!req.file) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Nincs feltöltött fájl" 
+      return res.status(400).json({
+        success: false,
+        message: "Nincs feltöltött fájl"
       });
     }
 
@@ -1109,7 +1110,7 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
     const userDoc = await db.collection("users").doc(userId).get();
     const oldProfilePicture = userDoc.data()?.profilePicture;
     const oldPublicId = userDoc.data()?.profilePicturePublicId;
-    
+
     // Upload to Cloudinary
     const uploadPromise = new Promise((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
@@ -1126,7 +1127,7 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
           else resolve(result);
         }
       );
-      
+
       uploadStream.end(req.file.buffer);
     });
 
@@ -1156,16 +1157,16 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 
     console.log('✅ Profile picture uploaded successfully');
 
-    res.json({ 
+    res.json({
       success: true,
       message: "Profilkép sikeresen feltöltve",
       profilePictureUrl: cloudinaryResult.secure_url
     });
   } catch (error) {
     console.error("❌ Upload profile picture error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: error.message || "Szerver hiba" 
+    res.status(500).json({
+      success: false,
+      message: error.message || "Szerver hiba"
     });
   }
 });
@@ -1174,7 +1175,7 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 // app.post("/api/validate-google-token", async (req, res) => {
 //   try {
 //     const { googleToken, email } = req.body;
-    
+
 //     if (!googleToken || !email) {
 //       return res.status(400).json({ 
 //         success: false, 
@@ -1186,7 +1187,7 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 
 //     // Google token verifikálása
 //     const decodedToken = await admin.auth().verifyIdToken(googleToken);
-    
+
 //     if (decodedToken.email !== email) {
 //       return res.status(401).json({ 
 //         success: false, 
@@ -1202,7 +1203,7 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 //         message: "Email mismatch" 
 //       });
 //     }
-    
+
 //     if (!userRecord.emailVerified) {
 //       return res.status(401).json({ 
 //         success: false, 
@@ -1234,10 +1235,10 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 //     } else {
 //       console.log("✅ Google user document already exists for:", email);
 //     }
-    
+
 //     // ✅ TÁROLJUK A SESSION-T 2FA-hoz (mint az emailes verzióban)
 //     const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
+
 //     // In-memory tárolás (production-ben használj Redis-t!)
 //     pendingAuth.set(sessionId, {
 //       email,
@@ -1246,13 +1247,13 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 //       timestamp: Date.now(),
 //       provider: 'google'
 //     });
-    
+
 //     res.json({ 
 //       success: true,
 //       message: "Google token helyes",
 //       sessionId  // ← Ezt add vissza a frontend-nek
 //     });
-    
+
 //   } catch (error) {
 //     console.error("❌ Google token validation error:", error);
 //     res.status(500).json({ 
@@ -1269,7 +1270,7 @@ const pendingAuth = new Map();
 setInterval(() => {
   const now = Date.now();
   const fiveMinutes = 5 * 60 * 1000;
-  
+
   for (const [sessionId, sessionData] of pendingAuth.entries()) {
     if (now - sessionData.timestamp > fiveMinutes) {
       pendingAuth.delete(sessionId);
@@ -1282,39 +1283,39 @@ setInterval(() => {
 app.post("/api/login-with-2fa-google", async (req, res) => {
   try {
     const { sessionId, code } = req.body;
-    
+
     console.log("🔐 Google 2FA Login attempt with sessionId:", sessionId);
-    
+
     if (!sessionId || !code) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "SessionId és kód szükséges" 
+      return res.status(400).json({
+        success: false,
+        message: "SessionId és kód szükséges"
       });
     }
 
     const session = pendingAuth.get(sessionId);
-    
+
     if (!session) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Lejárt vagy érvénytelen session" 
+      return res.status(400).json({
+        success: false,
+        message: "Lejárt vagy érvénytelen session"
       });
     }
 
     if (session.provider !== 'google') {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Ez a session nem Google bejelentkezéshez tartozik" 
+      return res.status(400).json({
+        success: false,
+        message: "Ez a session nem Google bejelentkezéshez tartozik"
       });
     }
 
     const userId = session.uid;
     const twoFAData = await get2FAData(userId);
-    
+
     if (!twoFAData || !twoFAData.is2FAEnabled) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "2FA nincs engedélyezve" 
+      return res.status(400).json({
+        success: false,
+        message: "2FA nincs engedélyezve"
       });
     }
 
@@ -1338,24 +1339,24 @@ app.post("/api/login-with-2fa-google", async (req, res) => {
     if (isValid) {
       const customToken = await admin.auth().createCustomToken(userId);
       pendingAuth.delete(sessionId);
-      
-      res.json({ 
+
+      res.json({
         success: true,
         message: "Sikeres 2FA validáció",
         customToken: customToken,
         remainingBackupCodes: twoFAData.backupCodes?.length || 0,
       });
     } else {
-      res.status(400).json({ 
-        success: false, 
-        message: "Érvénytelen kód" 
+      res.status(400).json({
+        success: false,
+        message: "Érvénytelen kód"
       });
     }
   } catch (error) {
     console.error("❌ Google 2FA login error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Szerver hiba" 
+    res.status(500).json({
+      success: false,
+      message: "Szerver hiba"
     });
   }
 });
@@ -1364,11 +1365,11 @@ app.post("/api/login-with-2fa-google", async (req, res) => {
 app.post("/api/validate-google-session", async (req, res) => {
   try {
     const { firebaseIdToken, email } = req.body;
-    
+
     if (!firebaseIdToken || !email) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Firebase token és email szükséges" 
+      return res.status(400).json({
+        success: false,
+        message: "Firebase token és email szükséges"
       });
     }
 
@@ -1376,20 +1377,20 @@ app.post("/api/validate-google-session", async (req, res) => {
 
     // ✅ Firebase ID token verifikálása (ez most működni fog!)
     const decodedToken = await admin.auth().verifyIdToken(firebaseIdToken);
-    
+
     if (decodedToken.email !== email) {
-      return res.status(401).json({ 
-        success: false, 
-        message: "Email nem egyezik" 
+      return res.status(401).json({
+        success: false,
+        message: "Email nem egyezik"
       });
     }
 
     const userRecord = await admin.auth().getUser(decodedToken.uid);
-    
+
     if (!userRecord.emailVerified) {
-      return res.status(401).json({ 
-        success: false, 
-        message: "Nincs megerősítve az email!" 
+      return res.status(401).json({
+        success: false,
+        message: "Nincs megerősítve az email!"
       });
     }
 
@@ -1397,11 +1398,11 @@ app.post("/api/validate-google-session", async (req, res) => {
 
     // 🔥 FIRESTORE DOKUMENTUM LÉTREHOZÁSA (ha még nincs)
     const userDocRef = admin.firestore().collection("users").doc(decodedToken.uid);
-    
+
     // Transaction használata race condition ellen
     await admin.firestore().runTransaction(async (transaction) => {
       const doc = await transaction.get(userDocRef);
-      
+
       if (!doc.exists) {
         const isGoogleProvider = userRecord.providerData.some(
           p => p.providerId === 'google.com'
@@ -1420,36 +1421,36 @@ app.post("/api/validate-google-session", async (req, res) => {
             backupCodes: []
           }
         });
-        
+
         console.log("✅ Google user document created in Firestore for:", email);
       } else {
         console.log("✅ Google user document already exists for:", email);
       }
     });
-    
+
     // ✅ SESSION TÁROLÁS 2FA-hoz
     const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
+
     pendingAuth.set(sessionId, {
       email,
       uid: decodedToken.uid,
       timestamp: Date.now(),
       provider: 'google'
     });
-    
+
     console.log("✅ Session created:", sessionId);
-    
-    res.json({ 
+
+    res.json({
       success: true,
       message: "Session létrehozva",
       sessionId
     });
-    
+
   } catch (error) {
     console.error("❌ Google session validation error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Token érvénytelen" 
+    res.status(500).json({
+      success: false,
+      message: "Token érvénytelen"
     });
   }
 });
@@ -1493,9 +1494,9 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
     const publicId = userDoc.data()?.profilePicturePublicId;
 
     if (!profilePicture) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Nincs profilkép a törléshez" 
+      return res.status(400).json({
+        success: false,
+        message: "Nincs profilkép a törléshez"
       });
     }
 
@@ -1521,15 +1522,15 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
 
     console.log('✅ Profile picture deleted successfully');
 
-    res.json({ 
+    res.json({
       success: true,
       message: "Profilkép sikeresen törölve"
     });
   } catch (error) {
     console.error("❌ Delete profile picture error:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Szerver hiba" 
+    res.status(500).json({
+      success: false,
+      message: "Szerver hiba"
     });
   }
 });

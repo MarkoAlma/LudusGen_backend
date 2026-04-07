@@ -258,6 +258,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
             return res.json({ success: true, content, usage });
         }
+        
 
         // ── Cerebras ─────────────────────────────────────
         else if (provider === 'cerebras') {
@@ -831,15 +832,19 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 });
 
 router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
-        try {
+    try {
         const {
-            model, provider, messages,
+            model,
+            provider,
+            messages,
             temperature = 0.7,
             max_tokens = 2048,
             top_p = 0.9,
             frequency_penalty = 0,
             presence_penalty = 0,
         } = req.body;
+        console.log(messages);
+        
 
         if (!model || !provider) {
             return res.status(400).json({ success: false, message: 'Hiányzó model / provider' });
@@ -850,75 +855,185 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
         if (messages.length > 50) {
             return res.status(400).json({ success: false, message: 'Max 50 üzenet per kérés' });
         }
-            let safeMax = Math.min(Math.max(128, max_tokens), 8192*32);
-            let content = '';
-            let usage = {};
+        if (!process.env.GROQ_API_KEY) {
+            return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
+        }
 
-    if (!process.env.CEREBRAS_API_KEY) {
-        return res.status(500).json({ success: false, message: 'CEREBRAS_API_KEY nincs beállítva' });
-    }
+        const safeMax = Math.min(Math.max(128, max_tokens), 1024);
 
-    const chatMsgs = normalizeMessages(messages);
+        const chatMsgs = normalizeMessages(messages);
 
-    let resp;
-    try {
-        resp = await axios.post(
-            'https://api.cerebras.ai/v1/chat/completions',
-            {
-                model,
-                messages: chatMsgs,
-                temperature: Math.min(Math.max(0, temperature), 1.5),
-                max_tokens:  safeMax,
-                top_p:       Math.min(Math.max(0, top_p), 1),
-                presence_penalty:  Math.min(Math.max(-2, presence_penalty), 2),
-                stream:      false,   // ← nem streamelünk
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${process.env.CEREBRAS_API_KEY}`,
-                    'Content-Type':  'application/json',
+
+        let resp;
+        try {
+            resp = await axios.post(
+                'https://api.groq.com/openai/v1/chat/completions',
+                {
+                    model,
+                    messages: chatMsgs,
+                    temperature:       Math.min(Math.max(0, temperature), 2),
+                    max_tokens:        safeMax,
+                    top_p:             Math.min(Math.max(0, top_p), 1),
+                    frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
+                    presence_penalty:  Math.min(Math.max(-2, presence_penalty), 2),
+                    stream: false,
                 },
-                timeout: 60000,
-            }
-        );
-    } catch (err) {
-        const msg = err.response?.data?.message || err.message || 'Cerebras API hiba';
-        console.error('Cerebras hiba:', msg);
-        return res.status(500).json({ success: false, message: msg });
-    }
-
-const choice0 = resp.data?.choices?.[0];
-content = choice0?.message?.content ?? '';
-
-if (!content) {
-    console.warn("⚠️ Cerebras empty content");
-    console.warn("finish_reason:", choice0?.finish_reason);
-    console.warn("Full resp (trim):",
-        JSON.stringify(resp.data).slice(0, 2000)
-    );
-}
-
-usage = {
-    input_tokens:  resp.data?.usage?.prompt_tokens     || 0,
-    output_tokens: resp.data?.usage?.completion_tokens || 0,
-    total_tokens:  resp.data?.usage?.total_tokens      || 0,
-};
-
-    await logUsage(req.userId, 'chat', { model, provider: 'cerebras', tokens: usage.total_tokens });
-    return res.json({ success: true, content, usage });
-
+                {
+                    headers: {
+                        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                        'Content-Type':  'application/json',
+                    },
+                    timeout: 60000,
+                }
+            );
         } catch (err) {
-        console.error('❌ Chat error:', err);
+            const msg = err.response?.data?.error?.message || err.message || 'Groq API hiba';
+            console.error('❌ Groq API hiba:', msg);
+            return res.status(err.response?.status || 500).json({ success: false, message: msg });
+        }
+
+        const choice0 = resp.data?.choices?.[0];
+        const content = choice0?.message?.content ?? '';
+
+        if (!content) {
+            console.warn('⚠️ Groq üres válasz');
+            console.warn('finish_reason:', choice0?.finish_reason);
+            console.warn('Full resp:', JSON.stringify(resp.data).slice(0, 2000));
+        }
+
+        const usage = {
+            input_tokens:  resp.data?.usage?.prompt_tokens     || 0,
+            output_tokens: resp.data?.usage?.completion_tokens || 0,
+            total_tokens:  resp.data?.usage?.total_tokens      || 0,
+        };
+
+        await logUsage(req.userId, 'chat', { model, provider: 'groq', tokens: usage.total_tokens });
+
+        return res.json({ success: true, content, usage });
+
+    } catch (err) {
+        console.error('❌ Enhance error:', err);
         if (!res.headersSent) {
             return res.status(500).json({
                 success: false,
                 message: err?.status === 429
-                    ? 'API rate limit — próbáld újra pár perc múlva'
-                    : err?.message || 'Chat hiba',
+                    ? 'Groq rate limit — próbáld újra pár perc múlva'
+                    : err?.message || 'Enhance hiba',
             });
         }
     }
 });
+
+router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { images, systemPrompt } = req.body;
+
+    if (!Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({ success: false, message: 'Nincs kép megadva' });
+    }
+    if (images.length > 3) {
+      return res.status(400).json({ success: false, message: 'Max 3 kép engedélyezett' });
+    }
+
+    if (!process.env.NVIDIA_API_KEY) {
+      return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva a szerveren' });
+    }
+
+    // ── Üzenet felépítése: rendszerprompt + képek ──────────────────────────
+    // A Gemma 3 27B IT NVIDIA API-n keresztül OpenAI-kompatibilis formátumot
+    // vár: a képeket image_url típusú content block-ként kell átadni.
+    const userContentBlocks = [
+      {
+        type: 'text',
+        text: systemPrompt || 'Describe the uploaded image(s) in detail.',
+      },
+      ...images.map((dataUrl, idx) => ({
+        type: 'image_url',
+        image_url: {
+          url: dataUrl, // base64 data URL: "data:image/jpeg;base64,..."
+        },
+      })),
+    ];
+
+    let resp;
+    try {
+      resp = await axios.post(
+        'https://integrate.api.nvidia.com/v1/chat/completions',
+        {
+          model:       'google/gemma-3-27b-it',
+          messages: [
+            {
+              role:    'user',
+              content: userContentBlocks,
+            },
+          ],
+          max_tokens:  1500,
+          temperature: 0.2,
+          top_p:       0.7,
+          stream:      false,
+        },
+        {
+          headers: {
+            Authorization:  `Bearer ${process.env.NVIDIA_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 90000, // vision modellek lassabbak
+        }
+      );
+    } catch (err) {
+      const msg = err.response?.data?.message || err.response?.data?.detail || err.message || 'NVIDIA API hiba';
+      console.error('Vision describe NVIDIA hiba:', msg);
+      return res.status(502).json({ success: false, message: `NVIDIA API hiba: ${msg}` });
+    }
+
+    const description = resp.data?.choices?.[0]?.message?.content?.trim() || '';
+
+    if (!description) {
+      console.warn('Vision describe: Gemma üres választ adott');
+      console.warn('finish_reason:', resp.data?.choices?.[0]?.finish_reason);
+      return res.status(500).json({ success: false, message: 'Gemma üres választ adott vissza' });
+    }
+
+    await logUsage(req.userId, 'vision-describe', {
+      model:    'google/gemma-3-27b-it',
+      provider: 'nvidia',
+      tokens:   resp.data?.usage?.total_tokens || 0,
+      images:   images.length,
+    });
+
+    return res.json({ success: true, description });
+
+  } catch (err) {
+    console.error('❌ Vision describe error:', err);
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        message: err?.message || 'Vision describe hiba',
+      });
+    }
+  }
+});
+
+// ── Kontext preferált felbontások ────────────────────────
+const KONTEXT_PREFERRED_RESOLUTIONS = [
+  [672,1568],[688,1504],[720,1456],[752,1392],[800,1328],
+  [832,1248],[880,1184],[944,1104],[1024,1024],[1104,944],
+  [1184,880],[1248,832],[1328,800],[1392,752],[1456,720],
+  [1504,688],[1568,672],
+];
+
+function snapToKontextResolution(origW, origH) {
+  const origAR = origW / origH;
+  let best = KONTEXT_PREFERRED_RESOLUTIONS[0];
+  let bestDiff = Infinity;
+  for (const [w, h] of KONTEXT_PREFERRED_RESOLUTIONS) {
+    const diff = Math.abs(w / h - origAR);
+    if (diff < bestDiff) { bestDiff = diff; best = [w, h]; }
+  }
+  return { w: best[0], h: best[1] };
+}
+
+
 // ════════════════════════════════════════════════════
 // 2.  KÉPGENERÁLÁS  —  POST /api/generate-image
 // ════════════════════════════════════════════════════
@@ -1004,21 +1119,23 @@ else if (provider === 'modelscope') {
         'Content-Type': 'application/json',
     };
 
+    const isQwenEditModel = apiId.includes('Qwen');
+    const isKontextModel  = apiId.includes('Kontext') || apiId.includes('FLUX.1-Kontext');
+
     // ── input_image (single) vagy input_images (array) támogatás ─
-    // Frontend küldhet egyet (input_image) vagy többet (input_images tömb)
     const rawInputImages = req.body.input_images
-        ? req.body.input_images                          // tömb
+        ? req.body.input_images
         : input_image
-            ? [input_image]                              // single → tömbbé alakítjuk
+            ? [input_image]
             : [];
 
     const isEditModel = rawInputImages.length > 0;
 
-    let imageUrlsForApi  = [];   // signed URL-ek tömbje az API-nak
-    let tempB2Keys       = [];   // cleanup-hoz
+    let imageUrlsForApi  = [];
+    let tempB2Keys       = [];
     let originalWidth    = null;
-    let originalHeight   = null; // az első kép méretét visszuk vissza
-
+    let originalHeight   = null;
+    let resizeMultiplier = 1;
     if (isEditModel) {
         try {
             for (let idx = 0; idx < rawInputImages.length; idx++) {
@@ -1029,27 +1146,41 @@ else if (provider === 'modelscope') {
 
                 const meta = await sharp(inputBuffer).metadata();
 
-                // Csak az első kép méretét mentjük (ez lesz az output méret)
                 if (idx === 0) {
                     originalWidth  = meta.width;
                     originalHeight = meta.height;
                 }
 
-                const TARGET_PIXELS = 1_000_000;
-                const currentPixels = meta.width * meta.height;
-                const scaleFactor   = Math.sqrt(TARGET_PIXELS / currentPixels);
+                let processedBuffer;
 
-                let newW = Math.round(meta.width  * scaleFactor);
-                let newH = Math.round(meta.height * scaleFactor);
-                newW = Math.round(newW / 16) * 16;
-                newH = Math.round(newH / 16) * 16;
+                if (isQwenEditModel) {
+                    const TARGET_PIXELS = 1_000_000;
+                    const scaleFactor = Math.sqrt(TARGET_PIXELS / (meta.width * meta.height));
+                    let newW = Math.round(meta.width  * scaleFactor / 16) * 16;
+                    let newH = Math.round(meta.height * scaleFactor / 16) * 16;
+                    console.log(`📐 Qwen resize: ${meta.width}x${meta.height} → ${newW}x${newH}`);
+                    const areaScale = (meta.width * meta.height) / (newW * newH);
+                    resizeMultiplier = Math.min(1.5, 0.4 + Math.log2(areaScale) * 0.4);
+                    processedBuffer = await sharp(inputBuffer)
+                        .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
+                        .png().toBuffer();
 
-                console.log(`📐 Kép #${idx + 1}: ${meta.width}x${meta.height} → ${newW}x${newH}`);
+                } else if (isKontextModel) {
+                    // Kontext-specifikus: legközelebbi preferált felbontás
+                    const { w: newW, h: newH } = snapToKontextResolution(meta.width, meta.height);
+                    console.log(`📐 Kontext resize: ${meta.width}x${meta.height} → ${newW}x${newH}`);
+                    const areaScale =
+                        (meta.width * meta.height) /
+                        (newW * newH);
+                    resizeMultiplier = Math.min(1.5, 0.4 + Math.log2(areaScale) * 0.4);
+                    processedBuffer = await sharp(inputBuffer)
+                        .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
+                        .png().toBuffer();
 
-                const resized = await sharp(inputBuffer)
-                    .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
-                    .png()
-                    .toBuffer();
+                } else {
+                    // más edit modell: nincs resize, csak png konverzió
+                    processedBuffer = await sharp(inputBuffer).png().toBuffer();
+                }
 
                 const filename = `edit_${Date.now()}_${idx}_${req.userId.slice(0, 8)}.png`;
                 const tempKey  = `temp_edit/${filename}`;
@@ -1058,7 +1189,7 @@ else if (provider === 'modelscope') {
                 await b2.send(new PutObjectCommand({
                     Bucket: process.env.B2_BUCKET_NAME,
                     Key: tempKey,
-                    Body: resized,
+                    Body: processedBuffer,
                     ContentType: 'image/png',
                 }));
 
@@ -1086,21 +1217,26 @@ else if (provider === 'modelscope') {
         ? {
               model:     apiId,
               prompt:    prompt.trim(),
+              steps: Math.min(Math.max(1, num_inference_steps), 50),
+              guidance: Math.min(Math.max(1, guidance_scale), 20),
               negative_prompt: negative_prompt ? negative_prompt.trim() : undefined,
               seed:      seed ? parseInt(seed) : undefined,
               prompt_extend,
-              image_url: imageUrlsForApi,   // API mindig tömböt vár
+              image_url: imageUrlsForApi,
           }
         : {
               model:  apiId,
               prompt: prompt.trim(),
+              steps: Math.min(Math.max(1, num_inference_steps), 50),
+              guidance: Math.min(Math.max(1, guidance_scale), 20),
               ...(negative_prompt ? { negative_prompt: negative_prompt.trim() } : {}),
               ...(seed ? { seed: parseInt(seed) } : {}),
               size: `${image_size.width || 1024}x${image_size.height || 1024}`,
           };
+          console.log(msBody)
 
     console.log(imageUrlsForApi);
-    
+
     console.log(
         'ModelScope body:',
         JSON.stringify({ ...msBody, image_url: msBody.image_url ? `[${msBody.image_url.length} URL]` : undefined })
@@ -1167,41 +1303,54 @@ else if (provider === 'modelscope') {
         }
     };
 
-    // ── Utófeldolgozás: fetch + visszaméretezés → base64 ─────────────────────
+    // ── Utófeldolgozás: fetch + visszaméretezés → base64 (csak Qwen) ──────────
 
-    const postProcess = async (url) => {
-        if (!isEditModel || !originalWidth || !originalHeight) return { url, base64: null };
+const postProcess = async (url, resizeMultiplier) => {
+    if (!isEditModel) {
+        return { url, base64: null };
+    }
 
-        try {
-            const response        = await fetch(url);
-            const generatedBuffer = Buffer.from(await response.arrayBuffer());
+    try {
+        const response        = await fetch(url);
+        const generatedBuffer = Buffer.from(await response.arrayBuffer());
 
-            const genMeta = await sharp(generatedBuffer).metadata();
-            console.log(`📥 Kapott kép: ${genMeta.width}x${genMeta.height}`);
+        const genMeta = await sharp(generatedBuffer).metadata();
+        console.log(`📥 Kapott kép: ${genMeta.width}x${genMeta.height}`);
+        console.log(resizeMultiplier);
+        
+        const restored = await sharp(generatedBuffer)
+            .resize(originalWidth, originalHeight, {
+                fit:    'fill',
+                kernel: 'lanczos3',
+            })
+            .sharpen({
+                sigma:  resizeMultiplier,
+                m1:     0.5,
+                m2:     3.0,
+                x1:     2.0,
+                y2:     15.0,
+                y3:     15.0,
+            })
+            .modulate({ brightness: 1.015 })
+            .png({ compressionLevel: 0 })
+            .toBuffer();
 
-            const restored = await sharp(generatedBuffer)
-                .resize(originalWidth, originalHeight, {
-                    fit:    'fill',
-                    kernel: 'lanczos3',
-                })
-                .png({ compressionLevel: 0 })
-                .toBuffer();
+        const base64 = `data:image/png;base64,${restored.toString('base64')}`;
+        console.log(`✅ Visszaméretezve: ${originalWidth}x${originalHeight}`);
+        return { url: null, base64 };
 
-            const base64 = `data:image/png;base64,${restored.toString('base64')}`;
-            console.log(`✅ Visszaméretezve: ${originalWidth}x${originalHeight}`);
-            return { url: null, base64 };
-
-        } catch (err) {
-            console.error('Post-process hiba:', err.message);
-            return { url, base64: null };
-        }
-    };
-
+    } catch (err) {
+        console.error('Post-process hiba:', err.message);
+        return { url, base64: null };
+    }
+};
     // ── Szinkron eredmény ─────────────────────────────────────────────────────
 
     if (immediateUrl) {
         await cleanupB2();
-        const { url: finalUrl, base64 } = await postProcess(immediateUrl);
+        console.log("Ez fut le (szinkron)");
+        
+        const { url: finalUrl, base64 } = await postProcess(immediateUrl, resizeMultiplier);
         await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
         return res.json({
             success: true,
@@ -1217,7 +1366,7 @@ else if (provider === 'modelscope') {
 
     let imageUrl = null;
 
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 150; i++) {
         await new Promise((r) => setTimeout(r, i === 0 ? 2000 : 3000));
 
         let pollData;
@@ -1265,13 +1414,12 @@ else if (provider === 'modelscope') {
         // PENDING / PROCESSING → folytatjuk
     }
 
-    await cleanupB2();
-
     if (!imageUrl) {
         return res.status(504).json({ success: false, message: 'ModelScope időtúllépés (>150s)' });
     }
 
-    const { url: finalUrl, base64 } = await postProcess(imageUrl);
+    const { url: finalUrl, base64 } = await postProcess(imageUrl, resizeMultiplier);
+    await cleanupB2();
 
     await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
     return res.json({
