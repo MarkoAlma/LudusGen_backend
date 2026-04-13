@@ -43,26 +43,10 @@ import {
   testWebhook,
 } from "../controllers/webhookController.js";
 
-import {
-  uploadAsset,
-} from "../controllers/assetController.js";
-
 /* ─── Middleware ──────────────────────────────────────────────────────── */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: 20 * 1024 * 1024 },
-});
-
-/** Asset upload multer — larger files (GLB/FBX/OBJ, max 50MB) */
-const assetUpload = multer({
-  storage: multer.memoryStorage(),
-  limits:  { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const ext = file.originalname.split(".").pop()?.toLowerCase();
-    const allowed = new Set(["glb", "fbx", "obj"]);
-    if (allowed.has(ext)) cb(null, true);
-    else cb(new Error(`Unsupported file type: ${ext}. Allowed: glb, fbx, obj`));
-  },
 });
 
 /** Generation rate limiter — 30 req/min per user */
@@ -98,9 +82,6 @@ export function createTripoRouter(verifyAuth) {
 
   /** Upload image → image_token */
   router.post("/tripo/upload", verifyAuth, upload.single("file"), uploadFile);
-
-  /** Upload 3D asset (GLB/FBX/OBJ) → import_model task */
-  router.post("/tripo/assets/upload", verifyAuth, assetUpload.single("file"), uploadAsset);
 
   /** Create any Tripo task */
   router.post("/tripo/task", verifyAuth, genLimiter, createTask);

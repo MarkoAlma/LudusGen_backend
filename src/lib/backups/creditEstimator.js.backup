@@ -24,7 +24,7 @@ export function estimateCost(req) {
 
   // Textúra addonok
   const hasTex  = req.texture || req.pbr;
-  const isHD    = req.texture_quality === "detailed";
+  const isHD    = req.texture_quality === "HD";
   let texAddon  = 0;
   if (hasTex) {
     const std  = CREDIT_COSTS["addon:texture_standard"]   ?? 10;

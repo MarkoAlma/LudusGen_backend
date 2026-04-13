@@ -183,7 +183,7 @@ export const MAX_RECENT_ERRORS        = 50;
 
 export const MODEL_CAPABILITIES = {
   "P1-20260311": {
-    ultraMesh:    true,  texture:   true,  pbr:        true,  tex4K:       false,
+    ultraMesh:    false, texture:   true,  pbr:        true,  tex4K:       true,
     multiview:    true,  batch:     true,  tPose:      false, inParts:     false,
     negPrompt:    true,  smartLowPoly: false, quad:    false,
     autoSize:     true,  exportUv:  true,  makeBetter: true,

@@ -106,6 +106,12 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 fal.config({ credentials: process.env.FAL_KEY });
 
+const MESHY_KEY = process.env.MESHY_API_KEY || process.env.TRIPO3D_API_KEY || process.env.TRIPO3D;
+const meshy = axios.create({
+    baseURL: 'https://api.meshy.ai',
+    headers: { Authorization: `Bearer ${MESHY_KEY}` },
+});
+
 // ── Firebase Auth middleware ──────────────────────────
 const verifyFirebaseToken = async (req, res, next) => {
     try {
@@ -121,6 +127,7 @@ const verifyFirebaseToken = async (req, res, next) => {
 
         req.userId = decoded.uid;
         req.userEmail = decoded.email;
+        req.user = { uid: decoded.uid, email: decoded.email };
         next();
     } catch {
         return res.status(401).json({ success: false, message: 'Érvénytelen token' });
@@ -213,23 +220,42 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 .filter((m) => m.role !== 'system')
                 .map((m) => ({ role: m.role, content: String(m.content) }));
 
-            const resp = await anthropic.messages.create({
-                model,
-                max_tokens: safeMax,
-                temperature: Math.min(Math.max(0, temperature), 1),
-                ...(systemMsg ? { system: systemMsg.content } : {}),
-                messages: chatMsgs,
-            });
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
 
-            content = resp.content?.[0]?.text || '';
-            usage = {
-                input_tokens: resp.usage?.input_tokens || 0,
-                output_tokens: resp.usage?.output_tokens || 0,
-                total_tokens: (resp.usage?.input_tokens || 0) + (resp.usage?.output_tokens || 0),
-            };
+            let fullContent = '';
+            try {
+                const stream = anthropic.messages.stream({
+                    model,
+                    max_tokens: safeMax,
+                    temperature: Math.min(Math.max(0, temperature), 1),
+                    ...(systemMsg ? { system: systemMsg.content } : {}),
+                    messages: chatMsgs,
+                });
 
-            await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
-            return res.json({ success: true, content, usage });
+                stream.on('text', (text) => {
+                    fullContent += text;
+                    res.write(`data: ${JSON.stringify({ delta: text })}\n\n`);
+                });
+
+                stream.on('end', async () => {
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                    await logUsage(req.userId, 'chat', { model, provider: 'anthropic', tokens: fullContent.length / 4 }); // Rough estimate
+                });
+
+                req.on('close', () => {
+                    stream.abort();
+                });
+            } catch (err) {
+                console.error('Anthropic stream error:', err);
+                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                res.end();
+            }
+            return;
         }
 
         // ── OpenAI ───────────────────────────────────────
@@ -238,25 +264,42 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'OPENAI_API_KEY nincs beállítva a .env-ben' });
             }
 
-            const resp = await openai.chat.completions.create({
-                model,
-                messages: normalizeMessages(messages),
-                temperature: Math.min(Math.max(0, temperature), 2),
-                max_tokens: safeMax,
-                top_p: Math.min(Math.max(0, top_p), 1),
-                frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
-                presence_penalty: Math.min(Math.max(-2, presence_penalty), 2),
-            });
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
 
-            content = resp.choices?.[0]?.message?.content || '';
-            usage = {
-                input_tokens: resp.usage?.prompt_tokens || 0,
-                output_tokens: resp.usage?.completion_tokens || 0,
-                total_tokens: resp.usage?.total_tokens || 0,
-            };
+            let fullContent = '';
+            try {
+                const stream = await openai.chat.completions.create({
+                    model,
+                    messages: normalizeMessages(messages),
+                    temperature: Math.min(Math.max(0, temperature), 2),
+                    max_tokens: safeMax,
+                    top_p: Math.min(Math.max(0, top_p), 1),
+                    frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
+                    presence_penalty: Math.min(Math.max(-2, presence_penalty), 2),
+                    stream: true,
+                });
 
-            await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
-            return res.json({ success: true, content, usage });
+                for await (const chunk of stream) {
+                    const delta = chunk.choices[0]?.delta?.content || '';
+                    if (delta) {
+                        fullContent += delta;
+                        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                    }
+                }
+
+                res.write('data: [DONE]\n\n');
+                res.end();
+                await logUsage(req.userId, 'chat', { model, provider: 'openai', tokens: fullContent.length / 4 });
+            } catch (err) {
+                console.error('OpenAI stream error:', err);
+                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                res.end();
+            }
+            return;
         }
         
 

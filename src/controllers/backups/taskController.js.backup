@@ -4,7 +4,6 @@ import { getTripoClient } from "../lib/tripoClient.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
-import { deductCredits, refundCredits } from "../services/creditService.js";
 import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
@@ -18,54 +17,19 @@ export async function createTask(req, res) {
 
   try {
     const body = { type, ...rest };
-    const userId = req.user?.uid;
-
-    // Estimate credit cost for this task
-    const { total: estimatedCost } = estimateCost(body);
-    console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"} cost=${estimatedCost}`);
-
-    // Check Tripo server balance BEFORE local deduction to avoid deduct-then-refund
-    if (estimatedCost > 0 && userId) {
-      try {
-        const tripoBalance = await getTripoClient().getBalance();
-        const availableTripo = tripoBalance.balance ?? 0;
-        if (availableTripo < estimatedCost) {
-          console.log(`[TaskController] Tripo balance ${availableTripo} < estimated cost ${estimatedCost} — rejecting`);
-          return res.status(402).json({
-            success: false,
-            message: `Insufficient credits: ${availableTripo} available, ${estimatedCost} required. Please top up your balance.`,
-            code: "INSUFFICIENT_CREDITS",
-          });
-        }
-      } catch (balanceErr) {
-        console.error(`[TaskController] Tripo balance check error:`, balanceErr.message);
-        // Continue anyway — don't block generation for a balance check failure
-      }
-
-      try {
-        await deductCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, type);
-      } catch (creditErr) {
-        if (creditErr.code === "INSUFFICIENT_CREDITS") {
-          return res.status(402).json({
-            success: false,
-            message: `Insufficient credits: ${creditErr.available} available, ${creditErr.required} required. Please top up your balance.`,
-            code: "INSUFFICIENT_CREDITS",
-          });
-        }
-        console.error(`[TaskController] Credit deduction error:`, creditErr.message);
-      }
-    }
 
     if (USE_QUEUE) {
+      console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"}`);
       const jobId = await enqueueTripoTask({
         jobType: "single",
         taskBody: body,
-        userId,
+        userId: req.user?.uid,
         callbackUrl: callback_url,
         idempotencyKey: idempotency_key ?? uuid(),
       });
       res.json({ success: true, queued: true, jobId });
     } else {
+      console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"}`);
       const taskId = await taskService.create(body, {
         callbackUrl: callback_url,
         idempotencyKey: idempotency_key,
@@ -74,17 +38,6 @@ export async function createTask(req, res) {
     }
   } catch (err) {
     console.error(`[TaskController] create error:`, err.message);
-
-    // Tripo 403 = insufficient credit → refund the locally deducted amount
-    if (err.message?.includes("403") && err.message?.includes("credit")) {
-      console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
-      try {
-        await refundCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, "tripo_403_insufficient_credit");
-      } catch (refundErr) {
-        console.error(`[TaskController] Refund error:`, refundErr.message);
-      }
-    }
-
     res.status(400).json({ success: false, message: err.message });
   }
 }
