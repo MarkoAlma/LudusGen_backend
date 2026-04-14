@@ -115,10 +115,9 @@ class TaskService {
               delete b["face_limit"];
             }
           }
-          // texture_quality: P1 only supports "standard" — "detailed" is not available
-          if (b["texture_quality"] && b["texture_quality"] !== "standard") {
-            console.warn(`[TaskService] P1-20260311: dropping unsupported texture_quality "${b["texture_quality"]}", using standard`);
-            delete b["texture_quality"];
+          // texture_quality: csak "standard" és "detailed"
+          if (b["texture_quality"] && !["standard", "detailed"].includes(b["texture_quality"])) {
+            b["texture_quality"] = "standard";
           }
           if (!b["texture"] && !b["pbr"]) delete b["texture_quality"];
           if (!b["texture"]) delete b["texture"];
