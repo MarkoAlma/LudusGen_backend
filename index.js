@@ -1554,7 +1554,15 @@ app.use("/api/tripo/webhook", express.raw({
 const tripoRouter = createTripoRouter(verifyFirebaseToken);
 app.use("/api", tripoRouter);
 
+// 5. Background task recovery — polls pending tasks and saves to history
+import { startTaskRecovery, stopTaskRecovery } from './src/services/taskRecoveryService.js';
+startTaskRecovery();
+
 // ==================== SERVER START ====================
 
-app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));
+const server = app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));
+
+// Graceful shutdown — stop background recovery
+process.on("SIGINT", () => { stopTaskRecovery(); server.close(); });
+process.on("SIGTERM", () => { stopTaskRecovery(); server.close(); });
 

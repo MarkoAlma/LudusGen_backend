@@ -1,7 +1,10 @@
 // src/controllers/webhookController.js
 import { webhookService } from "../services/webhookService.js";
 import { refundCredits, hasBeenCharged } from "../services/creditService.js";
+import { getTripoClient } from "../lib/tripoClient.js";
 import admin from "firebase-admin";
+
+const HISTORY_COLLECTION = "trellis_history";
 
 export async function handleWebhook(req, res) {
   // Signature verification — raw body must be captured by express.raw() middleware
@@ -24,6 +27,12 @@ export async function handleWebhook(req, res) {
     // Acknowledge immediately — process async
     res.json({ success: true, received: true });
 
+    if (payload.status === "success") {
+      // Task completed successfully — save to Firestore history automatically.
+      // This ensures the model is preserved even if the user navigated away.
+      await saveCompletedTaskToHistory(payload.task_id, payload);
+    }
+
     // If task failed via webhook, trigger refund (webhook doesn't have userId,
     // so we look it up from credit_history)
     if (["failed", "cancelled"].includes(payload.status)) {
@@ -35,6 +44,105 @@ export async function handleWebhook(req, res) {
     console.error("[WebhookController] handleWebhook error:", err.message);
     // Already responded 200 above — nothing to do
   }
+}
+
+/**
+ * Save a completed Tripo task to the user's Firestore history.
+ * Looks up userId from credit_history, fetches full task details from Tripo,
+ * and creates a history entry — same shape as the frontend saveHist function.
+ *
+ * @param {string} taskId - Tripo task ID
+ * @param {object} payload - Webhook payload
+ */
+async function saveCompletedTaskToHistory(taskId, payload) {
+  const db = admin.firestore();
+
+  // Look up userId from credit_history
+  const snap = await db.collectionGroup("transactions")
+    .where("taskId", "==", taskId)
+    .where("type", "==", "debit")
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    console.log(`[WebhookController] No credit charge found for task ${taskId}, skipping history save`);
+    return;
+  }
+
+  const doc = snap.docs[0];
+  const data = doc.data();
+  const userId = doc.ref.parent.parent.id;
+
+  // Check if history entry already exists (idempotency)
+  const existing = await db.collection(HISTORY_COLLECTION)
+    .where("taskId", "==", taskId)
+    .where("userId", "==", userId)
+    .limit(1)
+    .get();
+
+  if (!existing.empty) {
+    console.log(`[WebhookController] History already exists for task ${taskId}, skipping`);
+    return;
+  }
+
+  // Fetch full task details from Tripo to get model URL and params
+  let taskData;
+  try {
+    taskData = await getTripoClient().getTask(taskId);
+  } catch (err) {
+    console.error(`[WebhookController] Failed to fetch task ${taskId} from Tripo:`, err.message);
+    return;
+  }
+
+  const out = taskData.output ?? {};
+  const modelUrl = out.model ?? out.pbr_model ?? out.base_model
+    ?? out.rigged_model ?? out.animated_model
+    ?? out.converted_model ?? out.stylized_model ?? null;
+
+  if (!modelUrl) {
+    console.log(`[WebhookController] No model URL for completed task ${taskId}`);
+    return;
+  }
+
+  // Determine mode from task type
+  const typeMap = {
+    text_to_model: "generate",
+    image_to_model: "generate",
+    multiview_to_model: "generate",
+    refine_model: "refine",
+    stylize_model: "stylize",
+    texture_model: "texture",
+    convert_model: "retopo",
+    smart_low_poly: "retopo",
+    mesh_segmentation: "segment",
+    mesh_completion: "fill_parts",
+    animate_rig: "animate",
+    animate_retarget: "animate",
+  };
+  const mode = typeMap[payload.type ?? taskData.type] ?? "generate";
+
+  const now = Date.now();
+  const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+  await db.collection(HISTORY_COLLECTION).add({
+    userId,
+    prompt: taskData.prompt ?? payload.type ?? "3D Model",
+    status: "succeeded",
+    model_url: modelUrl,
+    source: "tripo",
+    mode,
+    taskId,
+    params: {
+      model_version: taskData.model_version ?? "unknown",
+      mode,
+      type: taskData.type,
+    },
+    ts: now,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: now + HISTORY_TTL_MS,
+  });
+
+  console.log(`[WebhookController] Saved task ${taskId} to history for user ${userId}`);
 }
 
 export async function testWebhook(req, res) {

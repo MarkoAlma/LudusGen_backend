@@ -1,0 +1,140 @@
+// src/lib/__tests__/creditEstimator.test.js
+//
+// Billing-break scenario tests for the credit estimator.
+// Run: node src/lib/__tests__/creditEstimator.test.js
+//
+// These tests verify that the estimator does NOT overcharge for addons
+// that get stripped by taskService.validate() before reaching the Tripo API.
+
+import { estimateCost } from "../creditEstimator.js";
+
+let passed = 0;
+let failed = 0;
+
+function assert(condition, label) {
+  if (condition) {
+    console.log(`  PASS: ${label}`);
+    passed++;
+  } else {
+    console.error(`  FAIL: ${label}`);
+    failed++;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scenario 1: P1 + text_to_model + texture_quality="detailed"
+//
+// BEFORE FIX: Estimator charged base(30) + texture_std(10) + HD_upgrade(10) = 50
+// AFTER FIX:  Estimator charges base(30) + texture_std(10) = 40
+// Why: P1 strips texture_quality="detailed" → only standard texture reaches API
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\nScenario 1: P1 text_to_model with detailed texture");
+{
+  const result = estimateCost({
+    type: "text_to_model",
+    model_version: "P1-20260311",
+    prompt: "a cat",
+    texture: true,
+    texture_quality: "detailed",
+  });
+  assert(result.total === 40, `Total should be 40 (base 30 + std texture 10), got ${result.total}`);
+  assert(result.breakdown.texture === 10, `Texture addon should be 10 (standard only), got ${result.breakdown.texture}`);
+  assert(!result.breakdown.geometry_detailed, "Should NOT have geometry_detailed addon");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scenario 2: P1 + text_to_model + geometry_quality="detailed" + smart_low_poly
+//
+// BEFORE FIX: Estimator charged base(30) + ultra(20) + slp(10) = 60
+// AFTER FIX:  Estimator charges base(30) = 30
+// Why: P1 strips both geometry_quality and smart_low_poly
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\nScenario 2: P1 text_to_model with geometry_quality + smart_low_poly");
+{
+  const result = estimateCost({
+    type: "text_to_model",
+    model_version: "P1-20260311",
+    prompt: "a cat",
+    geometry_quality: "detailed",
+    smart_low_poly: true,
+  });
+  assert(result.total === 30, `Total should be 30 (base only), got ${result.total}`);
+  assert(!result.breakdown.geometry_detailed, "Should NOT have geometry_detailed addon for P1");
+  assert(!result.breakdown.smart_low_poly, "Should NOT have smart_low_poly addon for P1");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scenario 3: P1 + text_to_model + generate_parts + quad + detailed texture
+//
+// BEFORE FIX: Estimator charged base(30) + parts(20) + quad(5) + tex_std(10) + HD(10) = 75
+// AFTER FIX:  Estimator charges base(30) + tex_std(10) = 40
+// Why: P1 strips generate_parts, quad, and texture_quality="detailed"
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\nScenario 3: P1 text_to_model with generate_parts + quad + detailed texture");
+{
+  const result = estimateCost({
+    type: "text_to_model",
+    model_version: "P1-20260311",
+    prompt: "a cat",
+    generate_parts: true,
+    quad: true,
+    texture: true,
+    texture_quality: "detailed",
+  });
+  assert(result.total === 40, `Total should be 40 (base 30 + std texture 10), got ${result.total}`);
+  assert(!result.breakdown.generate_parts, "Should NOT have generate_parts addon for P1");
+  assert(!result.breakdown.quad, "Should NOT have quad addon for P1");
+  assert(result.breakdown.texture === 10, `Texture addon should be 10 (standard only), got ${result.breakdown.texture}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sanity: v3.1 should STILL charge for all addons (not P1)
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\nSanity: v3.1 text_to_model with all addons (should charge everything)");
+{
+  const result = estimateCost({
+    type: "text_to_model",
+    model_version: "v3.1-20260211",
+    prompt: "a cat",
+    texture: true,
+    texture_quality: "detailed",
+    geometry_quality: "detailed",
+    smart_low_poly: true,
+    generate_parts: true,
+    quad: true,
+  });
+  // base(10) + tex_std(10) + HD(10) + ultra(20) + slp(10) + parts(20) + quad(5) = 85
+  assert(result.total === 85, `Total should be 85, got ${result.total}`);
+  assert(result.breakdown.geometry_detailed === 20, "Should have geometry_detailed addon for v3.1");
+  assert(result.breakdown.smart_low_poly === 10, "Should have smart_low_poly addon for v3.1");
+  assert(result.breakdown.generate_parts === 20, "Should have generate_parts addon for v3.1");
+  assert(result.breakdown.quad === 5, "Should have quad addon for v3.1");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sanity: P1 with standard texture (no overcharge scenario)
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\nSanity: P1 text_to_model with standard texture (normal case)");
+{
+  const result = estimateCost({
+    type: "text_to_model",
+    model_version: "P1-20260311",
+    prompt: "a cat",
+    texture: true,
+    texture_quality: "standard",
+  });
+  assert(result.total === 40, `Total should be 40 (base 30 + std texture 10), got ${result.total}`);
+  assert(result.breakdown.texture === 10, `Texture addon should be 10, got ${result.breakdown.texture}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Summary
+// ─────────────────────────────────────────────────────────────────────────────
+console.log(`\n${"=".repeat(60)}`);
+console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
+if (failed > 0) {
+  console.error("BILLING TESTS FAILED");
+  process.exit(1);
+} else {
+  console.log("ALL BILLING TESTS PASSED");
+}

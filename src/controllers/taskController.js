@@ -5,6 +5,7 @@ import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
 import { deductCredits, refundCredits } from "../services/creditService.js";
+import { registerTask as registerForRecovery } from "../services/taskRecoveryService.js";
 import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
@@ -70,6 +71,9 @@ export async function createTask(req, res) {
         callbackUrl: callback_url,
         idempotencyKey: idempotency_key,
       });
+      // Register for background recovery — if user navigates away, the
+      // recovery service will poll and save to history automatically.
+      if (userId) registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL);
       res.json({ success: true, taskId });
     }
   } catch (err) {
