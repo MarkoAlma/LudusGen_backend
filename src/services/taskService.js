@@ -281,8 +281,12 @@ class TaskService {
       }
 
       case "import_model":
-        if (!b["file"]?.["object"])
-          throw new Error("file.object required for import_model");
+        if (!b["file"])
+          throw new Error("file required for import_model");
+        break;
+
+      case "texture_edit":
+        if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
         break;
     }
 
@@ -302,6 +306,11 @@ class TaskService {
         out.base_model ??
         out.rigged_model ??
         out.animated_model ??
+        out.converted_model ??
+        out.segmented_model ??
+        out.textured_model ??
+        out.stylized_model ??
+        out.refined_model ??
         null,
       rigCheckResult: out.is_animatable ?? null,
       rawOutput: out,
