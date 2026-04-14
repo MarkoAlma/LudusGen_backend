@@ -705,6 +705,46 @@ app.post("/api/create-user", async (req, res) => {
 // ==================== PROTECTED ENDPOINTS ====================
 
 // Backend: /api/get-user/:uid módosítása
+// ✅ PUBLIKUS PROFIL LEKÉRÉSE (CSAK BIZTONSÁGOS MEZŐK)
+app.get("/api/get-public-profile/:uid", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    const userDocRef = admin.firestore().collection("users").doc(uid);
+    const userDoc = await userDocRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: "Felhasználó nem található"
+      });
+    }
+
+    const data = userDoc.data();
+    
+    // 🔥 CSAK BIZTONSÁGOS ADATOKAT ADUNK KI
+    const publicProfile = {
+      uid: uid,
+      displayName: data.displayName || data.name || "Névtelen",
+      profilePicture: data.profilePicture || data.photoURL || null,
+      createdAt: data.createdAt || null,
+      name: data.name || data.displayName || "Névtelen"
+    };
+
+    res.json({
+      success: true,
+      user: publicProfile
+    });
+
+  } catch (error) {
+    console.error("Error in get-public-profile:", error);
+    res.status(500).json({
+      success: false,
+      message: "Szerver hiba"
+    });
+  }
+});
+
 app.get("/api/get-user/:uid", async (req, res) => {
   try {
     const { uid } = req.params;
@@ -1534,6 +1574,168 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
     });
   }
 });
+// ==================== CREDIT SYSTEM ENDPOINTS ====================
+
+// Engedélyezett kredit csomagok (whitelist – nem lehet tetszőleges összeget küldeni)
+const CREDIT_PACKAGES = {
+  starter: { id: 'starter', name: 'Starter',  amount: 100,  price: 'Ingyenes' },
+  basic:   { id: 'basic',   name: 'Basic',    amount: 500,  price: '$4.99'    },
+  pro:     { id: 'pro',     name: 'Pro',      amount: 1000, price: '$9.99'    },
+  ultra:   { id: 'ultra',   name: 'Ultra',    amount: 5000, price: '$39.99'   },
+};
+
+// GET /api/get-credits – aktuális egyenleg lekérése
+app.get('/api/get-credits', verifyFirebaseToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const userDoc = await db.collection('users').doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Felhasználó nem található' });
+    }
+
+    const data = userDoc.data();
+    const credits = data.credits ?? 0;
+
+    // Utolsó 5 tranzakció összefoglaló
+    const txSnap = await db
+      .collection('users').doc(userId)
+      .collection('creditTransactions')
+      .orderBy('createdAt', 'desc')
+      .limit(5)
+      .get();
+
+    const recentTransactions = txSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    res.json({ success: true, credits, recentTransactions });
+  } catch (error) {
+    console.error('❌ get-credits error:', error);
+    res.status(500).json({ success: false, message: 'Szerver hiba' });
+  }
+});
+
+// POST /api/add-credits – kredit hozzáadása whitelist-validációval + biztonsági védelem
+app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
+  try {
+    const userId  = req.userId;
+    const { packageId } = req.body;
+
+    // 1. Whitelist ellenőrzés – csak előre definiált csomagok fogadhatók
+    const pkg = CREDIT_PACKAGES[packageId];
+    if (!pkg) {
+      return res.status(400).json({ success: false, message: 'Érvénytelen kredit csomag' });
+    }
+
+    const userRef = db.collection('users').doc(userId);
+
+    // 2. INGYENES csomag: csak egyszer igényelhető (Firestore transaction)
+    if (pkg.id === 'starter') {
+      let alreadyClaimed = false;
+
+      await db.runTransaction(async (tx) => {
+        const userSnap = await tx.get(userRef);
+        const data = userSnap.exists ? userSnap.data() : {};
+
+        if (data.hasClaimedFreeCredits === true) {
+          alreadyClaimed = true;
+          return; // transaction abort – nem írunk semmit
+        }
+
+        // Első és egyetlen alkalom – atomikusan jelöljük meg és adjuk hozzá
+        tx.set(userRef, {
+          credits:              admin.firestore.FieldValue.increment(pkg.amount),
+          hasClaimedFreeCredits: true,
+        }, { merge: true });
+      });
+
+      if (alreadyClaimed) {
+        return res.status(403).json({
+          success: false,
+          message: 'Az ingyenes Starter csomagot már egyszer felhasználtad',
+        });
+      }
+
+    } else {
+      // 3. FIZETŐS csomagok: rate-limit – max 10 tranzakció az elmúlt 1 órában
+      // ⚠️ Firestore NEM támogat két különböző mezőn inequality filtert egyszerre,
+      //    ezért csak createdAt>=... alapján kérdezünk, majd memóriában szűrjük a startert.
+      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      const recentTxSnap = await userRef
+        .collection('creditTransactions')
+        .where('createdAt', '>=', admin.firestore.Timestamp.fromDate(oneHourAgo))
+        .get();
+
+      // Memóriában szűrjük ki az ingyenes (starter) tranzakciókat
+      const paidTxCount = recentTxSnap.docs.filter(
+        d => d.data().packageId !== 'starter'
+      ).length;
+
+      if (paidTxCount >= 10) {
+        console.warn(`⚠️ Rate limit hit for user ${userId}: ${paidTxCount} paid transactions in 1 hour`);
+        return res.status(429).json({
+          success: false,
+          message: 'Túl sok kredit feltöltés egy órán belül. Kérlek próbáld újra később.',
+        });
+      }
+
+      // Atomikus növelés
+      await userRef.set(
+        { credits: admin.firestore.FieldValue.increment(pkg.amount) },
+        { merge: true }
+      );
+    }
+
+    // Tranzakció előzmény mentése (mindkét esetben, ha idáig jutottunk)
+    await userRef.collection('creditTransactions').add({
+      packageId:   pkg.id,
+      packageName: pkg.name,
+      amount:      pkg.amount,
+      price:       pkg.price,
+      createdAt:   admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Friss egyenleg visszaadása
+    const updatedDoc = await userRef.get();
+    const newBalance = updatedDoc.data().credits;
+
+    console.log(`✅ Credits added: ${pkg.amount} (${pkg.id}) → user ${userId}, balance: ${newBalance}`);
+    res.json({ success: true, credits: newBalance, added: pkg.amount, package: pkg });
+
+  } catch (error) {
+    console.error('❌ add-credits error:', error);
+    res.status(500).json({ success: false, message: 'Szerver hiba' });
+  }
+});
+
+
+// GET /api/credit-history – utolsó 20 tranzakció
+app.get('/api/credit-history', verifyFirebaseToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const snap = await db
+      .collection('users').doc(userId)
+      .collection('creditTransactions')
+      .orderBy('createdAt', 'desc')
+      .limit(20)
+      .get();
+
+    const transactions = snap.docs.map(d => {
+      const data = d.data();
+      return {
+        id: d.id,
+        ...data,
+        // Firestore Timestamp → ISO string a frontendnek
+        createdAt: data.createdAt?.toDate?.()?.toISOString() ?? null,
+      };
+    });
+
+    res.json({ success: true, transactions });
+  } catch (error) {
+    console.error('❌ credit-history error:', error);
+    res.status(500).json({ success: false, message: 'Szerver hiba' });
+  }
+});
+
 import { createTripoRouter } from './src/routes/tripo.routes.js';
 
 // 1. RAW body capture — must come BEFORE bodyParser.json()
