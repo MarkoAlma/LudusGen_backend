@@ -128,7 +128,8 @@ async function saveToHistory(entry, taskData) {
   const out = taskData.output ?? {};
   const modelUrl = out.model ?? out.pbr_model ?? out.base_model
     ?? out.rigged_model ?? out.animated_model
-    ?? out.converted_model ?? out.stylized_model ?? null;
+    ?? out.converted_model ?? out.low_poly_model
+    ?? out.stylized_model ?? null;
 
   if (!modelUrl) {
     console.log(`[TaskRecovery] No model URL for completed task ${entry.taskId}`);

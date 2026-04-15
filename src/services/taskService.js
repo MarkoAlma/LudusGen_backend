@@ -39,6 +39,10 @@ class TaskService {
   async get(taskId) {
     const client = getTripoClient();
     const task = await client.getTask(taskId);
+    // DEBUG: log the raw task type and output keys for troubleshooting
+    if (task.type === "convert_model" || task.type === "smart_low_poly" || task.type === "stylize_model") {
+      console.log(`[TaskService.get] task ${taskId} type=${task.type} status=${task.status} output keys:`, JSON.stringify(task.output ?? {}, null, 2));
+    }
     return this.taskToPollResult(task);
   }
 
@@ -296,6 +300,10 @@ class TaskService {
   /* ── Convert raw task to PollResult ──────────────────────────────── */
   taskToPollResult(task) {
     const out = task.output ?? {};
+    // DEBUG: log output fields for convert_model, smart_low_poly, stylize_model to identify the correct field name
+    if (task.type === "convert_model" || task.type === "smart_low_poly" || task.type === "stylize_model") {
+      console.log(`[TaskService] taskToPollResult type=${task.type} output keys:`, JSON.stringify(out, null, 2));
+    }
     return {
       success: task.status === "success",
       status: task.status,
@@ -307,6 +315,7 @@ class TaskService {
         out.rigged_model ??
         out.animated_model ??
         out.converted_model ??
+        out.low_poly_model ??
         out.segmented_model ??
         out.textured_model ??
         out.stylized_model ??

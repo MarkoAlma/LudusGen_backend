@@ -2,7 +2,7 @@
 import { taskService } from "../services/taskService.js";
 import { getTripoClient } from "../lib/tripoClient.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
-import { estimateCost } from "../lib/creditEstimator.js";
+import { estimateCost, CREDIT_COSTS } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
 import { deductCredits, refundCredits } from "../services/creditService.js";
 import { registerTask as registerForRecovery } from "../services/taskRecoveryService.js";
@@ -176,10 +176,36 @@ export async function uploadFile(req, res) {
 }
 
 /* ─── Model proxy ─────────────────────────────────────────────────────── */
-export async function modelProxy(req, res) {
-  let { url } = req.query;
 
-  // FIX: null-check BEFORE new URL()
+// In-memory cache for Tripo model binaries.  Pre-signed URLs expire after
+// a few hours, so we cache the fetched blob keyed by taskId.  This lets
+// history-card thumbnails work even after the original URL has expired.
+// Entries are evicted after 6 hours (TTL).
+const MODEL_CACHE = new Map();
+const MODEL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+// Periodic cleanup of stale cache entries (every 30 min)
+let _cacheCleanupTimer = null;
+function startCacheCleanup() {
+  if (_cacheCleanupTimer) return;
+  _cacheCleanupTimer = setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, entry] of MODEL_CACHE.entries()) {
+      if (now - entry.cachedAt > MODEL_CACHE_TTL_MS) {
+        MODEL_CACHE.delete(key);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) console.log(`[TaskController] model cache cleanup: removed ${cleaned} stale entries`);
+  }, 30 * 60 * 1000);
+  _cacheCleanupTimer.unref?.();
+}
+startCacheCleanup();
+
+export async function modelProxy(req, res) {
+  let { url, taskId: taskIdParam } = req.query;
+
   if (!url) { res.status(400).json({ success: false, message: "url missing" }); return; }
 
   const allowedHosts = [
@@ -220,14 +246,35 @@ export async function modelProxy(req, res) {
   };
 
   try {
+    // Read entire model binary into a Buffer (for caching)
+    const readBody = async (upstream) => {
+      const chunks = [];
+      for await (const chunk of upstream.body) chunks.push(chunk);
+      return Buffer.concat(chunks);
+    };
+
+    // ── Cache hit ──────────────────────────────────────────────────────
+    if (taskIdParam && MODEL_CACHE.has(taskIdParam)) {
+      const entry = MODEL_CACHE.get(taskIdParam);
+      if (Date.now() - entry.cachedAt < MODEL_CACHE_TTL_MS) {
+        console.log(`[TaskController] modelProxy: cache hit for ${taskIdParam}`);
+        res.setHeader("Content-Type", entry.contentType);
+        res.setHeader("Content-Disposition", `attachment; filename="model.${entry.ext}"`);
+        res.setHeader("Content-Length", entry.buffer.length);
+        res.setHeader("X-Cache", "HIT");
+        res.end(entry.buffer);
+        return;
+      }
+      MODEL_CACHE.delete(taskIdParam); // expired
+    }
+
+    // ── Fetch from upstream ────────────────────────────────────────────
     let { error, upstream, message } = await performFetch(url);
 
-    // FIX: If upstream returns 401/403/502 and it's likely an expired Tripo pre-signed URL,
-    // we attempt to refresh the task status to get a fresh URL.
+    // If upstream returns 401/403/502, try to refresh URL via taskId
     if (error && [401, 403, 502].includes(error)) {
-      // Extract taskId from typical Tripo URL filename pattern: tripo_pbr_model_[uuid].fbx
       const taskIdMatch = url.match(/tripo_(?:pbr|base|rigged|animated)_model_([a-f0-9-]{36})/i);
-      const taskId = taskIdMatch ? taskIdMatch[1] : null;
+      const taskId = taskIdMatch ? taskIdMatch[1] : (taskIdParam || null);
 
       if (taskId) {
         console.log(`[TaskController] modelProxy: URL expired (Upstream ${error}), refreshing task ${taskId}...`);
@@ -252,7 +299,10 @@ export async function modelProxy(req, res) {
       return;
     }
 
-    // Process the successful response
+    // Read body into buffer
+    const buffer = await readBody(upstream);
+
+    // Determine content type
     const parsed = new URL(url);
     const cleanPath = parsed.pathname.split("?")[0];
     const ext = cleanPath.split(".").pop()?.toLowerCase() ?? "glb";
@@ -264,25 +314,23 @@ export async function modelProxy(req, res) {
       stl:  "model/stl",
       usdz: "model/vnd.usdz+zip",
     };
-    const ct = EXT_CT_MAP[ext] ?? upstream.headers.get("content-type") ?? "model/gltf-binary";
-    const cl = upstream.headers.get("content-length");
+    const ct = EXT_CT_MAP[ext] ?? "model/gltf-binary";
 
+    // ── Cache the result ───────────────────────────────────────────────
+    const cacheKey = taskIdParam || `url_${cleanPath}`;
+    MODEL_CACHE.set(cacheKey, {
+      buffer,
+      contentType: ct,
+      ext,
+      cachedAt: Date.now(),
+    });
+
+    // ── Stream to client ───────────────────────────────────────────────
     res.setHeader("Content-Type", ct);
     res.setHeader("Content-Disposition", `attachment; filename="model.${ext}"`);
-    if (cl) res.setHeader("Content-Length", cl);
-
-    const reader = upstream.body?.getReader();
-    if (!reader) { res.status(502).json({ success: false, message: "No body" }); return; }
-
-    const pump = async () => {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        res.write(value);
-      }
-      res.end();
-    };
-    await pump();
+    res.setHeader("Content-Length", buffer.length);
+    res.setHeader("X-Cache", "MISS");
+    res.end(buffer);
   } catch (err) {
     console.error("[TaskController] proxy error:", err.message);
     if (!res.headersSent) res.status(500).json({ success: false, message: err.message });
