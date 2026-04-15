@@ -110,6 +110,12 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 fal.config({ credentials: process.env.FAL_KEY });
 
+const MESHY_KEY = process.env.MESHY_API_KEY || process.env.TRIPO3D_API_KEY || process.env.TRIPO3D;
+const meshy = axios.create({
+    baseURL: 'https://api.meshy.ai',
+    headers: { Authorization: `Bearer ${MESHY_KEY}` },
+});
+
 // ── Firebase Auth middleware ──────────────────────────
 const verifyFirebaseToken = async (req, res, next) => {
     try {
@@ -125,6 +131,7 @@ const verifyFirebaseToken = async (req, res, next) => {
 
         req.userId = decoded.uid;
         req.userEmail = decoded.email;
+        req.user = { uid: decoded.uid, email: decoded.email };
         next();
     } catch {
         return res.status(401).json({ success: false, message: 'Érvénytelen token' });
@@ -600,24 +607,67 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             const systemMsg = normalized.find((m) => m.role === 'system');
             const chatMsgs = normalized.filter((m) => m.role !== 'system');
 
-            const resp = await anthropic.messages.create({
-                model: apiModel,
-                max_tokens: safeMax,
-                temperature: Math.min(Math.max(0, temperature), 1),
-                ...(systemMsg ? { system: systemMsg.content } : {}),
-                messages: chatMsgs,
-            }, { abortSignal: signal });
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
 
-            const content = resp.content?.[0]?.text || '';
-            const usage = {
-                input_tokens: resp.usage?.input_tokens || 0,
-                output_tokens: resp.usage?.output_tokens || 0,
-                total_tokens: (resp.usage?.input_tokens || 0) + (resp.usage?.output_tokens || 0),
-            };
+            let totalContent = '';
+            let clientConnected = true;
 
-            await logUsage(req.userId, 'chat', { model: apiModel, provider, tokens: usage.total_tokens });
-            await saveResponse(content, usage, modelId, provider);
-            return res.json({ success: true, content, usage });
+            try {
+                const stream = anthropic.messages.stream({
+                    model: apiModel,
+                    max_tokens: safeMax,
+                    temperature: Math.min(Math.max(0, temperature), 1),
+                    ...(systemMsg ? { system: systemMsg.content } : {}),
+                    messages: chatMsgs,
+                }, { abortSignal: signal });
+
+                stream.on('text', (text) => {
+                    if (!clientConnected) return;
+                    totalContent += text;
+                    res.write(`data: ${JSON.stringify({ delta: text })}\n\n`);
+                });
+
+                stream.on('end', async () => {
+                    activeStreams.delete(streamKey);
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                    if (totalContent.length > 0) {
+                        try {
+                            const estimatedTokens = Math.ceil(totalContent.length / 4);
+                            await logUsage(req.userId, 'chat', { model: apiModel, provider: 'anthropic', tokens: estimatedTokens });
+                            await saveResponse(totalContent, { total_tokens: estimatedTokens }, modelId, 'anthropic');
+                        } catch (e) {
+                            console.error('[Chat] Anthropic save failed:', e.message);
+                        }
+                    }
+                });
+
+                stream.on('error', (err) => {
+                    activeStreams.delete(streamKey);
+                    if (err.name === 'AbortError') {
+                        console.log('[Anthropic] Stream aborted by client.');
+                    } else {
+                        console.error('Anthropic stream error:', err);
+                        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                    }
+                    if (!res.writableEnded) res.end();
+                });
+
+            } catch (err) {
+                activeStreams.delete(streamKey);
+                console.error('Anthropic setup error:', err);
+                if (!res.headersSent) {
+                    res.status(500).json({ success: false, message: err.message });
+                } else {
+                    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                    res.end();
+                }
+            }
+            return;
         }
 
         // ── OpenAI ───────────────────────────────────────
@@ -626,26 +676,62 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'OPENAI_API_KEY nincs beállítva a .env-ben' });
             }
 
-            const resp = await openai.chat.completions.create({
-                model: apiModel,
-                messages: normalizeMessages(context),
-                temperature: Math.min(Math.max(0, temperature), 2),
-                max_tokens: safeMax,
-                top_p: Math.min(Math.max(0, top_p), 1),
-                frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
-                presence_penalty: Math.min(Math.max(-2, presence_penalty), 2),
-            }, { signal });
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
 
-            const content = resp.choices?.[0]?.message?.content || '';
-            const usage = {
-                input_tokens: resp.usage?.prompt_tokens || 0,
-                output_tokens: resp.usage?.completion_tokens || 0,
-                total_tokens: resp.usage?.total_tokens || 0,
-            };
+            let totalContent = '';
+            let clientConnected = true;
 
-            await logUsage(req.userId, 'chat', { model: apiModel, provider, tokens: usage.total_tokens });
-            await saveResponse(content, usage, modelId, provider);
-            return res.json({ success: true, content, usage });
+            try {
+                const stream = await openai.chat.completions.create({
+                    model: apiModel,
+                    messages: normalizeMessages(context),
+                    temperature: Math.min(Math.max(0, temperature), 2),
+                    max_tokens: safeMax,
+                    top_p: Math.min(Math.max(0, top_p), 1),
+                    frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
+                    presence_penalty: Math.min(Math.max(-2, presence_penalty), 2),
+                    stream: true,
+                }, { signal });
+
+                for await (const chunk of stream) {
+                    if (!clientConnected) break;
+                    const delta = chunk.choices[0]?.delta?.content || '';
+                    if (delta) {
+                        totalContent += delta;
+                        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                    }
+                }
+
+                activeStreams.delete(streamKey);
+                res.write('data: [DONE]\n\n');
+                res.end();
+
+                if (totalContent.length > 0) {
+                    try {
+                        const estimatedTokens = Math.ceil(totalContent.length / 4);
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'openai', tokens: estimatedTokens });
+                        await saveResponse(totalContent, { total_tokens: estimatedTokens }, modelId, 'openai');
+                    } catch (e) {
+                        console.error('[Chat] OpenAI save failed:', e.message);
+                    }
+                }
+            } catch (err) {
+                activeStreams.delete(streamKey);
+                if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+                    console.log('[OpenAI] Stream aborted by client.');
+                } else {
+                    console.error('OpenAI stream error:', err);
+                    if (!res.writableEnded) {
+                        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                        res.end();
+                    }
+                }
+            }
+            return;
         }
 
         // ── Cerebras ─────────────────────────────────────
