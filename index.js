@@ -19,7 +19,7 @@ const app = express();          // Initialize app first
 
 // Middlewares
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:3001'],
+  origin: true, // Allow all for development flexibility
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));

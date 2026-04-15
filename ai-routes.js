@@ -18,6 +18,7 @@ import path from 'path';
 import sharp from 'sharp';
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { buildContext, trimToContextLimit, RECENT_MESSAGE_COUNT } from './src/lib/contextBuilder.js';
 
 import { existsSync, writeFileSync, unlinkSync } from 'fs';
 
@@ -100,6 +101,9 @@ REQUIRED_KEYS.forEach((key) => {
     if (!process.env[key]) console.warn(`⚠️  Hiányzó .env változó: ${key}`);
 });
 
+// Map to track active AI streams for safe stopping
+const activeStreams = new Map();
+
 // ── API kliensek inicializálása ───────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -166,12 +170,300 @@ async function logUsage(userId, type, meta = {}) {
 
 // ── Segédfüggvény: messages normalizálása (vision support) ──────────
 function normalizeMessages(messages) {
-    return messages.map((m) => ({
-        role: m.role,
-        content: Array.isArray(m.content)
-            ? m.content
-            : String(m.content),
-    }));
+    if (!messages || !Array.isArray(messages)) return [];
+
+    // 1. Basic cleaning and filtering out entirely empty content
+    let cleaned = messages.map(m => ({
+        role: m.role || 'user',
+        content: m.content
+    })).filter(m => {
+        if (m.content === null || m.content === undefined) return false;
+        if (typeof m.content === 'string' && m.content.trim() === '') return false;
+        if (Array.isArray(m.content) && m.content.length === 0) return false;
+        return true;
+    });
+
+    if (cleaned.length === 0) return [];
+
+    // 2. Merge consecutive messages with the same role
+    const merged = [];
+    for (const msg of cleaned) {
+        if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
+            const last = merged[merged.length - 1];
+            // Merge content
+            if (typeof last.content === 'string' && typeof msg.content === 'string') {
+                last.content += "\n\n" + msg.content;
+            } else {
+                // Handle complex content (e.g. vision or mixtures)
+                const lastParts = Array.isArray(last.content) ? last.content : [{ type: 'text', text: String(last.content) }];
+                const nextParts = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: String(msg.content) }];
+                last.content = [...lastParts, ...nextParts];
+            }
+        } else {
+            merged.push({ ...msg });
+        }
+    }
+
+    // 3. Enforce structure: System messages at front, then alternating User/Assistant starting with User
+    const finalMessages = [];
+    const systemContent = [];
+    const chatMsgs = [];
+
+    for (const m of merged) {
+        if (m.role === 'system') {
+            systemContent.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+        } else {
+            chatMsgs.push(m);
+        }
+    }
+
+    if (systemContent.length > 0) {
+        finalMessages.push({ role: 'system', content: systemContent.join("\n\n") });
+    }
+
+    // Mistral/Anthropic requirement: first message after system MUST be 'user'
+    while (chatMsgs.length > 0 && chatMsgs[0].role === 'assistant') {
+        chatMsgs.shift();
+    }
+
+    finalMessages.push(...chatMsgs);
+
+    return finalMessages;
+}
+
+/**
+ * Get model config by modelId.
+ * This mirrors the frontend models.js structure.
+ */
+function getModelConfig(modelId) {
+    const MODEL_MAP = {
+        'claude_sonnet': { apiModel: 'claude-sonnet-4-20250514', provider: 'anthropic', defaultSystemPrompt: 'You are a helpful, harmless, and honest assistant. Respond in the same language the user writes in.' },
+        'claude_opus': { apiModel: 'claude-opus-4-20250514', provider: 'anthropic', defaultSystemPrompt: 'You are a helpful, harmless, and honest assistant. Respond in the same language the user writes in.' },
+        'gpt4o_mini': { apiModel: 'gpt-4o-mini', provider: 'openai', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'gpt4o': { apiModel: 'gpt-4o', provider: 'openai', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'gpt4o_code': { apiModel: 'gpt-4o', provider: 'openai', defaultSystemPrompt: 'You are an elite software engineer with deep expertise across all programming languages and paradigms.\n- Produce production-ready, optimized code\n- Apply SOLID principles and design patterns\n- Include comprehensive error handling\n- Write thorough technical explanations\n- Review and suggest improvements proactively\n- Respond in the same language the user writes in' },
+        'deepseek_code': { apiModel: 'arcee-ai/trinity-large-preview:free', provider: 'openrouter', defaultSystemPrompt: 'You are an elite software engineer with deep expertise across all programming languages and paradigms.\n- Produce production-ready, optimized code\n- Apply SOLID principles and design patterns\n- Include comprehensive error handling\n- Write thorough technical explanations\n- Review and suggest improvements proactively\n- Respond in the same language the user writes in' },
+        'gemini-3-flash': { apiModel: 'gemini-3-flash-preview', provider: 'gemini', defaultSystemPrompt: 'You are a helpful AI assistant powered by Google Gemini. Respond in the same language the user writes in.' },
+        'gemini-2.5-pro': { apiModel: 'gemini-2.5-pro', provider: 'gemini', defaultSystemPrompt: 'You are a helpful AI assistant powered by Google Gemini. Respond in the same language the user writes in.' },
+        'groq-gpt120b': { apiModel: 'openai/gpt-oss-120b', provider: 'groq', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'groq-qwen3': { apiModel: 'qwen/qwen3-32b', provider: 'groq', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'groq-llama70b': { apiModel: 'llama-3.3-70b-versatile', provider: 'groq', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'cerebras-llama8b': { apiModel: 'llama3.1-8b', provider: 'cerebras', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'mistral-large': { apiModel: 'mistral-large-latest', provider: 'mistral', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'nvidia-glm4.7': { apiModel: 'z-ai/glm4.7', provider: 'nvidia', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'deepseek-v3.2': { apiModel: 'deepseek-ai/deepseek-v3.2', provider: 'nvidia', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'google-gemma-3-27b-it': { apiModel: 'google/gemma-3-27b-it', provider: 'nvidia', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+    };
+    return MODEL_MAP[modelId] || null;
+}
+
+/**
+ * Generate summary in background (fire-and-forget).
+ * Loads ALL messages from Firestore, generates summary, saves to session doc.
+ */
+async function generateSummaryInBackground(userId, sessionId, modelId) {
+    const db = admin.firestore();
+    const messagesRef = db.collection('conversations').doc(userId).collection('sessions').doc(sessionId).collection('messages');
+
+    // Load all messages (limit to last 50 for summary)
+    const snap = await messagesRef.orderBy('timestamp', 'asc').limit(50).get();
+    const messages = snap.docs.map(d => ({ role: d.data().role, content: String(d.data().content).slice(0, 2000) }));
+
+    if (messages.length < 20) return; // Too few messages to summarize (need at least 20)
+
+    const summaryPrompt = `Summarize this conversation in a structured format.
+Detect the language used and include it in the summary.
+Format:
+Topic: <main topic>
+Key facts established: <facts/decisions>
+User preferences: <preferences>
+Open questions: <unresolved questions>
+Language: <detected language>
+
+Keep it under 200 tokens. Be concise but capture all important context.`;
+
+    const summaryMessages = [
+        { role: 'system', content: summaryPrompt },
+        ...messages,
+    ];
+
+    // Use Groq for summary generation (cheap and fast)
+    const resp = await axios.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+            model: 'openai/gpt-oss-120b',
+            messages: summaryMessages,
+            temperature: 0.3,
+            max_tokens: 500,
+        },
+        {
+            headers: {
+                'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+        }
+    );
+
+    const summaryText = resp.data.choices?.[0]?.message?.content || '';
+
+    if (summaryText) {
+        const sessionRef = db.collection('conversations').doc(userId).collection('sessions').doc(sessionId);
+        await sessionRef.set({
+            summary: summaryText,
+            summaryGeneratedAt: admin.firestore.FieldValue.serverTimestamp(),
+            summaryMessageCount: messages.length,
+        }, { merge: true });
+
+        console.log(`[Summary] Generated for session ${sessionId} (${messages.length} messages)`);
+    }
+}
+
+// ── Rolling Context Summary constants ────────────────────────────────
+const RECENT_MESSAGE_WINDOW = 15;
+const SUMMARY_COLLECTION = 'chat_summaries';
+
+/**
+ * Build optimized message array for API call.
+ * If summaryText exists: [system prompt with summary prefix] + [last N messages]
+ * If no summary: [system prompt] + [all messages up to 50 limit]
+ */
+function buildOptimizedMessages(allMessages, systemPrompt, summaryText, recentCount = RECENT_MESSAGE_WINDOW) {
+    const nonSystemMessages = allMessages.filter(m => m.role !== 'system');
+    const systemMsg = allMessages.find(m => m.role === 'system');
+
+    if (summaryText) {
+        const enhancedSystemPrompt = systemPrompt
+            ? `${systemPrompt}\n\n--- Korábbi üzenetek összefoglalója ---\n${summaryText}`
+            : `--- Korábbi üzenetek összefoglalója ---\n${summaryText}`;
+
+        const recentMessages = nonSystemMessages.slice(-recentCount);
+        return [
+            { role: 'system', content: enhancedSystemPrompt },
+            ...recentMessages.map(m => ({ role: m.role, content: m.content })),
+        ];
+    }
+
+    const cappedMessages = nonSystemMessages.slice(-50);
+    return [
+        ...(systemMsg ? [{ role: 'system', content: systemMsg.content }] : []),
+        ...cappedMessages.map(m => ({ role: m.role, content: m.content })),
+    ];
+}
+
+/**
+ * Look up stored summary for a session.
+ * Summary is only generated on explicit model switch (triggered by frontend).
+ * Returns { summaryText }.
+ */
+async function getSummary(userId, sessionId) {
+    if (!userId || !sessionId) {
+        return { summaryText: null };
+    }
+
+    try {
+        const db = admin.firestore();
+        const summaryRef = db.collection('conversations')
+            .doc(userId)
+            .collection('sessions')
+            .doc(sessionId)
+            .collection(SUMMARY_COLLECTION)
+            .doc('latest');
+
+        const summaryDoc = await summaryRef.get();
+
+        if (summaryDoc.exists) {
+            return { summaryText: summaryDoc.data().summaryText };
+        }
+    } catch (e) {
+        console.warn('Summary lookup failed:', e.message);
+    }
+
+    return { summaryText: null };
+}
+
+/**
+ * Generate and store a summary using gpt-oss-120b via Groq.
+ * Fire-and-forget — does not block the response.
+ */
+async function generateSummary(userId, sessionId, messages, modelId) {
+    try {
+        const summaryPrompt = `Summarize this conversation in a structured format.
+Detect the language used and include it in the summary.
+Format:
+Topic: <main topic>
+Key facts established: <facts/decisions>
+User preferences: <preferences>
+Open questions: <unresolved questions>
+Language: <detected language>
+
+Keep it under 200 tokens. Be concise but capture all important context.`;
+
+        // Use last 30 messages, cap each at 2000 chars
+        const summaryMessages = [
+            { role: 'system', content: summaryPrompt },
+            ...messages
+                .slice(-30)
+                .map(m => ({ role: m.role, content: String(m.content).slice(0, 2000) })),
+        ];
+
+        const resp = await axios.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            {
+                model: 'openai/gpt-oss-120b',
+                messages: summaryMessages,
+                temperature: 0.3,
+                max_tokens: 300,
+                top_p: 0.9,
+                stream: false,
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+                timeout: 30000,
+            }
+        );
+
+        const summaryText = resp.data?.choices?.[0]?.message?.content || '';
+        if (!summaryText) return;
+
+        const db = admin.firestore();
+        const batch = db.batch();
+
+        // Store summary document
+        const summaryRef = db.collection('conversations')
+            .doc(userId)
+            .collection('sessions')
+            .doc(sessionId)
+            .collection(SUMMARY_COLLECTION)
+            .doc('latest');
+
+        batch.set(summaryRef, {
+            summaryText,
+            messageCountAtSummary: messages.length,
+            lastSummaryModelId: modelId || 'unknown',
+            language: 'auto',
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        // Update session doc
+        const sessionRef = db.collection('conversations')
+            .doc(userId)
+            .collection('sessions')
+            .doc(sessionId);
+
+        batch.set(sessionRef, {
+            summaryGenerated: true,
+            lastSummaryAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        await batch.commit();
+        console.log(`[Summary] Generated for session ${sessionId.slice(0, 12)}... (${summaryText.length} chars)`);
+    } catch (err) {
+        console.error('[Summary] Generation failed:', err.message);
+    }
 }
 
 // ════════════════════════════════════════════════════
@@ -179,28 +471,124 @@ function normalizeMessages(messages) {
 // ════════════════════════════════════════════════════
 router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
     try {
-        const {
-            model, provider, messages,
-            temperature = 0.7,
-            max_tokens = 2048,
-            top_p = 0.9,
-            frequency_penalty = 0,
-            presence_penalty = 0,
-        } = req.body;
+        const { sessionId, message, attachedImage, messageId } = req.body;
 
-        if (!model || !provider) {
-            return res.status(400).json({ success: false, message: 'Hiányzó model / provider' });
+        if (!sessionId) {
+            return res.status(400).json({ success: false, message: 'Hiányzó sessionId' });
         }
-        if (!Array.isArray(messages) || messages.length === 0) {
-            return res.status(400).json({ success: false, message: 'Érvénytelen üzenetlista' });
-        }
-        if (messages.length > 50) {
-            return res.status(400).json({ success: false, message: 'Max 50 üzenet per kérés' });
+        if (!message || (typeof message !== 'string' && !attachedImage)) {
+            return res.status(400).json({ success: false, message: 'Hiányzó üzenet' });
         }
 
-        const safeMax = Math.min(Math.max(128, max_tokens), 8192*32);
-        let content = '';
-        let usage = {};
+        const adminDb = admin.firestore();
+        const userId = req.userId;
+
+        // ── Centralized Abort Handling ──
+        const controller = new AbortController();
+        const signal = controller.signal;
+
+        // Register the stream in activeStreams for safe stopping
+        const streamKey = `${userId}:${sessionId}`;
+        activeStreams.set(streamKey, controller);
+
+        req.on('close', () => {
+            console.log(`[Chat] Client disconnected, aborting AI stream...`);
+            controller.abort();
+            activeStreams.delete(streamKey);
+        });
+
+        // ── Load session doc ──
+        const sessionRef = adminDb.collection('conversations').doc(userId).collection('sessions').doc(sessionId);
+        const sessionDoc = await sessionRef.get();
+        const sessionData = sessionDoc.exists ? sessionDoc.data() : {};
+
+        const modelId = sessionData.modelId || 'claude_sonnet';
+        const modelName = sessionData.modelName || 'Claude Sonnet 4';
+
+        // Resolve model config
+        const modelConfig = getModelConfig(modelId);
+        if (!modelConfig) {
+            return res.status(400).json({ success: false, message: `Ismeretlen modell: ${modelId}` });
+        }
+
+        const { apiModel, provider, defaultSystemPrompt } = modelConfig;
+
+        // ── Load recent messages from Firestore ──
+        const messagesRef = sessionRef.collection('messages');
+        const messagesQuery = messagesRef.orderBy('timestamp', 'desc').limit(RECENT_MESSAGE_COUNT + 1);
+        const messagesSnap = await messagesQuery.get();
+
+        let sessionMessages = messagesSnap.docs
+            .map(d => d.data())
+            .reverse()
+            .map(m => ({ role: m.role, content: m.content }));
+
+        // ── Build new user message ──
+        const newMessage = attachedImage
+            ? { role: 'user', content: [{ type: 'image_url', image_url: { url: attachedImage } }, { type: 'text', text: message }] }
+            : { role: 'user', content: message };
+
+        // ── Build context ──
+        const summary = sessionData.summary ? { text: sessionData.summary, messageCount: sessionData.summaryMessageCount || 0 } : null;
+        let context = buildContext(sessionMessages, summary, newMessage, defaultSystemPrompt || null);
+
+        // ── Trim to context limit if needed ──
+        const maxContextTokens = 8192 * 32 * 0.8;
+        context = trimToContextLimit(context, maxContextTokens);
+
+        // ── Extract params ──
+        const temperature = sessionData.temperature ?? 0.7;
+        const max_tokens = sessionData.maxTokens ?? 2048;
+        const top_p = sessionData.topP ?? 0.9;
+        const frequency_penalty = sessionData.frequencyPenalty ?? 0;
+        const presence_penalty = sessionData.presencePenalty ?? 0;
+
+        const safeMax = Math.min(Math.max(128, max_tokens), 8192 * 32);
+
+        // ── Helper: save AI response + update session ──
+        let isResponseSaved = false;
+        async function saveResponse(aiContent, aiUsage, modelForLog, providerForLog) {
+            if (isResponseSaved) return; // Prevent double save
+            isResponseSaved = true;
+
+            const aiMsgData = {
+                role: 'assistant',
+                content: aiContent,
+                model: modelForLog,
+                modelId: modelForLog,
+                modelName,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                createdAt: new Date().toISOString(),
+                ...(aiUsage.total_tokens ? { usage: aiUsage } : {}),
+            };
+
+            if (messageId) {
+                // Use provided ID to synchronize with frontend
+                await messagesRef.doc(messageId).set(aiMsgData, { merge: true });
+            } else {
+                await messagesRef.add(aiMsgData);
+            }
+
+            const newMessageCount = (sessionData.messageCount || 0) + 2;
+            // Only generate summary if we have at least 20 messages AND no existing summary,
+            // OR if we have an existing summary and 20+ new messages since it was generated
+            const needsSummary = (!sessionData.summary && newMessageCount >= 20) ||
+                (sessionData.summary && (newMessageCount - (sessionData.summaryMessageCount || 0)) >= 20);
+
+            await sessionRef.set({
+                sessionId,
+                modelId: modelForLog,
+                modelName,
+                lastMessage: message.slice(0, 100),
+                lastRole: 'assistant',
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                messageCount: newMessageCount,
+            }, { merge: true });
+
+            if (needsSummary) {
+                generateSummaryInBackground(userId, sessionId, modelForLog).catch(e => console.warn('[Summary] Background gen failed:', e.message));
+            }
+        }
 
         // ── Anthropic ────────────────────────────────────
         if (provider === 'anthropic') {
@@ -208,27 +596,27 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'ANTHROPIC_API_KEY nincs beállítva a .env-ben' });
             }
 
-            const systemMsg = messages.find((m) => m.role === 'system');
-            const chatMsgs = messages
-                .filter((m) => m.role !== 'system')
-                .map((m) => ({ role: m.role, content: String(m.content) }));
+            const normalized = normalizeMessages(context);
+            const systemMsg = normalized.find((m) => m.role === 'system');
+            const chatMsgs = normalized.filter((m) => m.role !== 'system');
 
             const resp = await anthropic.messages.create({
-                model,
+                model: apiModel,
                 max_tokens: safeMax,
                 temperature: Math.min(Math.max(0, temperature), 1),
                 ...(systemMsg ? { system: systemMsg.content } : {}),
                 messages: chatMsgs,
-            });
+            }, { abortSignal: signal });
 
-            content = resp.content?.[0]?.text || '';
-            usage = {
+            const content = resp.content?.[0]?.text || '';
+            const usage = {
                 input_tokens: resp.usage?.input_tokens || 0,
                 output_tokens: resp.usage?.output_tokens || 0,
                 total_tokens: (resp.usage?.input_tokens || 0) + (resp.usage?.output_tokens || 0),
             };
 
-            await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
+            await logUsage(req.userId, 'chat', { model: apiModel, provider, tokens: usage.total_tokens });
+            await saveResponse(content, usage, modelId, provider);
             return res.json({ success: true, content, usage });
         }
 
@@ -239,26 +627,26 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             }
 
             const resp = await openai.chat.completions.create({
-                model,
-                messages: normalizeMessages(messages),
+                model: apiModel,
+                messages: normalizeMessages(context),
                 temperature: Math.min(Math.max(0, temperature), 2),
                 max_tokens: safeMax,
                 top_p: Math.min(Math.max(0, top_p), 1),
                 frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
                 presence_penalty: Math.min(Math.max(-2, presence_penalty), 2),
-            });
+            }, { signal });
 
-            content = resp.choices?.[0]?.message?.content || '';
-            usage = {
+            const content = resp.choices?.[0]?.message?.content || '';
+            const usage = {
                 input_tokens: resp.usage?.prompt_tokens || 0,
                 output_tokens: resp.usage?.completion_tokens || 0,
                 total_tokens: resp.usage?.total_tokens || 0,
             };
 
-            await logUsage(req.userId, 'chat', { model, provider, tokens: usage.total_tokens });
+            await logUsage(req.userId, 'chat', { model: apiModel, provider, tokens: usage.total_tokens });
+            await saveResponse(content, usage, modelId, provider);
             return res.json({ success: true, content, usage });
         }
-        
 
         // ── Cerebras ─────────────────────────────────────
         else if (provider === 'cerebras') {
@@ -266,7 +654,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'CEREBRAS_API_KEY nincs beállítva' });
             }
 
-            const chatMsgs = normalizeMessages(messages);
+            const chatMsgs = normalizeMessages(context);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -276,16 +664,10 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             let streamResp;
             try {
-                console.log("Cerebras");
-                console.log(Math.min(Math.max(0, temperature), 1.5));
-                console.log(Math.min(Math.max(0, top_p), 1));
-                
-                
-                
                 streamResp = await axios.post(
                     'https://api.cerebras.ai/v1/chat/completions',
                     {
-                        model,
+                        model: apiModel,
                         messages: chatMsgs,
                         temperature: Math.min(Math.max(0, temperature), 1.5),
                         max_tokens: safeMax,
@@ -301,28 +683,31 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         responseType: 'stream',
                         decompress: false,
                         timeout: 60000,
+                        signal, // Use global signal
                     }
                 );
             } catch (err) {
+                if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+                    console.log('[Cerebras] Stream aborted by client.');
+                    return;
+                }
                 console.error('Cerebras hiba:', err.response?.data || err.message);
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
 
-            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
-            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
-            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
-            req.on('close', () => {
-                if (!res.writableEnded) {
-                    streamResp.data.destroy();
-                }
+            let clientConnected = true;
+            req.on('close', () => { 
+                clientConnected = false; 
+                if (!res.writableEnded) streamResp.data.destroy(); 
+                saveResponse(totalContent, {}, modelId, 'cerebras').catch(e => console.error('[Chat] Cerebras abort-save failed:', e.message));
             });
-            console.log("itt");
-            
+
             let totalContent = '';
             let buf = '';
 
             streamResp.data.on('data', (chunk) => {
+                if (!clientConnected) return;
                 buf += chunk.toString('utf8');
                 const lines = buf.split('\n');
                 buf = lines.pop();
@@ -334,19 +719,27 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     try {
                         const parsed = JSON.parse(raw);
                         const delta = parsed.choices?.[0]?.delta?.content || '';
-                        if (delta) {
+                        if (delta && clientConnected) {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
                     } catch {}
                 }
             });
-            
 
             streamResp.data.on('end', async () => {
+                activeStreams.delete(streamKey);
                 res.write('data: [DONE]\n\n');
                 res.end();
-                await logUsage(req.userId, 'chat', { model, provider: 'cerebras', tokens: totalContent.length });
+                // Always try to save what was generated so far
+                if (totalContent.length > 0) {
+                    try {
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'cerebras', tokens: totalContent.length });
+                        await saveResponse(totalContent, {}, modelId, 'cerebras');
+                    } catch (e) {
+                        console.error('[Chat] Cerebras save failed:', e.message);
+                    }
+                }
             });
 
             streamResp.data.on('error', () => {
@@ -363,7 +756,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'MISTRAL_API_KEY nincs beállítva' });
             }
 
-            const chatMsgs = normalizeMessages(messages);
+            const chatMsgs = normalizeMessages(context);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -376,7 +769,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 streamResp = await axios.post(
                     'https://api.mistral.ai/v1/chat/completions',
                     {
-                        model,
+                        model: apiModel,
                         messages: chatMsgs,
                         temperature: Math.min(Math.max(0, temperature), 1),
                         max_tokens: safeMax,
@@ -392,27 +785,31 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         responseType: 'stream',
                         decompress: false,
                         timeout: 60000,
+                        signal, // Use global signal
                     }
                 );
             } catch (err) {
+                if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+                    console.log('[Mistral] Stream aborted by client.');
+                    return;
+                }
                 console.error('Mistral hiba:', err.response?.data || err.message);
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
 
-            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
-            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
-            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
-            req.on('close', () => {
-                if (!res.writableEnded) {
-                    streamResp.data.destroy();
-                }
+            let clientConnected = true;
+            req.on('close', () => { 
+                clientConnected = false; 
+                if (!res.writableEnded) streamResp.data.destroy(); 
+                saveResponse(totalContent, {}, modelId, 'mistral').catch(e => console.error('[Chat] Mistral abort-save failed:', e.message));
             });
 
             let totalContent = '';
             let buf = '';
 
             streamResp.data.on('data', (chunk) => {
+                if (!clientConnected) return;
                 buf += chunk.toString('utf8');
                 const lines = buf.split('\n');
                 buf = lines.pop();
@@ -424,7 +821,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     try {
                         const parsed = JSON.parse(raw);
                         const delta = parsed.choices?.[0]?.delta?.content || '';
-                        if (delta) {
+                        if (delta && clientConnected) {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
@@ -433,12 +830,22 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             });
 
             streamResp.data.on('end', async () => {
+                activeStreams.delete(streamKey);
                 res.write('data: [DONE]\n\n');
                 res.end();
-                await logUsage(req.userId, 'chat', { model, provider: 'mistral', tokens: totalContent.length });
+                // Save partial response even on disconnect
+                if (totalContent.length > 0) {
+                    try {
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'mistral', tokens: totalContent.length });
+                        await saveResponse(totalContent, {}, modelId, 'mistral');
+                    } catch (e) {
+                        console.error('[Chat] Mistral save failed:', e.message);
+                    }
+                }
             });
 
             streamResp.data.on('error', () => {
+                activeStreams.delete(streamKey);
                 res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
                 res.end();
             });
@@ -452,7 +859,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
             }
 
-            const chatMsgs = normalizeMessages(messages);
+            const chatMsgs = normalizeMessages(context);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -465,7 +872,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 streamResp = await axios.post(
                     'https://api.groq.com/openai/v1/chat/completions',
                     {
-                        model,
+                        model: apiModel,
                         messages: chatMsgs,
                         temperature: Math.min(Math.max(0, temperature), 2),
                         max_tokens: safeMax,
@@ -479,27 +886,31 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         },
                         responseType: 'stream',
                         timeout: 60000,
+                        signal, // Use global signal
                     }
                 );
             } catch (err) {
+                if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+                    console.log('[Groq] Stream aborted by client.');
+                    return;
+                }
                 console.error('Groq hiba:', err.response?.data || err.message);
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
 
-            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
-            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
-            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
-            req.on('close', () => {
-                if (!res.writableEnded) {
-                    streamResp.data.destroy();
-                }
+            let clientConnected = true;
+            req.on('close', () => { 
+                clientConnected = false; 
+                if (!res.writableEnded) streamResp.data.destroy(); 
+                saveResponse(totalContent, {}, modelId, 'groq').catch(e => console.error('[Chat] Groq abort-save failed:', e.message));
             });
 
             let totalContent = '';
             let buf = '';
 
             streamResp.data.on('data', (chunk) => {
+                if (!clientConnected) return;
                 buf += chunk.toString('utf8');
                 const lines = buf.split('\n');
                 buf = lines.pop();
@@ -511,7 +922,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     try {
                         const parsed = JSON.parse(raw);
                         const delta = parsed.choices?.[0]?.delta?.content || '';
-                        if (delta) {
+                        if (delta && clientConnected) {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
@@ -520,12 +931,22 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             });
 
             streamResp.data.on('end', async () => {
+                activeStreams.delete(streamKey);
                 res.write('data: [DONE]\n\n');
                 res.end();
-                await logUsage(req.userId, 'chat', { model, provider: 'groq', tokens: totalContent.length });
+                // Save partial results even if client disconnected
+                if (totalContent.length > 0) {
+                    try {
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'groq', tokens: totalContent.length });
+                        await saveResponse(totalContent, {}, modelId, 'groq');
+                    } catch (e) {
+                        console.error('[Chat] Groq save failed:', e.message);
+                    }
+                }
             });
 
             streamResp.data.on('error', (err) => {
+                activeStreams.delete(streamKey);
                 res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
                 res.end();
             });
@@ -539,12 +960,13 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'GEMINI_API_KEY nincs beállítva' });
             }
 
-            const systemMsg = messages.find((m) => m.role === 'system');
-            const contents = messages
+            const normalized = normalizeMessages(context);
+            const systemMsg = normalized.find((m) => m.role === 'system');
+            const contents = normalized
                 .filter((m) => m.role !== 'system')
                 .map((m) => ({
                     role: m.role === 'assistant' ? 'model' : 'user',
-                    parts: [{ text: String(m.content) }],
+                    parts: [{ text: Array.isArray(m.content) ? JSON.stringify(m.content) : String(m.content) }],
                 }));
 
             res.setHeader('Content-Type', 'text/event-stream');
@@ -556,7 +978,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             let streamResp;
             try {
                 streamResp = await axios.post(
-                    `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
+                    `https://generativelanguage.googleapis.com/v1beta/models/${apiModel}:streamGenerateContent?alt=sse`,
                     {
                         contents,
                         ...(systemMsg ? {
@@ -575,27 +997,31 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         },
                         responseType: 'stream',
                         timeout: 60000,
+                        signal, // Use global signal
                     }
                 );
             } catch (err) {
+                if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+                    console.log('[Gemini] Stream aborted by client.');
+                    return;
+                }
                 console.error('Gemini kapcsolódási hiba:', err.message);
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
 
-            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
-            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
-            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
-            req.on('close', () => {
-                if (!res.writableEnded) {
-                    streamResp.data.destroy();
-                }
+            let clientConnected = true;
+            let totalContent = '';
+            req.on('close', () => { 
+                clientConnected = false; 
+                if (!res.writableEnded) streamResp.data.destroy(); 
+                saveResponse(totalContent, {}, modelId, 'gemini').catch(e => console.error('[Chat] Gemini abort-save failed:', e.message));
             });
 
-            let totalContent = '';
             let buf = '';
 
             streamResp.data.on('data', (chunk) => {
+                if (!clientConnected) return;
                 buf += chunk.toString('utf8');
                 const lines = buf.split('\n');
                 buf = lines.pop();
@@ -606,7 +1032,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     try {
                         const parsed = JSON.parse(raw);
                         const delta = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
-                        if (delta) {
+                        if (delta && clientConnected) {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
@@ -617,7 +1043,15 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             streamResp.data.on('end', async () => {
                 res.write('data: [DONE]\n\n');
                 res.end();
-                await logUsage(req.userId, 'chat', { model, provider: 'gemini', tokens: totalContent.length });
+                // Save partial results even if client disconnected
+                if (totalContent.length > 0) {
+                    try {
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'gemini', tokens: totalContent.length });
+                        await saveResponse(totalContent, {}, modelId, 'gemini');
+                    } catch (e) {
+                        console.error('[Chat] Gemini save failed:', e.message);
+                    }
+                }
             });
 
             streamResp.data.on('error', (err) => {
@@ -635,7 +1069,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
             }
 
-            const nvidiaMsgs = normalizeMessages(messages);
+            const nvidiaMsgs = normalizeMessages(context);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -648,7 +1082,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 streamResp = await axios.post(
                     'https://integrate.api.nvidia.com/v1/chat/completions',
                     {
-                        model,
+                        model: apiModel,
                         messages: nvidiaMsgs,
                         temperature: Math.min(Math.max(0, temperature), 2),
                         max_tokens: safeMax,
@@ -662,30 +1096,35 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         },
                         responseType: 'stream',
                         timeout: 300000,
+                        signal, // Use global signal
                     }
                 );
             } catch (err) {
+                if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+                    console.log('[NVIDIA] Stream aborted by client.');
+                    return;
+                }
                 console.error('NVIDIA kapcsolódási hiba:', err.message);
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
 
-            const keepAlive = setInterval(() => {
-                res.write(': ping\n\n');
-            }, 15000);
+            const keepAlive = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, 15000);
 
-            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
-            req.on('close', () => {
-                if (!res.writableEnded) {
-                    clearInterval(keepAlive);
-                    streamResp.data.destroy();
-                }
+            let clientConnected = true;
+            req.on('close', () => { 
+                clientConnected = false; 
+                clearInterval(keepAlive); 
+                if (!res.writableEnded) streamResp.data.destroy(); 
+                // Ensure partial save on disconnect
+                saveResponse(totalContent, {}, modelId, 'nvidia').catch(e => console.error('[Chat] NVIDIA abort-save failed:', e.message));
             });
 
             let totalContent = '';
             let buf = '';
 
             streamResp.data.on('data', (chunk) => {
+                if (!clientConnected) return;
                 buf += chunk.toString('utf8');
                 const lines = buf.split('\n');
                 buf = lines.pop();
@@ -697,7 +1136,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     try {
                         const parsed = JSON.parse(raw);
                         const delta = parsed.choices?.[0]?.delta?.content || '';
-                        if (delta) {
+                        if (delta && clientConnected) {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
@@ -706,13 +1145,22 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             });
 
             streamResp.data.on('end', async () => {
+                activeStreams.delete(streamKey);
                 clearInterval(keepAlive);
                 res.write('data: [DONE]\n\n');
                 res.end();
-                await logUsage(req.userId, 'chat', { model, provider: 'nvidia', tokens: totalContent.length });
+                if (totalContent.length > 0) {
+                    try {
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'nvidia', tokens: totalContent.length });
+                        await saveResponse(totalContent, {}, modelId, 'nvidia');
+                    } catch (e) {
+                        console.error('[Chat] NVIDIA save failed:', e.message);
+                    }
+                }
             });
 
             streamResp.data.on('error', (err) => {
+                activeStreams.delete(streamKey);
                 clearInterval(keepAlive);
                 console.error('NVIDIA stream hiba:', err.message);
                 res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
@@ -728,7 +1176,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'OPENROUTER_API_KEY nincs beállítva a .env-ben' });
             }
 
-            const chatMsgs = normalizeMessages(messages);
+            const chatMsgs = normalizeMessages(context);
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -741,7 +1189,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 streamResp = await axios.post(
                     'https://openrouter.ai/api/v1/chat/completions',
                     {
-                        model,
+                        model: apiModel,
                         messages: chatMsgs,
                         temperature: Math.min(Math.max(0, temperature), 2),
                         max_tokens: safeMax,
@@ -758,21 +1206,24 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         httpsAgent,
                         responseType: 'stream',
                         timeout: 120000,
+                        signal, // Use global signal
                     }
                 );
             } catch (err) {
+                if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+                    console.log('[OpenRouter] Stream aborted by client.');
+                    return;
+                }
                 console.error('OpenRouter kapcsolódási hiba:', err.message);
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
             }
 
-            // ── Ha a kliens IDŐ ELŐTT bontja a kapcsolatot (abort), leállítjuk az upstream stremet ──
-            // res.writableEnded ellenőrzés: ha a válasz már befejeződött normálisan,
-            // NE destroyoljuk — csak valódi megszakításkor avatkozunk be
-            req.on('close', () => {
-                if (!res.writableEnded) {
-                    streamResp.data.destroy();
-                }
+            let clientConnected = true;
+            req.on('close', () => { 
+                clientConnected = false; 
+                if (!res.writableEnded) streamResp.data.destroy(); 
+                saveResponse(totalContent, {}, modelId, 'openrouter').catch(e => console.error('[Chat] OpenRouter abort-save failed:', e.message));
             });
 
             let totalContent = '';
@@ -791,7 +1242,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     try {
                         const parsed = JSON.parse(raw);
                         const delta = parsed.choices?.[0]?.delta?.content || '';
-                        if (delta) {
+                        if (delta && clientConnected) {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
@@ -800,21 +1251,27 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             });
 
             streamResp.data.on('end', async () => {
+                activeStreams.delete(streamKey);
                 res.write('data: [DONE]\n\n');
                 res.end();
-                await logUsage(req.userId, 'chat', { model, provider: 'openrouter', tokens: totalContent.length });
+                if (totalContent.length > 0) {
+                    try {
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'openrouter', tokens: totalContent.length });
+                        await saveResponse(totalContent, {}, modelId, 'openrouter');
+                    } catch (e) {
+                        console.error('[Chat] OpenRouter save failed:', e.message);
+                    }
+                }
             });
 
             streamResp.data.on('error', (err) => {
+                activeStreams.delete(streamKey);
                 console.error('OpenRouter stream hiba:', err.message);
                 res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
                 res.end();
             });
 
-            return;
-        }
-
-        else {
+        } else {
             return res.status(400).json({ success: false, message: `Ismeretlen provider: ${provider}` });
         }
 
@@ -828,6 +1285,74 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     : err?.message || 'Chat hiba',
             });
         }
+    }
+});
+
+// ── FINALIZE — Sync visible text and update tokens ─────
+router.post('/chat/finalize', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { sessionId, messageId, content } = req.body;
+        const userId = req.userId;
+
+        if (!sessionId || !messageId) {
+            return res.status(400).json({ success: false, message: 'Hiányzó adatok' });
+        }
+
+        const adminDb = admin.firestore();
+        const msgRef = adminDb
+            .collection('conversations')
+            .doc(userId)
+            .collection('sessions')
+            .doc(sessionId)
+            .collection('messages')
+            .doc(messageId);
+
+        // Calculate approximate tokens based on the verified visible length
+        const charCount = content?.length || 0;
+        const estimatedTokens = Math.ceil(charCount / 4);
+
+        await msgRef.set({
+            content: content || "",
+            usage: {
+                output_tokens: estimatedTokens,
+                total_tokens: estimatedTokens
+            },
+            finalizedByFrontend: true,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        // Also update session summary state if needed (optional)
+        return res.json({ success: true, message: 'Üzenet szinkronizálva' });
+    } catch (err) {
+        console.error('❌ Finalize error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ── STOP — Safe termination of the upstream AI stream ──
+router.post('/chat/stop', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { sessionId } = req.body;
+        const userId = req.userId;
+
+        if (!sessionId) {
+            return res.status(400).json({ success: false, message: 'Hiányzó sessionId' });
+        }
+
+        const streamKey = `${userId}:${sessionId}`;
+        const controller = activeStreams.get(streamKey);
+
+        if (controller) {
+            console.log(`[Chat] Stop requested for session ${sessionId}. Aborting upstream...`);
+            controller.abort();
+            activeStreams.delete(streamKey);
+            return res.json({ success: true, message: 'Adatfolyam leállítva' });
+        } else {
+            return res.json({ success: true, message: 'Nincs aktív adatfolyam' });
+        }
+    } catch (err) {
+        console.error('❌ Stop error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
     }
 });
 
@@ -861,7 +1386,7 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
         const safeMax = Math.min(Math.max(128, max_tokens), 1024);
 
-        const chatMsgs = normalizeMessages(messages);
+        const chatMsgs = normalizeMessages(optimizedMessages);
 
 
         let resp;
@@ -2470,6 +2995,204 @@ router.get('/meshy/history', verifyFirebaseToken, async (req, res) => {
     console.error('Meshy history error:', err.message);
     return res.status(500).json({ success: false, message: 'Előzmény lekérdezési hiba' });
   }
+});
+
+// ════════════════════════════════════════════════════
+// 2.  SUMMARY  —  POST /api/chat/summary
+// ════════════════════════════════════════════════════
+router.post('/chat/summary', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { sessionId, messages, modelId } = req.body;
+
+        if (!sessionId || !Array.isArray(messages) || messages.length === 0) {
+            return res.status(400).json({ success: false, message: 'Hiányzó sessionId vagy üzenetek' });
+        }
+
+        const summaryPrompt = `Summarize this conversation in a structured format.
+Detect the language used and include it in the summary.
+Format:
+Topic: <main topic>
+Key facts established: <facts/decisions>
+User preferences: <preferences>
+Open questions: <unresolved questions>
+Language: <detected language>
+
+Keep it under 200 tokens. Be concise but capture all important context.`;
+
+        const summaryMessages = [
+            { role: 'system', content: summaryPrompt },
+            ...messages
+                .slice(-30)
+                .map(m => ({ role: m.role, content: String(m.content).slice(0, 2000) })),
+        ];
+
+        const resp = await axios.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            {
+                model: 'openai/gpt-oss-120b',
+                messages: summaryMessages,
+                temperature: 0.3,
+                max_tokens: 300,
+                top_p: 0.9,
+                stream: false,
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+                timeout: 30000,
+            }
+        );
+
+        const summaryText = resp.data?.choices?.[0]?.message?.content || '';
+        if (!summaryText) {
+            return res.status(500).json({ success: false, message: 'Üres summary' });
+        }
+
+        const db = admin.firestore();
+        const batch = db.batch();
+
+        const summaryRef = db.collection('conversations')
+            .doc(req.userId)
+            .collection('sessions')
+            .doc(sessionId)
+            .collection(SUMMARY_COLLECTION)
+            .doc('latest');
+
+        batch.set(summaryRef, {
+            summaryText,
+            messageCountAtSummary: messages.length,
+            lastSummaryModelId: modelId || 'unknown',
+            language: 'auto',
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        const sessionRef = db.collection('conversations')
+            .doc(req.userId)
+            .collection('sessions')
+            .doc(sessionId);
+
+        batch.set(sessionRef, {
+            summaryGenerated: true,
+            lastSummaryAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        await batch.commit();
+        console.log(`[Summary] Generated for session ${sessionId.slice(0, 12)}... (${summaryText.length} chars)`);
+
+        return res.json({ success: true, summaryText });
+    } catch (err) {
+        console.error('[Summary] Generation failed:', err.message);
+        return res.status(500).json({ success: false, message: 'Summary generation failed' });
+    }
+});
+
+// ════════════════════════════════════════════════════
+// 3.  SUMMARY GET  —  GET /api/chat/summary/:sessionId
+// ════════════════════════════════════════════════════
+router.get('/chat/summary/:sessionId', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+
+        const summaryDoc = await admin.firestore()
+            .collection('conversations')
+            .doc(req.userId)
+            .collection('sessions')
+            .doc(sessionId)
+            .collection(SUMMARY_COLLECTION)
+            .doc('latest')
+            .get();
+
+        if (!summaryDoc.exists) {
+            return res.json({ success: false, summary: null });
+        }
+
+        return res.json({ success: true, summary: summaryDoc.data() });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ════════════════════════════════════════════════════
+// 3.  SWITCH-MODEL  —  POST /api/chat/switch-model
+// ════════════════════════════════════════════════════
+router.post('/chat/switch-model', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { sessionId, newModelId } = req.body;
+
+        if (!sessionId || !newModelId) {
+            return res.status(400).json({ success: false, message: 'Hiányzó sessionId vagy newModelId' });
+        }
+
+        const db = admin.firestore();
+        const userId = req.userId;
+        const sessionRef = db.collection('conversations').doc(userId).collection('sessions').doc(sessionId);
+
+        // Load all messages for summary
+        const messagesRef = sessionRef.collection('messages');
+        const snap = await messagesRef.orderBy('timestamp', 'asc').limit(50).get();
+        const messages = snap.docs.map(d => ({ role: d.data().role, content: String(d.data().content).slice(0, 2000) }));
+
+        // Generate summary
+        const summaryPrompt = `Summarize this conversation in a structured format.
+Detect the language used and include it in the summary.
+Format:
+Topic: <main topic>
+Key facts established: <facts/decisions>
+User preferences: <preferences>
+Open questions: <unresolved questions>
+Language: <detected language>
+
+Keep it under 200 tokens. Be concise but capture all important context.`;
+
+        const summaryMessages = [
+            { role: 'system', content: summaryPrompt },
+            ...messages,
+        ];
+
+        const resp = await axios.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            {
+                model: 'openai/gpt-oss-120b',
+                messages: summaryMessages,
+                temperature: 0.3,
+                max_tokens: 500,
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                    'Content-Type': 'application/json',
+                },
+            }
+        );
+
+        const summaryText = resp.data.choices?.[0]?.message?.content || '';
+
+        // Resolve new model config
+        const modelConfig = getModelConfig(newModelId);
+        if (!modelConfig) {
+            return res.status(400).json({ success: false, message: `Ismeretlen modell: ${newModelId}` });
+        }
+
+        // Update session with new model and summary
+        await sessionRef.set({
+            modelId: newModelId,
+            modelName: modelConfig.apiModel,
+            summary: summaryText,
+            summaryGeneratedAt: admin.firestore.FieldValue.serverTimestamp(),
+            summaryMessageCount: messages.length,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        console.log(`[SwitchModel] Session ${sessionId} switched to ${newModelId}, summary generated (${messages.length} messages)`);
+
+        return res.json({ success: true, summary: summaryText });
+    } catch (e) {
+        console.error('Switch model error:', e);
+        return res.status(500).json({ success: false, message: e.message });
+    }
 });
 
 export default router;
