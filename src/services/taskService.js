@@ -226,23 +226,48 @@ class TaskService {
         if (!["glb", "fbx"].includes(fmt))
           throw new Error("out_format must be glb or fbx");
         b["out_format"] = fmt;
-        const spec = b["spec"] ?? "mixamo";
+
+        // Default to "tripo" spec (API preferred)
+        const spec = b["spec"] ?? "tripo";
         if (!["mixamo", "tripo"].includes(spec))
           throw new Error("spec must be mixamo or tripo");
         b["spec"] = spec;
+
+        // Set rig_type if not provided
+        if (!b["rig_type"]) b["rig_type"] = "biped";
+        const validRigTypes = ["biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic"];
+        if (!validRigTypes.includes(b["rig_type"]))
+          throw new Error(`Invalid rig_type. Valid: ${validRigTypes.join(", ")}`);
+
+        // Add missing optional flags with proper defaults
+        if (b["bake_animation"] === undefined) b["bake_animation"] = true;
+        if (b["export_with_geometry"] === undefined) b["export_with_geometry"] = true;
+        if (b["animate_in_place"] === undefined) b["animate_in_place"] = false;
+
         break;
       }
 
       case "animate_retarget": {
         if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
+
         const fmt = b["out_format"] ?? "glb";
         if (!["glb", "fbx"].includes(fmt))
           throw new Error("out_format must be glb or fbx");
         b["out_format"] = fmt;
+
+        // Handle both animation (single) and animations (array) formats
+        // taskController már preset:biped:walk formátumra alakítja az értéket
         const animList = b["animations"] ?? (b["animation"] ? [b["animation"]] : []);
         if (animList.length === 0) throw new Error("animation or animations array required");
-        const invalid = animList.filter(a => !VALID_ANIMATIONS.has(a));
+
+        // Validate: preset: prefixes always pass, otherwise check VALID_ANIMATIONS
+        const invalid = animList.filter(a => {
+          if (a.startsWith("preset:")) return false;
+          return !VALID_ANIMATIONS.has(a);
+        });
         if (invalid.length) throw new Error(`Unknown animation(s): ${invalid.join(", ")}`);
+
+        // Normalize to API format: arrays > 1 item, single strings for 1 item
         if (animList.length > 1) {
           b["animations"] = animList;
           delete b["animation"];
@@ -250,6 +275,22 @@ class TaskService {
           b["animation"] = animList[0];
           delete b["animations"];
         }
+
+        // Add optional parameters with proper defaults
+        if (b["bake_animation"] === undefined) b["bake_animation"] = true;
+        if (b["export_with_geometry"] === undefined) b["export_with_geometry"] = true;
+        if (b["animate_in_place"] === undefined) b["animate_in_place"] = false;
+
+        console.log(`[TaskService] animate_retarget validated:`, {
+          original_model_task_id: b["original_model_task_id"],
+          animation: b["animation"],
+          animations: b["animations"],
+          out_format: b["out_format"],
+          bake_animation: b["bake_animation"],
+          export_with_geometry: b["export_with_geometry"],
+          animate_in_place: b["animate_in_place"],
+        });
+
         break;
       }
 
@@ -340,4 +381,4 @@ class TaskService {
   }
 }
 
-export const taskService = new TaskService();
+export const taskService = new TaskService();

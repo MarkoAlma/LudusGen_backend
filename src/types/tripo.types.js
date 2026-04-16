@@ -249,3 +249,27 @@ export const TASK_STATUSES_SET           = new Set(TASK_STATUSES);
  * @property {Object|null} rawOutput
  * @property {number} durationMs
  */
+/**
+ * @typedef {Object} AnimateRetargetRequest
+ * @property {"animate_retarget"} type
+ * @property {string} original_model_task_id
+ * @property {string} [animation] - Single animation (e.g., "preset:idle")
+ * @property {string[]} [animations] - Multiple animations
+ * @property {"glb"|"fbx"} [out_format="glb"]
+ * @property {boolean} [bake_animation=true]
+ * @property {boolean} [export_with_geometry=true]
+ * @property {boolean} [animate_in_place=false]
+ */
+
+/**
+ * @typedef {Object} AnimateRigRequest
+ * @property {"animate_rig"} type
+ * @property {string} original_model_task_id
+ * @property {string} [spec="tripo"] - "tripo" or "mixamo"
+ * @property {"glb"|"fbx"} [out_format="glb"]
+ * @property {"biped"|"quadruped"|"hexapod"|"octopod"|"avian"|"serpentine"|"aquatic"} [rig_type="biped"]
+ * @property {string} [model_version] - Rigging model version
+ * @property {boolean} [bake_animation=true]
+ * @property {boolean} [export_with_geometry=true]
+ * @property {boolean} [animate_in_place=false]
+ */

@@ -23,8 +23,8 @@ export class TripoClient {
   constructor(apiKey, baseUrl, timeoutMs) {
     const key = apiKey ?? process.env.TRIPO3D_API_KEY;
     if (!key) throw new Error("TRIPO3D_API_KEY is not configured");
-    this.apiKey    = key;
-    this.baseUrl   = baseUrl   ?? TRIPO_BASE_URL;
+    this.apiKey = key;
+    this.baseUrl = baseUrl ?? TRIPO_BASE_URL;
     this.timeoutMs = timeoutMs ?? DEFAULT_TIMEOUT;
   }
 
@@ -41,7 +41,7 @@ export class TripoClient {
 
     for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
       const controller = new AbortController();
-      const timer      = setTimeout(() => controller.abort(), this.timeoutMs);
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
       try {
         const res = await fetch(url, { ...options, headers, signal: controller.signal });
@@ -49,7 +49,7 @@ export class TripoClient {
 
         // 429 — rate limited
         if (res.status === 429) {
-          const ra  = res.headers.get("Retry-After");
+          const ra = res.headers.get("Retry-After");
           const delay = ra ? parseInt(ra, 10) * 1000 : backoffDelay(attempt);
           console.warn(`[TripoClient] 429 rate limited, retry ${attempt + 1} in ${delay}ms`);
           await sleep(delay);
@@ -113,9 +113,24 @@ export class TripoClient {
 
   /* ── Task operations ──────────────────────────────────────────── */
   async createTask(taskBody, idempotencyKey) {
-    console.log("[TripoClient] createTask body:", JSON.stringify(taskBody, null, 2)); // ← ADD IDE
- 
-    const res    = await this.post("/task", taskBody, idempotencyKey);
+    console.log("[TripoClient] createTask body:", JSON.stringify(taskBody, null, 2));
+
+    // Extra logging for animate tasks to help debugging
+    if (taskBody.type?.startsWith("animate_")) {
+      console.log(`[TripoClient] ${taskBody.type} request details:`, {
+        original_model_task_id: taskBody.original_model_task_id,
+        animation: taskBody.animation,
+        animations: taskBody.animations,
+        rig_type: taskBody.rig_type,
+        out_format: taskBody.out_format,
+        spec: taskBody.spec,
+        bake_animation: taskBody.bake_animation,
+        export_with_geometry: taskBody.export_with_geometry,
+        animate_in_place: taskBody.animate_in_place,
+      });
+    }
+
+    const res = await this.post("/task", taskBody, idempotencyKey);
     const taskId = res.data?.task_id;
     if (!taskId) throw new Error(`No task_id in response: ${JSON.stringify(res).slice(0, 200)}`);
     return taskId;
@@ -127,20 +142,20 @@ export class TripoClient {
     return res.data;
   }
 
-async cancelTask(taskId) {
-  // Tripo API does not support task cancellation.
-  // We only stop polling on the frontend side.
-  console.log(`[TripoClient] cancel requested for ${taskId} — no-op (Tripo has no cancel endpoint)`);
-  return { success: true, cancelled: false };
-}
+  async cancelTask(taskId) {
+    // Tripo API does not support task cancellation.
+    // We only stop polling on the frontend side.
+    console.log(`[TripoClient] cancel requested for ${taskId} — no-op (Tripo has no cancel endpoint)`);
+    return { success: true, cancelled: false };
+  }
 
   async listTasks({ status, limit = 20, cursor } = {}) {
     const qs = new URLSearchParams();
     if (status) qs.set("status", status);
-    if (limit)  qs.set("limit",  String(limit));
+    if (limit) qs.set("limit", String(limit));
     if (cursor) qs.set("cursor", cursor);
     const path = `/tasks${qs.toString() ? "?" + qs : ""}`;
-    const res  = await this.get(path);
+    const res = await this.get(path);
     return res.data ?? { tasks: [], total: 0 };
   }
 
@@ -153,7 +168,7 @@ async cancelTask(taskId) {
     const { Blob } = await import("buffer");
     const form = new FormData();
     form.append("file", new Blob([buffer], { type: mimeType }), filename);
-    const res   = await this.postForm("/upload", form);
+    const res = await this.postForm("/upload", form);
     const token = res.data?.image_token;
     if (!token) throw new Error("No image_token in upload response");
     return token;
@@ -166,7 +181,7 @@ async cancelTask(taskId) {
    */
   async pollTask(taskId, opts = {}) {
     const interval = opts.pollIntervalMs ?? POLL_INTERVAL;
-    const maxMs    = opts.maxMs ?? MAX_POLL_MS;
+    const maxMs = opts.maxMs ?? MAX_POLL_MS;
     const deadline = Date.now() + maxMs;
 
     while (Date.now() < deadline) {
@@ -176,25 +191,27 @@ async cancelTask(taskId) {
       if (task.status === "success") {
         const out = task.output ?? {};
         return {
-          success:        true,
-          status:         "success",
-          progress:       100,
+          success: true,
+          status: "success",
+          progress: 100,
           // FIX: converted_model, stylized_model, segmented_model, textured_model,
           //        refined_model hozzáadva — history cardban megjelenik
-          modelUrl:       out.pbr_model ?? out.textured_model ?? out.model
-                          ?? out.base_model ?? out.rigged_model ?? out.animated_model
-                          ?? out.converted_model ?? out.low_poly_model
-                          ?? out.segmented_model
-                          ?? out.stylized_model ?? out.refined_model ?? null,
-          outputFormat:   out.format ?? null,
+          modelUrl: out.pbr_model ?? out.textured_model ?? out.model
+            ?? out.base_model ?? out.rigged_model ?? out.animated_model
+            ?? out.converted_model ?? out.low_poly_model
+            ?? out.segmented_model
+            ?? out.stylized_model ?? out.refined_model ?? null,
+          outputFormat: out.format ?? null,
           rigCheckResult: out.is_animatable ?? null,
-          rawOutput:      out,
+          rawOutput: out,
         };
       }
 
       if (task.status === "failed" || task.status === "cancelled") {
-        return { success: false, status: task.status, progress: task.progress ?? 0,
-                 modelUrl: null, rigCheckResult: null, rawOutput: null };
+        return {
+          success: false, status: task.status, progress: task.progress ?? 0,
+          modelUrl: null, rigCheckResult: null, rawOutput: null
+        };
       }
 
       await sleep(interval);
