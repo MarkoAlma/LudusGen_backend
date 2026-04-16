@@ -2,15 +2,16 @@
 import { taskService } from "../services/taskService.js";
 import { getTripoClient } from "../lib/tripoClient.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
-import { estimateCost, CREDIT_COSTS } from "../lib/creditEstimator.js";
+import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
-import { deductCredits, refundCredits } from "../services/creditService.js";
-import { registerTask as registerForRecovery } from "../services/taskRecoveryService.js";
+import { deductCredits, refundCredits, linkTaskIdToTransaction } from "../services/creditService.js";
+import { registerTask as registerForRecovery, unregisterTask } from "../services/taskRecoveryService.js";
 import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
+const HISTORY_COLLECTION = "trellis_history";
 
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
 export async function createTask(req, res) {
@@ -25,8 +26,9 @@ export async function createTask(req, res) {
     const { total: estimatedCost } = estimateCost(body);
     console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"} cost=${estimatedCost}`);
 
-    // Check Tripo server balance BEFORE local deduction to avoid deduct-then-refund
+    let tempTxId = null;
     if (estimatedCost > 0 && userId) {
+      tempTxId = `pending_${type}_${Date.now()}`;
       try {
         const tripoBalance = await getTripoClient().getBalance();
         const availableTripo = tripoBalance.balance ?? 0;
@@ -40,11 +42,10 @@ export async function createTask(req, res) {
         }
       } catch (balanceErr) {
         console.error(`[TaskController] Tripo balance check error:`, balanceErr.message);
-        // Continue anyway — don't block generation for a balance check failure
       }
 
       try {
-        await deductCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, type);
+        await deductCredits(userId, estimatedCost, tempTxId, type);
       } catch (creditErr) {
         if (creditErr.code === "INSUFFICIENT_CREDITS") {
           return res.status(402).json({
@@ -54,6 +55,67 @@ export async function createTask(req, res) {
           });
         }
         console.error(`[TaskController] Credit deduction error:`, creditErr.message);
+      }
+    }
+
+    // ── Pre-Task Logic: Metadata Inheritance ──────────────────────────
+    let inheritedPrompt = body.prompt || null;
+    const parentTaskId = body.original_model_task_id || body.draft_model_task_id;
+
+    if (parentTaskId && userId) {
+      try {
+        const db = admin.firestore();
+        const snap = await db.collection(HISTORY_COLLECTION)
+          .where("taskId", "==", parentTaskId)
+          .limit(1)
+          .get();
+
+        if (!snap.empty) {
+          const parentData = snap.docs[0].data();
+          inheritedPrompt = parentData.prompt || null;
+          
+          // Special logic for animate_retarget/rig (Rig-aware presets)
+          if (type.startsWith("animate_")) {
+            const rigType = parentData.params?.rig_type || "biped";
+            const version = parentData.params?.model_version || "";
+            const isV1 = version.toLowerCase().startsWith("v1.") || version.includes("Turbo-v1.0");
+
+            const anim = body.animation || (body.animations && body.animations[0]);
+            if (anim && !body.preset) {
+              if (rigType === "biped" || rigType === "quadruped" || isV1) {
+                body.preset = `${rigType}:${anim}`;
+                console.log(`[TaskController] Formatted ${type} preset: ${body.preset} (ver=${version}, rig=${rigType})`);
+              } else {
+                body.preset = anim;
+              }
+              delete body.animation;
+              delete body.animations;
+            }
+          }
+          
+          // Refine source validation
+          if (type === "refine_model") {
+            const histType = parentData.params?.type;
+            const VALID_REFINE_SOURCES = new Set(["text_to_model", "image_to_model", "multiview_to_model"]);
+            if (histType && !VALID_REFINE_SOURCES.has(histType)) {
+              return res.status(400).json({
+                success: false,
+                message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható (kivéve: ${histType}).`,
+                code: "UNSUPPORTED_REFINE_SOURCE",
+              });
+            }
+          }
+        } else if (type === "animate_retarget") {
+          // Fallback for retarget if parent not in history
+          const anim = body.animation || (body.animations && body.animations[0]);
+          if (anim && !body.preset) {
+            body.preset = `biped:${anim}`;
+            delete body.animation;
+            delete body.animations;
+          }
+        }
+      } catch (err) {
+        console.warn(`[TaskController] Parent metadata lookup failed:`, err.message);
       }
     }
 
@@ -71,9 +133,18 @@ export async function createTask(req, res) {
         callbackUrl: callback_url,
         idempotencyKey: idempotency_key,
       });
-      // Register for background recovery — if user navigates away, the
-      // recovery service will poll and save to history automatically.
-      if (userId) registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL);
+
+      // Link real taskId to credit transaction for refunds
+      if (userId && tempTxId) {
+        linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e => 
+          console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
+        );
+      }
+
+      // Register for background recovery with inherited prompt
+      if (userId) {
+        registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt);
+      }
       res.json({ success: true, taskId });
     }
   } catch (err) {
@@ -116,6 +187,18 @@ export async function cancelTask(req, res) {
     // Már befejezett/failed task cancel kísérlete nem kritikus hiba
     // A frontend kezeli, 200-at küldünk vissza hogy ne logoljon hibát
     res.json({ success: false, message: err.message });
+  }
+}
+
+/* ─── Task: acknowledge (stop background poll) ────────────────────────── */
+export async function acknowledgeTask(req, res) {
+  try {
+    const { taskId } = req.params;
+    if (!taskId) return res.status(400).json({ success: false, message: "taskId required" });
+    unregisterTask(taskId);
+    res.json({ success: true, unregistered: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 }
 
@@ -177,12 +260,16 @@ export async function uploadFile(req, res) {
 
 /* ─── Model proxy ─────────────────────────────────────────────────────── */
 
-// In-memory cache for Tripo model binaries.  Pre-signed URLs expire after
-// a few hours, so we cache the fetched blob keyed by taskId.  This lets
-// history-card thumbnails work even after the original URL has expired.
-// Entries are evicted after 6 hours (TTL).
+// pre-signed URLs expire after a few hours, so we cache the fetched blob
+// keyed by taskId. Entries are evicted after 6 hours (TTL).
 const MODEL_CACHE = new Map();
 const MODEL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+// Track tasks that Tripo reports as 404 (deleted/expired).
+// We cache these for 1 hour to avoid repeated expensive refresh attempts
+// for "dead" models.
+const REFRESH_FAILURE_CACHE = new Map();
+const REFRESH_FAILURE_TTL_MS = 1 * 60 * 60 * 1000;
 
 // Periodic cleanup of stale cache entries (every 30 min)
 let _cacheCleanupTimer = null;
@@ -190,14 +277,23 @@ function startCacheCleanup() {
   if (_cacheCleanupTimer) return;
   _cacheCleanupTimer = setInterval(() => {
     const now = Date.now();
-    let cleaned = 0;
+    let cleanedModel = 0;
     for (const [key, entry] of MODEL_CACHE.entries()) {
       if (now - entry.cachedAt > MODEL_CACHE_TTL_MS) {
         MODEL_CACHE.delete(key);
-        cleaned++;
+        cleanedModel++;
       }
     }
-    if (cleaned > 0) console.log(`[TaskController] model cache cleanup: removed ${cleaned} stale entries`);
+    let cleanedFailure = 0;
+    for (const [key, timestamp] of REFRESH_FAILURE_CACHE.entries()) {
+      if (now - timestamp > REFRESH_FAILURE_TTL_MS) {
+        REFRESH_FAILURE_CACHE.delete(key);
+        cleanedFailure++;
+      }
+    }
+    if (cleanedModel > 0 || cleanedFailure > 0) {
+      console.log(`[TaskController] cache cleanup: removed ${cleanedModel} models, ${cleanedFailure} dead marks`);
+    }
   }, 30 * 60 * 1000);
   _cacheCleanupTimer.unref?.();
 }
@@ -257,7 +353,6 @@ export async function modelProxy(req, res) {
     if (taskIdParam && MODEL_CACHE.has(taskIdParam)) {
       const entry = MODEL_CACHE.get(taskIdParam);
       if (Date.now() - entry.cachedAt < MODEL_CACHE_TTL_MS) {
-        console.log(`[TaskController] modelProxy: cache hit for ${taskIdParam}`);
         res.setHeader("Content-Type", entry.contentType);
         res.setHeader("Content-Disposition", `attachment; filename="model.${entry.ext}"`);
         res.setHeader("Content-Length", entry.buffer.length);
@@ -271,31 +366,87 @@ export async function modelProxy(req, res) {
     // ── Fetch from upstream ────────────────────────────────────────────
     let { error, upstream, message } = await performFetch(url);
 
-    // If upstream returns 401/403/502, try to refresh URL via taskId
-    if (error && [401, 403, 502].includes(error)) {
-      const taskIdMatch = url.match(/tripo_(?:pbr|base|rigged|animated)_model_([a-f0-9-]{36})/i);
+    // If upstream returns 401/403/410/502, try to refresh URL via taskId
+    if (error && [401, 403, 410, 502].includes(error)) {
+      const taskIdSource = taskIdMatch ? "url_regex" : (taskIdParam ? "query_param" : "none");
       const taskId = taskIdMatch ? taskIdMatch[1] : (taskIdParam || null);
 
       if (taskId) {
+        console.log(`[TaskController] modelProxy: Upstream ${error} for task ${taskId} (source: ${taskIdSource})`);
+        // Check if we already know this task is dead
+        if (REFRESH_FAILURE_CACHE.has(taskId)) {
+          console.log(`[TaskController] modelProxy: skipping refresh for known dead task ${taskId}`);
+          res.status(410).json({ success: false, message: "Task expired or deleted from source", code: "TASK_NOT_FOUND" });
+          return;
+        }
+
         console.log(`[TaskController] modelProxy: URL expired (Upstream ${error}), refreshing task ${taskId}...`);
         try {
           const freshData = await taskService.get(taskId);
-          if (freshData.success && freshData.modelUrl && freshData.modelUrl !== url) {
-            console.log(`[TaskController] modelProxy: refresh successful, retrying with new URL`);
-            url = freshData.modelUrl;
-            const retry = await performFetch(url);
-            error = retry.error;
-            upstream = retry.upstream;
-            message = retry.message;
+          if (freshData.success && freshData.modelUrl) {
+            if (freshData.modelUrl !== url) {
+              console.log(`[TaskController] modelProxy: refresh successful, retrying with new URL`);
+              url = freshData.modelUrl;
+              const retry = await performFetch(url);
+              error = retry.error;
+              upstream = retry.upstream;
+              message = retry.message;
+            } else {
+              console.warn(`[TaskController] modelProxy: refresh returned same URL for ${taskId}. Item is likely dead.`);
+              error = 410; // Treat as gone since it didn't refresh
+              message = "Tripo API returned same expired URL";
+            }
           }
         } catch (refreshErr) {
-          console.error(`[TaskController] Refresh failed for ${taskId}:`, refreshErr.message);
+          console.error(`[TaskController] Refresh attempt failed for ${taskId}:`, refreshErr.message);
+          
+          // If Tripo says 404 (Not Found), mark it as dead
+          if (refreshErr.message?.includes("404") || refreshErr.message?.includes("2001")) {
+            REFRESH_FAILURE_CACHE.set(taskId, Date.now());
+            
+            // Attempt to update status in Firestore so client stops asking
+            (async () => {
+              try {
+                const db = admin.firestore();
+                // 1. Try taskId matches
+                const taskSnap = await db.collection(HISTORY_COLLECTION)
+                  .where("taskId", "==", taskId)
+                  .get();
+                
+                // 2. Try model_url matches (important for old records missing taskId field)
+                const urlSnap = await db.collection(HISTORY_COLLECTION)
+                  .where("model_url", "==", url)
+                  .get();
+
+                const allDocs = [...taskSnap.docs, ...urlSnap.docs];
+                const uniqueDocs = Array.from(new Map(allDocs.map(d => [d.id, d])).values());
+
+                if (uniqueDocs.length > 0) {
+                  const batch = db.batch();
+                  uniqueDocs.forEach(doc => {
+                    batch.update(doc.ref, {
+                      status: "failed",
+                      error: "Task expired on Tripo platform (Source deleted)"
+                    });
+                  });
+                  await batch.commit();
+                  console.log(`[TaskController] Marked ${uniqueDocs.length} documents as failed for taskId ${taskId}`);
+                }
+              } catch (fsErr) {
+                console.warn(`[TaskController] Firestore batch update failed:`, fsErr.message);
+              }
+            })();
+
+            res.status(410).json({ success: false, message: "Model no longer exists on Tripo", code: "TASK_NOT_FOUND" });
+            return;
+          }
         }
       }
     }
 
     if (error) {
-      res.status(502).json({ success: false, message: message || `Upstream ${error}` });
+      const finalStatus = [401, 403, 404, 410].includes(error) ? error : 502;
+      res.status(finalStatus).json({ success: false, message: message || `Upstream ${error}`, code: error === 410 ? "TASK_EXPIRED" : "UPSTREAM_ERROR" });
       return;
     }
 
@@ -450,8 +601,6 @@ export async function getModelCapabilities(req, res) {
 }
 
 /* ─── History management ──────────────────────────────────────────────────── */
-
-const HISTORY_COLLECTION = "trellis_history";
 
 /**
  * DELETE /api/tripo/history/:id

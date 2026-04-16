@@ -126,7 +126,7 @@ class TaskService {
           }
           if (!b["texture"] && !b["pbr"]) delete b["texture_quality"];
           if (!b["texture"]) delete b["texture"];
-          if (!b["pbr"])     delete b["pbr"];
+          if (!b["pbr"]) delete b["pbr"];
           break; // P1 validáció kész, többi szabály nem vonatkozik rá
         }
 
@@ -136,6 +136,13 @@ class TaskService {
           if (body.type === "text_to_model" && !p?.trim())
             throw new Error("prompt is required for text_to_model");
           if (p && p.length > 1000) throw new Error("prompt max 1000 characters");
+        }
+
+        // negative_prompt length — Tripo API max 255 characters
+        const np = b["negative_prompt"];
+        if (np && np.length > 255) {
+          b["negative_prompt"] = np.slice(0, 255);
+          console.warn(`[TaskService] negative_prompt truncated to 255 chars (was ${np.length})`);
         }
 
         // generate_parts constraints
@@ -300,7 +307,10 @@ class TaskService {
   /* ── Convert raw task to PollResult ──────────────────────────────── */
   taskToPollResult(task) {
     const out = task.output ?? {};
-    // DEBUG: log output fields for convert_model, smart_low_poly, stylize_model to identify the correct field name
+    // DEBUG: log prerigcheck output to identify the actual field name
+    if (task.type === "animate_prerigcheck") {
+      console.log(`[TaskService] prerigcheck raw task output:`, JSON.stringify(out, null, 2));
+    }
     if (task.type === "convert_model" || task.type === "smart_low_poly" || task.type === "stylize_model") {
       console.log(`[TaskService] taskToPollResult type=${task.type} output keys:`, JSON.stringify(out, null, 2));
     }
@@ -309,22 +319,25 @@ class TaskService {
       status: task.status,
       progress: task.progress ?? 0,
       modelUrl:
-        out.model ??
         out.pbr_model ??
+        out.textured_model ??
+        out.model ??
+        out.model_url ??
         out.base_model ??
         out.rigged_model ??
         out.animated_model ??
         out.converted_model ??
         out.low_poly_model ??
         out.segmented_model ??
-        out.textured_model ??
         out.stylized_model ??
         out.refined_model ??
         null,
-      rigCheckResult: out.is_animatable ?? null,
+      rigCheckResult: out.is_animatable ?? out.animatable ?? out.riggable ?? out.rig_check_result ?? null,
+      rigType: out.rig_type ?? out.topology ?? null,
+      topology: out.topology ?? null,
       rawOutput: out,
     };
   }
 }
 
-export const taskService = new TaskService();
+export const taskService = new TaskService();
