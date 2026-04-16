@@ -110,11 +110,14 @@ export async function createTask(req, res) {
             }
           }
         } else if (type === "animate_retarget") {
-          // Fallback for retarget if parent not in history
-          const anim = body.animation || (body.animations && body.animations[0]);
-          if (anim && !anim.startsWith("preset:")) {
-            body.animation = `preset:biped:${anim}`;
-            delete body.animations;
+          const defaultRigType = "biped";
+          if (body.animations?.length > 0) {
+            body.animations = body.animations.map(a =>
+              a.startsWith("preset:") ? a : `preset:${defaultRigType}:${a}`
+            );
+            delete body.animation;
+          } else if (body.animation && !body.animation.startsWith("preset:")) {
+            body.animation = `preset:${defaultRigType}:${body.animation}`;
           }
         }
       } catch (err) {
