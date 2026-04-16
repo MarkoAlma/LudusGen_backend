@@ -196,8 +196,9 @@ export class TripoClient {
           progress: 100,
           // FIX: converted_model, stylized_model, segmented_model, textured_model,
           //        refined_model hozzáadva — history cardban megjelenik
-          modelUrl: out.pbr_model ?? out.textured_model ?? out.model
-            ?? out.base_model ?? out.rigged_model ?? out.animated_model
+modelUrl: out.pbr_model ?? out.textured_model ?? out.model
+  ?? out.base_model ?? out.rigged_model
+  ?? (Array.isArray(out.animated_models) ? out.animated_models[0] : out.animated_model)
             ?? out.converted_model ?? out.low_poly_model
             ?? out.segmented_model
             ?? out.stylized_model ?? out.refined_model ?? null,

@@ -136,8 +136,11 @@ async function saveToHistory(entry, taskData) {
     return;
   }
 
+  const animatedModels = Array.isArray(out.animated_models) && out.animated_models.length > 0
+    ? out.animated_models
+    : null;
   const modelUrl = out.model ?? out.model_url ?? out.pbr_model ?? out.base_model
-    ?? out.rigged_model ?? out.animated_model
+    ?? out.rigged_model ?? (animatedModels ? animatedModels[0] : out.animated_model)
     ?? out.converted_model ?? out.low_poly_model
     ?? out.stylized_model ?? null;
 
@@ -161,26 +164,33 @@ async function saveToHistory(entry, taskData) {
   const mode = TYPE_TO_MODE[entry.type] ?? "generate";
   const now = Date.now();
 
-  await db.collection(HISTORY_COLLECTION).add({
-    userId: entry.userId,
-    prompt: entry.prompt ?? taskData.prompt ?? entry.type,
-    status: "succeeded",
-    model_url: modelUrl,
-    source: "tripo",
-    mode,
-    taskId: entry.taskId,
-    params: {
-      model_version: entry.modelVersion,
+  const urlsToSave = animatedModels ?? [modelUrl];
+  for (let i = 0; i < urlsToSave.length; i++) {
+    const url = urlsToSave[i];
+    if (!url) continue;
+    await db.collection(HISTORY_COLLECTION).add({
+      userId: entry.userId,
+      prompt: entry.prompt ?? taskData.prompt ?? entry.type,
+      status: "succeeded",
+      model_url: url,
+      source: "tripo",
       mode,
-      type: entry.type,
-      rig_type: out.rig_type ?? out.topology ?? null,
-      topology: out.topology ?? null,
-      is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,
-    },
-    ts: now,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    expiresAt: now + HISTORY_TTL_MS,
-  });
+      taskId: entry.taskId,
+      animationIndex: (urlsToSave.length > 1 && { animationIndex: i }),
+      params: {
+        model_version: entry.modelVersion,
+        mode,
+        type: entry.type,
+        rig_type: out.rig_type ?? out.topology ?? null,
+        topology: out.topology ?? null,
+        is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,
+      },
+      ts: now,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: now + HISTORY_TTL_MS,
+    });
+  }
+  console.log(`[TaskRecovery] Saved ${urlsToSave.length} model(s) for task ${entry.taskId} to history for user ${entry.userId}`);
 
   console.log(`[TaskRecovery] Saved task ${entry.taskId} to history for user ${entry.userId}`);
 }
