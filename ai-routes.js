@@ -19,8 +19,13 @@ import sharp from 'sharp';
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
-// ── contextBuilder import ELTÁVOLÍTVA — buildOptimizedMessages helyi függvény ──
-// RÉGI: import { buildContext, trimToContextLimit, RECENT_MESSAGE_COUNT } from './src/lib/contextBuilder.js';
+import {
+    buildContext,
+    getMessagesForSummary,
+    RECENT_MESSAGE_WINDOW,
+    SUMMARY_TRIGGER_COUNT,
+    trimToContextLimit,
+} from './src/lib/contextBuilder.js';
 
 import { existsSync, writeFileSync, unlinkSync } from 'fs';
 
@@ -159,12 +164,41 @@ const genLimiter = rateLimit({
     message: { success: false, message: 'Túl sok generálás – próbáld újra 1 óra múlva' },
 });
 
+// ── Token Usage Logger (Precise) ─────────────────────────────────────────────
+function printTokenUsage(provider, model, usage) {
+    const p = provider.toUpperCase().padEnd(10);
+    const m = model.padEnd(25);
+    
+    // Alap mezők
+    const inT = (usage.prompt_tokens || usage.input_tokens || 0);
+    const outT = (usage.completion_tokens || usage.output_tokens || 0);
+    
+    // Ha az API adott total-t, azt tekintjük alapnak
+    const totalT = (usage.total_tokens || (inT + outT));
+    
+    // Kiszámoljuk az eltérést (pl. cache kért tartalom)
+    const extraT = Math.max(0, totalT - (inT + outT));
+
+    const sIn = String(inT).padStart(6);
+    const sOut = String(outT).padStart(6);
+    const sExtra = extraT > 0 ? `| EXTRA: \x1b[36m${String(extraT).padStart(6)}\x1b[0m ` : "".padEnd(0);
+    const sTotal = String(totalT).padStart(7);
+
+    console.log(`\x1b[32m[USAGE]\x1b[0m \x1b[1m${p}\x1b[0m | \x1b[36m${m}\x1b[0m | IN: \x1b[33m${sIn}\x1b[0m | OUT: \x1b[33m${sOut}\x1b[0m ${sExtra}| TOTAL: \x1b[35m${sTotal}\x1b[0m`);
+}
+
 // ── Firestore usage log ───────────────────────────────────────────────────────
 async function logUsage(userId, type, meta = {}) {
     try {
         const cleanMeta = Object.fromEntries(
             Object.entries(meta).filter(([, v]) => v !== undefined && v !== null)
         );
+
+        // Debug log to console
+        if (type === 'chat') {
+            printTokenUsage(meta.provider || 'unknown', meta.model || 'unknown', meta);
+        }
+
         await admin.firestore().collection('usage_logs').add({
             userId, type, ...cleanMeta,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -255,36 +289,7 @@ function getModelConfig(modelId) {
 }
 
 // ── Rolling Context Summary konstansok ───────────────────────────────────────
-const RECENT_MESSAGE_WINDOW = 10;  // hány üzenetet tartunk meg summary mellett (TESZT: 10)
-const SUMMARY_TRIGGER_COUNT = 20;  // hány üzenet után generálunk ELSŐ summaryt
 const SUMMARY_COLLECTION = 'chat_summaries';
-
-// ── buildOptimizedMessages ────────────────────────────────────────────────────
-// Ez az egyetlen kontextus-építő függvény.
-// Ha van summary: system prompt + summary + utolsó RECENT_MESSAGE_WINDOW üzenet
-// Ha nincs summary: system prompt + max 50 üzenet (az első 20 üzenet alatt vagyunk)
-function buildOptimizedMessages(allMessages, systemPrompt, summaryText, recentCount = RECENT_MESSAGE_WINDOW) {
-    const nonSystemMessages = allMessages.filter(m => m.role !== 'system');
-
-    if (summaryText) {
-        const enhancedSystemPrompt = systemPrompt
-            ? `${systemPrompt}\n\n--- Korábbi üzenetek összefoglalója ---\n${summaryText}`
-            : `--- Korábbi üzenetek összefoglalója ---\n${summaryText}`;
-
-        const recentMessages = nonSystemMessages.slice(-recentCount);
-        return [
-            { role: 'system', content: enhancedSystemPrompt },
-            ...recentMessages.map(m => ({ role: m.role, content: m.content })),
-        ];
-    }
-
-    // Nincs summary (első 20 üzenet) — max 50 üzenetet küldünk
-    const cappedMessages = nonSystemMessages.slice(-50);
-    return [
-        ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
-        ...cappedMessages.map(m => ({ role: m.role, content: m.content })),
-    ];
-}
 
 // ── Groq retry helper — kezeli a 429 rate limit hibákat ──────────────────────
 async function groqWithRetry(body, retries = 3) {
@@ -315,122 +320,83 @@ async function groqWithRetry(body, retries = 3) {
     }
 }
 
-// ── Summary generálás (fire-and-forget) ──────────────────────────────────────
-// Összefoglalja az utolsó RECENT_MESSAGE_WINDOW-on kívüli üzeneteket,
-// majd TÖRLI azokat Firestore-ból — így az üzenetszám soha nem nő RECENT_MESSAGE_WINDOW fölé.
-async function generateSummaryInBackground(userId, sessionId, modelId) {
-    try {
-        const db = admin.firestore();
-        const messagesRef = db.collection('conversations').doc(userId).collection('sessions').doc(sessionId).collection('messages');
+async function refreshSessionSummary({ userId, sessionId, modelId, allMessages, sessionData }) {
+    const summarizedMessageCount = sessionData.summarizedMessageCount || 0;
+    const messagesForSummary = getMessagesForSummary(allMessages, summarizedMessageCount);
 
-        // Összes üzenet lekérése timestamp szerint
-        const allSnap = await messagesRef.orderBy('timestamp', 'asc').get();
-        if (allSnap.docs.length < 4) return;
-
-        // Az utolsó RECENT_MESSAGE_WINDOW darabot megtartjuk, a többit összefoglaljuk + töröljük
-        const docsToDelete = allSnap.docs.slice(0, -RECENT_MESSAGE_WINDOW);
-        const docsToKeep   = allSnap.docs.slice(-RECENT_MESSAGE_WINDOW);
-
-        if (docsToDelete.length === 0) return; // nincs mit törölni
-
-        const messagesToSummarize = docsToDelete.map(d => ({
-            role: d.data().role,
-            content: String(d.data().content).slice(0, 500),
-        }));
-
-        // Előző summary lekérése — ha van, beleolvasztjuk az újba, hogy ne vesszen el régi kontextus
-        const prevSummarySnap = await db.collection('conversations')
-            .doc(userId).collection('sessions').doc(sessionId)
-            .collection(SUMMARY_COLLECTION).doc('latest').get();
-        const prevSummaryText = prevSummarySnap.exists ? prevSummarySnap.data().summaryText : null;
-
-        const summaryPrompt = prevSummaryText
-            ? `You are updating a running conversation summary. Below is the previous summary, followed by new messages. Merge them into one updated summary.
-Previous summary:
-${prevSummaryText}
-
-Detect the language used and produce an updated summary in this format:
-Topic: <main topic>
-Key facts established: <all important facts/decisions, old + new>
-User preferences: <preferences>
-Open questions: <unresolved questions>
-Language: <detected language>
-
-Keep it under 200 tokens. Preserve important context from the previous summary.`
-            : `Summarize this conversation in a structured format.
-Detect the language used and include it in the summary.
-Format:
-Topic: <main topic>
-Key facts established: <facts/decisions>
-User preferences: <preferences>
-Open questions: <unresolved questions>
-Language: <detected language>
-
-Keep it under 150 tokens. Be concise but capture all important context.`;
-
-        const resp = await groqWithRetry({
-            model: 'openai/gpt-oss-120b',
-            messages: [
-                { role: 'system', content: summaryPrompt },
-                ...messagesToSummarize,
-            ],
-            temperature: 0.3,
-            max_tokens: 200,
-            stream: false,
-        });
-
-        const summaryText = resp.data?.choices?.[0]?.message?.content || '';
-        if (!summaryText) return;
-
-        // Régi üzenetek törlése — Firestore batch max 500 művelet
-        const BATCH_LIMIT = 490;
-        for (let i = 0; i < docsToDelete.length; i += BATCH_LIMIT) {
-            const deleteBatch = db.batch();
-            docsToDelete.slice(i, i + BATCH_LIMIT).forEach(doc => deleteBatch.delete(doc.ref));
-            await deleteBatch.commit();
-        }
-
-        // Summary + session frissítése egy batch-ben
-        const writeBatch = db.batch();
-
-        const summaryRef = db.collection('conversations')
-            .doc(userId)
-            .collection('sessions')
-            .doc(sessionId)
-            .collection(SUMMARY_COLLECTION)
-            .doc('latest');
-
-        writeBatch.set(summaryRef, {
-            summaryText,
-            messageCountAtSummary: allSnap.docs.length,
-            deletedCount: docsToDelete.length,
-            remainingCount: docsToKeep.length,
-            lastSummaryModelId: modelId || 'unknown',
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-
-        const sessionRef = db.collection('conversations')
-            .doc(userId)
-            .collection('sessions')
-            .doc(sessionId);
-
-        // summaryMessageCount = a törlés UTÁNI maradék üzenetszám (docsToKeep.length).
-        // Így a következő trigger pontosan RECENT_MESSAGE_WINDOW (10) új üzenet után sül el,
-        // és a newSince soha nem kerül mínuszba.
-        writeBatch.set(sessionRef, {
-            summary: summaryText,
-            summaryGeneratedAt: admin.firestore.FieldValue.serverTimestamp(),
-            summaryMessageCount: docsToKeep.length,  // törlés UTÁNI maradék = következő trigger alapja
-            summaryGenerated: true,
-            lastSummaryAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-
-        await writeBatch.commit();
-        console.log(`[Summary] Generálva és ${docsToDelete.length} régi üzenet törölve. Marad: ${docsToKeep.length} üzenet. Session: ${sessionId.slice(0, 12)}...`);
-    } catch (err) {
-        console.error('[Summary] Generálás sikertelen:', err.message);
+    if (messagesForSummary.length === 0) {
+        return {
+            summaryRefreshed: false,
+            summarizedMessageCount,
+            summary: sessionData.summary || null,
+        };
     }
+
+    const previousSummary = sessionData.summary || '';
+    const summaryPrompt = previousSummary
+        ? `You are updating a cumulative conversation summary. Merge the previous summary with the newly provided older messages.
+
+Previous summary:
+${previousSummary}
+
+Return a concise updated summary in the same language as the conversation.
+Include durable facts, established preferences, decisions, constraints, and unresolved questions.
+Do not mention message counts or timestamps.
+Keep it under 220 tokens.`
+        : `Summarize these conversation messages in the same language as the conversation.
+Include durable facts, established preferences, decisions, constraints, and unresolved questions.
+Do not mention message counts or timestamps.
+Keep it under 180 tokens.`;
+
+    const summaryResponse = await groqWithRetry({
+        model: 'openai/gpt-oss-120b',
+        messages: [
+            { role: 'system', content: summaryPrompt },
+            ...messagesForSummary.map((message) => ({
+                role: message.role,
+                content: typeof message.content === 'string'
+                    ? message.content.slice(0, 1200)
+                    : JSON.stringify(message.content).slice(0, 1200),
+            })),
+        ],
+        temperature: 0.2,
+        max_tokens: 260,
+        stream: false,
+    });
+
+    const nextSummary = summaryResponse.data?.choices?.[0]?.message?.content?.trim();
+    if (!nextSummary) {
+        throw new Error('Summary generation returned empty content');
+    }
+
+    const nextSummarizedMessageCount = summarizedMessageCount + messagesForSummary.length;
+    const db = admin.firestore();
+    const sessionRef = db.collection('conversations').doc(userId).collection('sessions').doc(sessionId);
+    const summaryRef = sessionRef.collection(SUMMARY_COLLECTION).doc('latest');
+
+    const batch = db.batch();
+    batch.set(summaryRef, {
+        summaryText: nextSummary,
+        summarizedMessageCount: nextSummarizedMessageCount,
+        lastSummaryModelId: modelId || 'unknown',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    batch.set(sessionRef, {
+        summary: nextSummary,
+        summarizedMessageCount: nextSummarizedMessageCount,
+        summaryUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    await batch.commit();
+
+    console.log(`[Summary] Cumulative summary refreshed. summarized=${nextSummarizedMessageCount}, session=${sessionId}`);
+
+    return {
+        summaryRefreshed: true,
+        summarizedMessageCount: nextSummarizedMessageCount,
+        summary: nextSummary,
+    };
 }
 
 // ════════════════════════════════════════════════════
@@ -477,55 +443,43 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
         const { apiModel, provider, defaultSystemPrompt } = modelConfig;
 
-        // ── Üzenetek betöltése Firestore-ból ──
-        // RECENT_MESSAGE_WINDOW * 2 + néhány extra — ez elég, a buildOptimizedMessages úgyis levágja
         const messagesRef = sessionRef.collection('messages');
-        const messagesSnap = await messagesRef
-            .orderBy('timestamp', 'asc')
-            .get();
+        const messagesSnap = await messagesRef.orderBy('timestamp', 'asc').get();
 
-        const sessionMessages = messagesSnap.docs
-            .map(d => d.data())
-            .map(m => ({ role: m.role, content: m.content }));
+        const storedMessages = messagesSnap.docs.map((docSnap) => ({
+            role: docSnap.data().role,
+            content: docSnap.data().content,
+        }));
 
-        // ── Új user üzenet összeállítása ──
         const newMessage = attachedImage
-            ? { role: 'user', content: [{ type: 'image_url', image_url: { url: attachedImage } }, { type: 'text', text: message }] }
+            ? {
+                role: 'user',
+                content: [
+                    { type: 'image_url', image_url: { url: attachedImage } },
+                    { type: 'text', text: message },
+                ],
+            }
             : { role: 'user', content: message };
 
-        // ── FIX: buildOptimizedMessages — az egyetlen kontextus-építő ──
-        // summary a session dokumentumból jön (gyors, egy Firestore olvasás)
-        const summaryText = sessionData.summary || null;
-        
-        const lastFetchedMsg = sessionMessages[sessionMessages.length - 1];
-        const userMsgContent = typeof message === 'string' ? message : JSON.stringify(message);
+        const lastStoredMessage = storedMessages[storedMessages.length - 1];
+        const userAlreadySaved =
+            lastStoredMessage &&
+            lastStoredMessage.role === 'user' &&
+            typeof lastStoredMessage.content === 'string' &&
+            lastStoredMessage.content === message;
 
-        // Ha a frontend már elmentette a user üzenetet Firestore-ba, ne adjuk hozzá újra
-        const userAlreadyInFirestore =
-            lastFetchedMsg &&
-            lastFetchedMsg.role === 'user' &&
-            String(lastFetchedMsg.content) === userMsgContent;
-
-        const allMessages = userAlreadyInFirestore
-            ? sessionMessages
-            : [...sessionMessages, newMessage];
-
-        console.log("SYSTEM:", defaultSystemPrompt ? 1 : 0);
-        console.log("SUMMARY:", summaryText ? 1 : 0);
-        console.log("MESSAGES (Firestore):", sessionMessages.length);
-        console.log("ALL MESSAGES (before build):", allMessages.length);
-
-        const context = buildOptimizedMessages(
-            allMessages,
+        const baseMessages = userAlreadySaved ? storedMessages : [...storedMessages, newMessage];
+        let context = buildContext(
+            baseMessages,
+            sessionData.summary || null,
+            sessionData.summarizedMessageCount || 0,
+            null,
             defaultSystemPrompt || null,
-            summaryText,
-            RECENT_MESSAGE_WINDOW
         );
 
-        console.log("FINAL CONTEXT LENGTH:", context.length);
-        console.log("CONTEXT BREAKDOWN:", context.map(m => m.role));
+        context = trimToContextLimit(context, 8192 * 32 * 0.8);
 
-        console.log(`[Chat] Kontextus: ${context.length} üzenet, summary: ${summaryText ? 'igen' : 'nem'}`);
+        console.log(`[Chat] Kontextus: ${context.length} üzenet, summary: ${sessionData.summary ? 'igen' : 'nem'}`);
 
         // ── API paraméterek ──
         const temperature = sessionData.temperature ?? 0.7;
@@ -563,12 +517,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 await messagesRef.add(aiMsgData);
             }
 
-            // allMessages most már az összes Firestore üzenetet tartalmazza (limit nélküli lekérés),
-            // +1 az éppen most mentett assistant üzenetért — ez a valódi üzenetszám.
-            const actualMessageCount = allMessages.length + 1;
-            const hasSummary = !!sessionData.summary;
-            const lastSummaryAt = sessionData.summaryMessageCount || 0;
-            const newMessagesSinceSummary = actualMessageCount - lastSummaryAt;
+            const actualMessageCount = baseMessages.length + 1;
 
             await sessionRef.set({
                 sessionId,
@@ -580,20 +529,18 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 messageCount: actualMessageCount,
             }, { merge: true });
 
-            // Summary trigger:
-            // - Első summary: ha elértük a SUMMARY_TRIGGER_COUNT-ot (20), és még nincs summary
-            // - Újratrigger: minden RECENT_MESSAGE_WINDOW (10) új üzenetnél a legutóbbi summary óta
-            const needsSummary =
-                (!hasSummary && actualMessageCount >= SUMMARY_TRIGGER_COUNT) ||
-                (hasSummary && newMessagesSinceSummary >= RECENT_MESSAGE_WINDOW);
+            const summaryResult = await refreshSessionSummary({
+                userId,
+                sessionId,
+                modelId: modelForLog,
+                allMessages: [...baseMessages, { role: 'assistant', content: aiContent }],
+                sessionData: {
+                    ...sessionData,
+                    messageCount: actualMessageCount,
+                },
+            });
 
-            console.log(`[Summary] Check: totalCount=${actualMessageCount}, lastSummaryAt=${lastSummaryAt}, newSince=${newMessagesSinceSummary}, needs=${needsSummary}`);
-
-            if (needsSummary) {
-                console.log(`[Summary] Trigger: ${actualMessageCount} üzenet (summaryMessageCount: ${sessionData.summaryMessageCount || 0}), háttérben generálás...`);
-                generateSummaryInBackground(userId, sessionId, modelForLog)
-                    .catch(e => console.warn('[Summary] Háttér generálás sikertelen:', e.message));
-            }
+            return summaryResult;
         }
 
         // ── Anthropic ─────────────────────────────────────────────────────────
@@ -614,6 +561,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             let totalContent = '';
 
+            let usageInfo = { input_tokens: 0, output_tokens: 0 };
+
             try {
                 const stream = anthropic.messages.stream({
                     model: apiModel,
@@ -623,24 +572,54 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     messages: chatMsgs,
                 }, { abortSignal: signal });
 
+                stream.on('message_start', (message) => {
+                    if (message.message?.usage) {
+                        usageInfo.input_tokens = message.message.usage.input_tokens || 0;
+                    }
+                });
+
                 stream.on('text', (text) => {
                     totalContent += text;
                     res.write(`data: ${JSON.stringify({ delta: text })}\n\n`);
                 });
 
+                stream.on('message_stop', (message) => {
+                    if (message.message?.usage) {
+                        usageInfo.output_tokens = message.message.usage.output_tokens || 0;
+                    }
+                });
+
                 stream.on('end', async () => {
+                    if (totalContent.length > 0) {
+                        try {
+                            // Check if summary will be triggered
+                            const totalMessages = (baseMessages?.length || 0) + 1;
+                            if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                                res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                            }
+
+                            const finalUsage = {
+                                input_tokens: usageInfo.input_tokens,
+                                output_tokens: usageInfo.output_tokens,
+                                prompt_tokens: usageInfo.input_tokens,
+                                completion_tokens: usageInfo.output_tokens,
+                                total_tokens: usageInfo.input_tokens + usageInfo.output_tokens
+                            };
+                            await logUsage(req.userId, 'chat', { 
+                                model: apiModel, 
+                                provider: 'anthropic', 
+                                ...finalUsage 
+                            });
+                            const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'anthropic');
+                            res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
+                        } catch (e) {
+                            console.error('[Chat] Anthropic mentés sikertelen:', e.message);
+                            
+                        }
+                    }
                     activeStreams.delete(streamKey);
                     res.write('data: [DONE]\n\n');
                     res.end();
-                    if (totalContent.length > 0) {
-                        try {
-                            const estimatedTokens = Math.ceil(totalContent.length / 4);
-                            await logUsage(req.userId, 'chat', { model: apiModel, provider: 'anthropic', tokens: estimatedTokens });
-                            await saveResponse(totalContent, { total_tokens: estimatedTokens }, modelId, 'anthropic');
-                        } catch (e) {
-                            console.error('[Chat] Anthropic mentés sikertelen:', e.message);
-                        }
-                    }
                 });
 
                 stream.on('error', (err) => {
@@ -681,6 +660,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             let totalContent = '';
 
+            let usageInfo = null;
+
             try {
                 const stream = await openai.chat.completions.create({
                     model: apiModel,
@@ -691,6 +672,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
                     presence_penalty: Math.min(Math.max(-2, presence_penalty), 2),
                     stream: true,
+                    stream_options: { include_usage: true }
                 }, { signal });
 
                 for await (const chunk of stream) {
@@ -699,21 +681,38 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         totalContent += delta;
                         res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                     }
+                    if (chunk.usage) {
+                        usageInfo = chunk.usage;
+                    }
                 }
-
-                activeStreams.delete(streamKey);
-                res.write('data: [DONE]\n\n');
-                res.end();
 
                 if (totalContent.length > 0) {
                     try {
-                        const estimatedTokens = Math.ceil(totalContent.length / 4);
-                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'openai', tokens: estimatedTokens });
-                        await saveResponse(totalContent, { total_tokens: estimatedTokens }, modelId, 'openai');
+                        const totalMessages = (baseMessages?.length || 0) + 1;
+                        if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                            res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                        }
+
+                        const finalUsage = usageInfo || {
+                            prompt_tokens: 0,
+                            completion_tokens: Math.ceil(totalContent.length / 4),
+                            total_tokens: Math.ceil(totalContent.length / 4)
+                        };
+
+                        await logUsage(req.userId, 'chat', { 
+                            model: apiModel, 
+                            provider: 'openai', 
+                            ...finalUsage
+                        });
+                        const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'openai');
+                        res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
                     } catch (e) {
                         console.error('[Chat] OpenAI mentés sikertelen:', e.message);
                     }
                 }
+                activeStreams.delete(streamKey);
+                res.write('data: [DONE]\n\n');
+                res.end();
             } catch (err) {
                 activeStreams.delete(streamKey);
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
@@ -755,6 +754,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         max_tokens: safeMax,
                         top_p: Math.min(Math.max(0, top_p), 1),
                         stream: true,
+                        stream_options: { include_usage: true }
                     },
                     {
                         headers: {
@@ -785,6 +785,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 saveResponse(totalContent, {}, modelId, 'cerebras').catch(e => console.error('[Chat] Cerebras abort-mentés sikertelen:', e.message));
             });
 
+            let usageInfo = null;
             let buf = '';
             streamResp.data.on('data', (chunk) => {
                 if (!clientConnected) return;
@@ -803,22 +804,40 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
+                        if (parsed.usage) {
+                            usageInfo = parsed.usage;
+                        }
                     } catch { }
                 }
             });
 
             streamResp.data.on('end', async () => {
-                activeStreams.delete(streamKey);
-                res.write('data: [DONE]\n\n');
-                res.end();
                 if (totalContent.length > 0) {
                     try {
-                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'cerebras', tokens: totalContent.length });
-                        await saveResponse(totalContent, {}, modelId, 'cerebras');
+                        const totalMessages = (baseMessages?.length || 0) + 1;
+                        if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                            res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                        }
+
+                        const finalUsage = usageInfo || {
+                            prompt_tokens: 0,
+                            completion_tokens: Math.ceil(totalContent.length / 4),
+                            total_tokens: Math.ceil(totalContent.length / 4)
+                        };
+                        await logUsage(req.userId, 'chat', { 
+                            model: apiModel, 
+                            provider: 'cerebras', 
+                            ...finalUsage 
+                        });
+                        const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'cerebras');
+                        res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
                     } catch (e) {
                         console.error('[Chat] Cerebras mentés sikertelen:', e.message);
                     }
                 }
+                activeStreams.delete(streamKey);
+                res.write('data: [DONE]\n\n');
+                res.end();
             });
 
             streamResp.data.on('error', () => {
@@ -855,6 +874,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         max_tokens: safeMax,
                         top_p: Math.min(Math.max(0, top_p), 1),
                         stream: true,
+                        stream_options: { include_usage: true }
                     },
                     {
                         headers: {
@@ -885,6 +905,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 saveResponse(totalContent, {}, modelId, 'mistral').catch(e => console.error('[Chat] Mistral abort-mentés sikertelen:', e.message));
             });
 
+            let usageInfo = null;
             let buf = '';
             streamResp.data.on('data', (chunk) => {
                 if (!clientConnected) return;
@@ -903,22 +924,40 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
+                        if (parsed.usage) {
+                            usageInfo = parsed.usage;
+                        }
                     } catch { }
                 }
             });
 
             streamResp.data.on('end', async () => {
-                activeStreams.delete(streamKey);
-                res.write('data: [DONE]\n\n');
-                res.end();
                 if (totalContent.length > 0) {
                     try {
-                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'mistral', tokens: totalContent.length });
-                        await saveResponse(totalContent, {}, modelId, 'mistral');
+                        const totalMessages = (baseMessages?.length || 0) + 1;
+                        if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                            res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                        }
+
+                        const finalUsage = usageInfo || {
+                            prompt_tokens: 0,
+                            completion_tokens: Math.ceil(totalContent.length / 4),
+                            total_tokens: Math.ceil(totalContent.length / 4)
+                        };
+                        await logUsage(req.userId, 'chat', { 
+                            model: apiModel, 
+                            provider: 'mistral', 
+                            ...finalUsage 
+                        });
+                        const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'mistral');
+                        res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
                     } catch (e) {
                         console.error('[Chat] Mistral mentés sikertelen:', e.message);
                     }
                 }
+                activeStreams.delete(streamKey);
+                res.write('data: [DONE]\n\n');
+                res.end();
             });
 
             streamResp.data.on('error', () => {
@@ -938,24 +977,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             const chatMsgs = normalizeMessages(context);
 
-            // ═══ TOKEN DEBUG LOG ═══════════════════════════════════════════
-            const estimatedInputTokens = chatMsgs.reduce((acc, m) => {
-                const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-                return acc + Math.ceil(text.length / 4);
-            }, 0);
-            console.log('[Groq DEBUG] ══════════════════════════════════');
-            console.log('[Groq DEBUG] Model:', apiModel);
-            console.log('[Groq DEBUG] max_tokens (safeMax):', safeMax);
-            console.log('[Groq DEBUG] Becsült INPUT tokenek:', estimatedInputTokens);
-            console.log('[Groq DEBUG] Groq által lefoglalt tokenek (input+max):', estimatedInputTokens + safeMax);
-            console.log('[Groq DEBUG] Üzenetek száma:', chatMsgs.length);
-            chatMsgs.forEach((m, i) => {
-                const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-                console.log(`[Groq DEBUG]   [${i}] role=${m.role} len=${text.length} chars (~${Math.ceil(text.length/4)} token): "${text.slice(0, 120)}..."`);
-            });
-            console.log('[Groq DEBUG] ══════════════════════════════════');
-            // ═══════════════════════════════════════════════════════════════
-
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
@@ -974,6 +995,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         max_tokens: effectiveMaxTokens,
                         top_p: Math.min(Math.max(0, top_p), 1),
                         stream: true,
+                        stream_options: { include_usage: true }
                     },
                     {
                         headers: {
@@ -1002,6 +1024,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 saveResponse(totalContent, {}, modelId, 'groq').catch(e => console.error('[Chat] Groq abort-mentés sikertelen:', e.message));
             });
 
+            let usageInfo = null;
             let buf = '';
             streamResp.data.on('data', (chunk) => {
                 if (!clientConnected) return;
@@ -1020,22 +1043,32 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
+                        if (parsed.usage) usageInfo = parsed.usage;
                     } catch { }
                 }
             });
 
             streamResp.data.on('end', async () => {
-                activeStreams.delete(streamKey);
-                res.write('data: [DONE]\n\n');
-                res.end();
                 if (totalContent.length > 0) {
                     try {
-                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'groq', tokens: totalContent.length });
-                        await saveResponse(totalContent, {}, modelId, 'groq');
+                        const totalMessages = (baseMessages?.length || 0) + 1;
+                        if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                            res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                        }
+                        const finalUsage = usageInfo || {
+                            prompt_tokens: 0,
+                            completion_tokens: Math.ceil(totalContent.length / 4),
+                            total_tokens: Math.ceil(totalContent.length / 4)
+                        };
+                        const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'groq');
+                        res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
                     } catch (e) {
                         console.error('[Chat] Groq mentés sikertelen:', e.message);
                     }
                 }
+                activeStreams.delete(streamKey);
+                res.write('data: [DONE]\n\n');
+                res.end();
             });
 
             streamResp.data.on('error', (err) => {
@@ -1070,6 +1103,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             let streamResp;
             let totalContent = '';
+            let usageInfo = null;
+
             try {
                 streamResp = await axios.post(
                     `https://generativelanguage.googleapis.com/v1beta/models/${apiModel}:streamGenerateContent?alt=sse`,
@@ -1126,21 +1161,44 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
+                        if (parsed.usageMetadata) {
+                            usageInfo = {
+                                prompt_tokens: parsed.usageMetadata.promptTokenCount || 0,
+                                completion_tokens: parsed.usageMetadata.candidatesTokenCount || 0,
+                                total_tokens: parsed.usageMetadata.totalTokenCount || 0,
+                                cached_tokens: parsed.usageMetadata.cachedContentTokenCount || 0
+                            };
+                        }
                     } catch { }
                 }
             });
 
             streamResp.data.on('end', async () => {
-                res.write('data: [DONE]\n\n');
-                res.end();
                 if (totalContent.length > 0) {
                     try {
-                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'gemini', tokens: totalContent.length });
-                        await saveResponse(totalContent, {}, modelId, 'gemini');
+                        const totalMessages = (baseMessages?.length || 0) + 1;
+                        if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                            res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                        }
+
+                        const finalUsage = usageInfo || {
+                            prompt_tokens: 0,
+                            completion_tokens: Math.ceil(totalContent.length / 4),
+                            total_tokens: Math.ceil(totalContent.length / 4)
+                        };
+                        await logUsage(req.userId, 'chat', { 
+                            model: apiModel, 
+                            provider: 'gemini', 
+                            ...finalUsage 
+                        });
+                        const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'gemini');
+                        res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
                     } catch (e) {
                         console.error('[Chat] Gemini mentés sikertelen:', e.message);
                     }
                 }
+                res.write('data: [DONE]\n\n');
+                res.end();
             });
 
             streamResp.data.on('error', (err) => {
@@ -1168,6 +1226,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             let streamResp;
             let totalContent = '';
+            let usageInfo = null;
+
             try {
                 streamResp = await axios.post(
                     'https://integrate.api.nvidia.com/v1/chat/completions',
@@ -1178,6 +1238,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         max_tokens: safeMax,
                         top_p: Math.min(Math.max(0, top_p), 1),
                         stream: true,
+                        stream_options: { include_usage: true }
                     },
                     {
                         headers: {
@@ -1227,23 +1288,37 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
+                        if (parsed.usage) {
+                            usageInfo = parsed.usage;
+                        }
                     } catch { }
                 }
             });
 
             streamResp.data.on('end', async () => {
-                activeStreams.delete(streamKey);
-                clearInterval(keepAlive);
-                res.write('data: [DONE]\n\n');
-                res.end();
                 if (totalContent.length > 0) {
                     try {
-                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'nvidia', tokens: totalContent.length });
-                        await saveResponse(totalContent, {}, modelId, 'nvidia');
+                        const totalMessages = (baseMessages?.length || 0) + 1;
+                        if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                            res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                        }
+
+                        const finalUsage = usageInfo || {
+                            prompt_tokens: 0,
+                            completion_tokens: Math.ceil(totalContent.length / 4),
+                            total_tokens: Math.ceil(totalContent.length / 4)
+                        };
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'nvidia', ...finalUsage });
+                        const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'nvidia');
+                        res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
                     } catch (e) {
                         console.error('[Chat] NVIDIA mentés sikertelen:', e.message);
                     }
                 }
+                activeStreams.delete(streamKey);
+                clearInterval(keepAlive);
+                res.write('data: [DONE]\n\n');
+                res.end();
             });
 
             streamResp.data.on('error', (err) => {
@@ -1273,6 +1348,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             let streamResp;
             let totalContent = '';
+            let usageInfo = null;
+
             try {
                 streamResp = await axios.post(
                     'https://openrouter.ai/api/v1/chat/completions',
@@ -1283,6 +1360,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         max_tokens: safeMax,
                         top_p: Math.min(Math.max(0, top_p), 1),
                         stream: true,
+                        stream_options: { include_usage: true }
                     },
                     {
                         headers: {
@@ -1316,6 +1394,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
             let buf = '';
             streamResp.data.on('data', (chunk) => {
+                if (!clientConnected) return;
                 buf += chunk.toString('utf8');
                 const lines = buf.split('\n');
                 buf = lines.pop();
@@ -1331,22 +1410,36 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             totalContent += delta;
                             res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         }
+                        if (parsed.usage) {
+                            usageInfo = parsed.usage;
+                        }
                     } catch { }
                 }
             });
 
             streamResp.data.on('end', async () => {
-                activeStreams.delete(streamKey);
-                res.write('data: [DONE]\n\n');
-                res.end();
                 if (totalContent.length > 0) {
                     try {
-                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'openrouter', tokens: totalContent.length });
-                        await saveResponse(totalContent, {}, modelId, 'openrouter');
+                        const totalMessages = (baseMessages?.length || 0) + 1;
+                        if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                            res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                        }
+
+                        const finalUsage = usageInfo || {
+                            prompt_tokens: 0,
+                            completion_tokens: Math.ceil(totalContent.length / 4),
+                            total_tokens: Math.ceil(totalContent.length / 4)
+                        };
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'openrouter', ...finalUsage });
+                        const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'openrouter');
+                        res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
                     } catch (e) {
                         console.error('[Chat] OpenRouter mentés sikertelen:', e.message);
                     }
                 }
+                activeStreams.delete(streamKey);
+                res.write('data: [DONE]\n\n');
+                res.end();
             });
 
             streamResp.data.on('error', (err) => {
@@ -1359,7 +1452,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         } else {
             return res.status(400).json({ success: false, message: `Ismeretlen provider: ${provider}` });
         }
-
     } catch (err) {
         console.error('❌ Chat hiba:', err);
         if (!res.headersSent) {
@@ -2401,7 +2493,7 @@ Keep it under 150 tokens. Be concise but capture all important context.`;
         batch.set(summaryRef, { summaryText, messageCountAtSummary: messages.length, lastSummaryModelId: modelId || 'unknown', language: 'auto', createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
         const sessionRef = db.collection('conversations').doc(req.userId).collection('sessions').doc(sessionId);
-        batch.set(sessionRef, { summary: summaryText, summaryGenerated: true, summaryMessageCount: messages.length, lastSummaryAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        batch.set(sessionRef, { summary: summaryText, summarizedMessageCount: messages.length, summaryUpdatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
         await batch.commit();
         return res.json({ success: true, summaryText });
@@ -2435,44 +2527,34 @@ router.post('/chat/switch-model', verifyFirebaseToken, async (req, res) => {
         const userId = req.userId;
         const sessionRef = db.collection('conversations').doc(userId).collection('sessions').doc(sessionId);
 
-        const snap = await sessionRef.collection('messages').orderBy('timestamp', 'asc').limit(20).get();
-        const messages = snap.docs.map(d => ({ role: d.data().role, content: String(d.data().content).slice(0, 500) }));
-
-        const summaryPrompt = `Summarize this conversation in a structured format.
-Detect the language used and include it in the summary.
-Format:
-Topic: <main topic>
-Key facts established: <facts/decisions>
-User preferences: <preferences>
-Open questions: <unresolved questions>
-Language: <detected language>
-
-Keep it under 150 tokens.`;
-
-        const resp = await groqWithRetry({
-            model: 'openai/gpt-oss-120b',
-            messages: [{ role: 'system', content: summaryPrompt }, ...messages],
-            temperature: 0.3,
-            max_tokens: 200,
-            stream: false,
-        });
-
-        const summaryText = resp.data?.choices?.[0]?.message?.content || '';
-
         const modelConfig = getModelConfig(newModelId);
         if (!modelConfig) return res.status(400).json({ success: false, message: `Ismeretlen modell: ${newModelId}` });
+
+        const sessionDoc = await sessionRef.get();
+        const sessionData = sessionDoc.exists ? sessionDoc.data() : {};
 
         await sessionRef.set({
             modelId: newModelId,
             modelName: modelConfig.apiModel,
-            summary: summaryText,
-            summaryGeneratedAt: admin.firestore.FieldValue.serverTimestamp(),
-            summaryMessageCount: messages.length,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
 
-        console.log(`[SwitchModel] ${sessionId} → ${newModelId}, summary generálva (${messages.length} üzenet)`);
-        return res.json({ success: true, summary: summaryText });
+        const messagesSnap = await sessionRef.collection('messages').orderBy('timestamp', 'asc').get();
+        const allMessages = messagesSnap.docs.map((docSnap) => ({
+            role: docSnap.data().role,
+            content: docSnap.data().content,
+        }));
+
+        const summaryResult = await refreshSessionSummary({
+            userId,
+            sessionId,
+            modelId: newModelId,
+            allMessages,
+            sessionData,
+        });
+
+        console.log(`[SwitchModel] ${sessionId} → ${newModelId} (context megőrizve)`);
+        return res.json({ success: true, summaryRefreshed: summaryResult.summaryRefreshed });
     } catch (e) {
         console.error('Switch model hiba:', e);
         return res.status(500).json({ success: false, message: e.message });

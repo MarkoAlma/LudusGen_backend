@@ -2,45 +2,63 @@
 // contextBuilder.js — Kontextus építés a backenden
 // ═══════════════════════════════════════════════════════
 
-const RECENT_MESSAGE_COUNT = 20;
+const RECENT_MESSAGE_WINDOW = 20;
+const SUMMARY_TRIGGER_COUNT = 40;
 const CONTEXT_LIMIT_RATIO = 0.8;
 
-// Rough token estimation: ~3 chars per token for Hungarian text
 function estimateTokens(text) {
   if (!text) return 0;
-  return Math.ceil(text.length / 3);
+  return Math.ceil(String(text).length / 3);
+}
+
+function estimateContentTokens(content) {
+  if (typeof content === 'string') {
+    return estimateTokens(content);
+  }
+
+  if (Array.isArray(content)) {
+    return content.reduce((sum, part) => {
+      if (part?.type === 'text') {
+        return sum + estimateTokens(part.text);
+      }
+      return sum;
+    }, 0);
+  }
+
+  return 0;
 }
 
 function estimateContextTokens(messages) {
-  return messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
+  return messages.reduce((sum, message) => sum + estimateContentTokens(message.content), 0);
 }
 
-/**
- * Build the context for an AI API call.
- * @param {Array} sessionMessages - Recent messages from Firestore (without the new one)
- * @param {Object|null} summary - { text, messageCount } from session doc
- * @param {Object} newMessage - { role: 'user', content: '...' }
- * @param {string|null} systemPrompt - Model's default system prompt
- * @returns {Array} Optimized message array for the AI API
- */
-export function buildContext(sessionMessages, summary, newMessage, systemPrompt) {
+export function getUnsummarizedMessages(allMessages, summarizedMessageCount = 0) {
+  return allMessages.slice(summarizedMessageCount);
+}
+
+export function getMessagesForSummary(allMessages, summarizedMessageCount = 0) {
+  const unsummarizedMessages = getUnsummarizedMessages(allMessages, summarizedMessageCount);
+  if (unsummarizedMessages.length < SUMMARY_TRIGGER_COUNT) {
+    return [];
+  }
+
+  return unsummarizedMessages.slice(0, RECENT_MESSAGE_WINDOW);
+}
+
+export function buildContext(allMessages, summaryText, summarizedMessageCount = 0, newMessage, systemPrompt) {
   const context = [];
 
-  // 1. System prompt
   if (systemPrompt) {
     context.push({ role: 'system', content: systemPrompt });
   }
 
-  // 2. Summary (if exists)
-  if (summary?.text) {
-    context.push({ role: 'system', content: `[Conversation Summary]\n${summary.text}` });
+  if (summaryText) {
+    context.push({ role: 'system', content: `[Conversation Summary]\n${summaryText}` });
   }
 
-  // 3. Recent messages (last N from Firestore)
-  const recent = sessionMessages.slice(-RECENT_MESSAGE_COUNT);
-  context.push(...recent);
+  const unsummarizedMessages = getUnsummarizedMessages(allMessages, summarizedMessageCount);
+  context.push(...unsummarizedMessages);
 
-  // 4. New user message (guard against null/undefined)
   if (newMessage?.content) {
     context.push(newMessage);
   }
@@ -48,22 +66,19 @@ export function buildContext(sessionMessages, summary, newMessage, systemPrompt)
   return context;
 }
 
-/**
- * Trim messages to fit within the context limit.
- * Keeps system messages, removes oldest user/assistant messages.
- */
 export function trimToContextLimit(messages, maxTokens) {
-  let total = estimateContextTokens(messages);
-  if (total <= maxTokens) return messages;
-
-  const systemMsgs = messages.filter(m => m.role === 'system');
-  const chatMsgs = messages.filter(m => m.role !== 'system');
-
-  while (chatMsgs.length > 2 && estimateContextTokens([...systemMsgs, ...chatMsgs]) > maxTokens) {
-    chatMsgs.shift();
+  if (estimateContextTokens(messages) <= maxTokens) {
+    return messages;
   }
 
-  return [...systemMsgs, ...chatMsgs];
+  const systemMessages = messages.filter((message) => message.role === 'system');
+  const chatMessages = messages.filter((message) => message.role !== 'system');
+
+  while (chatMessages.length > 2 && estimateContextTokens([...systemMessages, ...chatMessages]) > maxTokens) {
+    chatMessages.shift();
+  }
+
+  return [...systemMessages, ...chatMessages];
 }
 
-export { RECENT_MESSAGE_COUNT, CONTEXT_LIMIT_RATIO };
+export { RECENT_MESSAGE_WINDOW, SUMMARY_TRIGGER_COUNT, CONTEXT_LIMIT_RATIO };
