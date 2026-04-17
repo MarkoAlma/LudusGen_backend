@@ -386,8 +386,8 @@ export async function modelProxy(req, res) {
 
     // If upstream returns 401/403/410/502, try to refresh URL via taskId
     if (error && [401, 403, 410, 502].includes(error)) {
-      const taskIdSource = taskIdMatch ? "url_regex" : (taskIdParam ? "query_param" : "none");
-      const taskId = taskIdMatch ? taskIdMatch[1] : (taskIdParam || null);
+      const taskIdSource = taskIdParam ? "query_param" : "none";
+      const taskId = taskIdParam || null;
 
       if (taskId) {
         console.log(`[TaskController] modelProxy: Upstream ${error} for task ${taskId} (source: ${taskIdSource})`);
@@ -660,18 +660,21 @@ export async function clearHistory(req, res) {
   const uid = req.user?.uid;
   if (!uid) { res.status(401).json({ success: false, message: "Unauthorized" }); return; }
 
+  const ALLOWED_SOURCES = ["tripo", "trellis", "upload"];
+  const source = ALLOWED_SOURCES.includes(req.query.source) ? req.query.source : "tripo";
+
   try {
     const db = admin.firestore();
     const snap = await db.collection(HISTORY_COLLECTION)
       .where("userId", "==", uid)
-      .where("source", "==", "tripo")
+      .where("source", "==", source)
       .get();
 
     const batch = db.batch();
     snap.docs.forEach(doc => batch.delete(doc.ref));
     await batch.commit();
 
-    console.log(`[HistoryController] cleared ${snap.size} tripo items for user ${uid}`);
+    console.log(`[HistoryController] cleared ${snap.size} ${source} items for user ${uid}`);
     res.json({ success: true, deleted: snap.size });
   } catch (err) {
     console.error("[HistoryController] clearHistory error:", err.message);

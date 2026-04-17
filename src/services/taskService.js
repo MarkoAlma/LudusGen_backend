@@ -39,10 +39,6 @@ class TaskService {
   async get(taskId) {
     const client = getTripoClient();
     const task = await client.getTask(taskId);
-    // DEBUG: log the raw task type and output keys for troubleshooting
-    if (task.type === "convert_model" || task.type === "smart_low_poly" || task.type === "stylize_model") {
-      console.log(`[TaskService.get] task ${taskId} type=${task.type} status=${task.status} output keys:`, JSON.stringify(task.output ?? {}, null, 2));
-    }
     return this.taskToPollResult(task);
   }
 
@@ -240,6 +236,12 @@ class TaskService {
           throw new Error(`Invalid rig_type. Valid: ${validRigTypes.join(", ")}`);
 
         // Add missing optional flags with proper defaults
+        // FIX: handle export_geometry alias from older frontend code
+        if (b["export_with_geometry"] === undefined && b["export_geometry"] !== undefined) {
+          b["export_with_geometry"] = b["export_geometry"];
+        }
+        delete b["export_geometry"]; // always cleanup the alias
+
         if (b["bake_animation"] === undefined) b["bake_animation"] = true;
         if (b["export_with_geometry"] === undefined) b["export_with_geometry"] = true;
         if (b["animate_in_place"] === undefined) b["animate_in_place"] = false;
@@ -280,16 +282,6 @@ class TaskService {
         if (b["bake_animation"] === undefined) b["bake_animation"] = true;
         if (b["export_with_geometry"] === undefined) b["export_with_geometry"] = true;
         if (b["animate_in_place"] === undefined) b["animate_in_place"] = false;
-
-        console.log(`[TaskService] animate_retarget validated:`, {
-          original_model_task_id: b["original_model_task_id"],
-          animation: b["animation"],
-          animations: b["animations"],
-          out_format: b["out_format"],
-          bake_animation: b["bake_animation"],
-          export_with_geometry: b["export_with_geometry"],
-          animate_in_place: b["animate_in_place"],
-        });
 
         break;
       }
@@ -338,7 +330,12 @@ class TaskService {
         break;
 
       case "texture_edit":
+        b["type"] = "texture_model";
         if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
+        if (!["standard", "detailed"].includes(b["texture_quality"])) {
+          b["texture_quality"] = "standard";
+        }
+        delete b["creativity_strength"];
         break;
     }
 
@@ -348,13 +345,6 @@ class TaskService {
   /* ── Convert raw task to PollResult ──────────────────────────────── */
   taskToPollResult(task) {
     const out = task.output ?? {};
-    // DEBUG: log prerigcheck output to identify the actual field name
-    if (task.type === "animate_prerigcheck") {
-      console.log(`[TaskService] prerigcheck raw task output:`, JSON.stringify(out, null, 2));
-    }
-    if (task.type === "convert_model" || task.type === "smart_low_poly" || task.type === "stylize_model") {
-      console.log(`[TaskService] taskToPollResult type=${task.type} output keys:`, JSON.stringify(out, null, 2));
-    }
     return {
       success: task.status === "success",
       status: task.status,

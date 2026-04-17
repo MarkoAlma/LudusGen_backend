@@ -168,7 +168,8 @@ async function saveToHistory(entry, taskData) {
   for (let i = 0; i < urlsToSave.length; i++) {
     const url = urlsToSave[i];
     if (!url) continue;
-    await db.collection(HISTORY_COLLECTION).add({
+    const stableDocId = urlsToSave.length > 1 ? `tripo_${entry.taskId}_${i}` : `tripo_${entry.taskId}`;
+    await db.collection(HISTORY_COLLECTION).doc(stableDocId).set({
       userId: entry.userId,
       prompt: entry.prompt ?? taskData.prompt ?? entry.type,
       status: "succeeded",
@@ -176,7 +177,7 @@ async function saveToHistory(entry, taskData) {
       source: "tripo",
       mode,
       taskId: entry.taskId,
-      animationIndex: (urlsToSave.length > 1 && { animationIndex: i }),
+      ...(urlsToSave.length > 1 && { animationIndex: i }),
       params: {
         model_version: entry.modelVersion,
         mode,
@@ -188,7 +189,7 @@ async function saveToHistory(entry, taskData) {
       ts: now,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       expiresAt: now + HISTORY_TTL_MS,
-    });
+    }, { merge: true });
   }
   console.log(`[TaskRecovery] Saved ${urlsToSave.length} model(s) for task ${entry.taskId} to history for user ${entry.userId}`);
 
@@ -199,6 +200,7 @@ async function saveToHistory(entry, taskData) {
 async function handleFailedTask(entry, taskData) {
   const taskId = entry.taskId;
   const userId = entry.userId;
+  console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. rawOutput:`, JSON.stringify(taskData.rawOutput ?? {}));
 
   // Look up the charged amount from credit_history
   // NOTE: collectionGroup with multiple where() requires a composite index.

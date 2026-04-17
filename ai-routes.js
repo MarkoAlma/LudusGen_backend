@@ -902,25 +902,34 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
             return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
         }
 
-        const safeMax = Math.min(Math.max(128, max_tokens), 1024);
+        const isReasoningModel = model.includes('gpt-oss') || model.includes('deepseek-r1') || model.includes('qwq');
+        const tokenCap = isReasoningModel ? 16384 : 1024;
+        const safeMax = Math.min(Math.max(128, max_tokens), tokenCap);
 
         const chatMsgs = normalizeMessages(messages);
 
 
         let resp;
         try {
+            const body = {
+                model,
+                messages: chatMsgs,
+                stream: false,
+            };
+
+            if (isReasoningModel) {
+                body.max_completion_tokens = safeMax;
+            } else {
+                body.temperature       = Math.min(Math.max(0, temperature), 2);
+                body.max_tokens        = safeMax;
+                body.top_p             = Math.min(Math.max(0, top_p), 1);
+                body.frequency_penalty = Math.min(Math.max(-2, frequency_penalty), 2);
+                body.presence_penalty  = Math.min(Math.max(-2, presence_penalty), 2);
+            }
+
             resp = await axios.post(
                 'https://api.groq.com/openai/v1/chat/completions',
-                {
-                    model,
-                    messages: chatMsgs,
-                    temperature:       Math.min(Math.max(0, temperature), 2),
-                    max_tokens:        safeMax,
-                    top_p:             Math.min(Math.max(0, top_p), 1),
-                    frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
-                    presence_penalty:  Math.min(Math.max(-2, presence_penalty), 2),
-                    stream: false,
-                },
+                body,
                 {
                     headers: {
                         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
