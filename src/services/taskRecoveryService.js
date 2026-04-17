@@ -139,6 +139,9 @@ async function saveToHistory(entry, taskData) {
   const animatedModels = Array.isArray(out.animated_models) && out.animated_models.length > 0
     ? out.animated_models
     : null;
+  if (animatedModels && entry.type === "animate_retarget") {
+    console.log(`[TaskRecovery] animate_retarget ${entry.taskId}: animated_models count=${animatedModels.length}`, animatedModels);
+  }
   const modelUrl = out.model ?? out.model_url ?? out.pbr_model ?? out.base_model
     ?? out.rigged_model ?? (animatedModels ? animatedModels[0] : out.animated_model)
     ?? out.converted_model ?? out.low_poly_model

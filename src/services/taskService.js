@@ -345,6 +345,9 @@ class TaskService {
   /* ── Convert raw task to PollResult ──────────────────────────────── */
   taskToPollResult(task) {
     const out = task.output ?? {};
+    if (task.status === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
+      console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
+    }
     return {
       success: task.status === "success",
       status: task.status,
@@ -356,7 +359,9 @@ class TaskService {
         out.model_url ??
         out.base_model ??
         out.rigged_model ??
-        out.animated_model ??
+        (Array.isArray(out.animated_models) && out.animated_models.length > 0
+          ? out.animated_models[0]
+          : out.animated_model) ??
         out.converted_model ??
         out.low_poly_model ??
         out.segmented_model ??
