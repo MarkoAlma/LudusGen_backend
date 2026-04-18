@@ -53,8 +53,7 @@ export const VALID_ANIMATIONS = new Set([
 ]);
 
 export const VALID_STYLES = new Set([
-  "cartoon", "clay", "alien", "christmas", "steampunk",
-  "lego", "voxel", "voronoi", "minecraft", "gold", "ancient_bronze",
+  "lego", "voxel", "voronoi", "minecraft",
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────────
