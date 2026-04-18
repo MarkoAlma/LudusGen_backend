@@ -1721,9 +1721,46 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             return res.status(400).json({ success: false, message: 'Hiányzó prompt' });
         }
 
+        const sseStart = (res) => {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.flushHeaders();
+        };
+        const sseEmit = (res, data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+        const ESTIMATED_DURATIONS = {
+            modelscope_edit: 150,
+            modelscope_gen: 60,
+            nvidia: 60,
+        };
+
+        const estimateGenerationDuration = ({ provider, isEditModel, steps, guidance }) => {
+            const safeSteps = Math.max(1, Number(steps) || 1);
+            const safeGuidance = Math.max(0, Number(guidance) || 0);
+
+            if (provider === 'modelscope') {
+                const baseDuration = isEditModel ? ESTIMATED_DURATIONS.modelscope_edit : ESTIMATED_DURATIONS.modelscope_gen;
+                const stepFactor = Math.max(0.5, safeSteps / 35);
+                const guidanceFactor = 1 + Math.max(0, safeGuidance - 3) * 0.03;
+                return Math.round(baseDuration * stepFactor * guidanceFactor);
+            }
+
+            if (provider === 'nvidia') {
+                const baseDuration = ESTIMATED_DURATIONS.nvidia;
+                const stepFactor = Math.max(0.6, safeSteps / 35);
+                const guidanceFactor = 1 + Math.max(0, safeGuidance - 3) * 0.02;
+                return Math.round(baseDuration * stepFactor * guidanceFactor);
+            }
+
+            return ESTIMATED_DURATIONS.modelscope_gen;
+        };
+
         if (provider === 'google-image') {
             if (!process.env.GEMINI_API_KEY) {
-                return res.status(500).json({ success: false, message: 'GEMINI_API_KEY nincs beállítva' });
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'GEMINI_API_KEY nincs beállítva' });
+                return res.end();
             }
 
             const response = await axios.post(
@@ -1755,12 +1792,16 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
             if (images.length === 0) throw new Error('A Gemini nem adott vissza képet.');
             await logUsage(req.userId, 'image', { provider: 'google-image', apiId, numImages: images.length });
-            return res.json({ success: true, images });
+            sseStart(res);
+            sseEmit(res, { type: 'done', images });
+            return res.end();
         }
 
         else if (provider === 'modelscope') {
             if (!process.env.MODELSCOPE_API_KEY) {
-                return res.status(500).json({ success: false, message: 'MODELSCOPE_API_KEY nincs beállítva' });
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'MODELSCOPE_API_KEY nincs beállítva' });
+                return res.end();
             }
 
             const msHeaders = {
@@ -1827,7 +1868,9 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                     }
                 } catch (e) {
                     console.error('B2 hiba:', e.message);
-                    return res.status(500).json({ success: false, message: e.message });
+                    sseStart(res);
+                    sseEmit(res, { type: 'error', message: e.message });
+                    return res.end();
                 }
             }
 
@@ -1863,7 +1906,9 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
                 const genData = await genResp.json();
                 if (!genResp.ok) {
-                    return res.status(500).json({ success: false, message: `ModelScope hiba: ${JSON.stringify(genData?.errors || genData).slice(0, 200)}` });
+                    sseStart(res);
+                    sseEmit(res, { type: 'error', message: `ModelScope hiba: ${JSON.stringify(genData?.errors || genData).slice(0, 200)}` });
+                    return res.end();
                 }
 
                 if (genData.output_images?.length > 0) {
@@ -1871,10 +1916,14 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 } else if (genData.task_id) {
                     taskId = genData.task_id;
                 } else {
-                    return res.status(500).json({ success: false, message: `ModelScope: ismeretlen válasz` });
+                    sseStart(res);
+                    sseEmit(res, { type: 'error', message: `ModelScope: ismeretlen válasz` });
+                    return res.end();
                 }
             } catch (err) {
-                return res.status(500).json({ success: false, message: 'ModelScope kapcsolódási hiba: ' + err.message });
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'ModelScope kapcsolódási hiba: ' + err.message });
+                return res.end();
             }
 
             const cleanupB2 = async () => {
@@ -1904,12 +1953,26 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 await cleanupB2();
                 const { url: finalUrl, base64 } = await postProcess(immediateUrl, resizeMultiplier);
                 await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
-                return res.json({ success: true, images: [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }] });
+                sseStart(res);
+                sseEmit(res, { type: 'done', images: [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }] });
+                return res.end();
             }
+
+            sseStart(res);
+            const estimatedDuration = estimateGenerationDuration({
+                provider: 'modelscope',
+                isEditModel,
+                steps: num_inference_steps,
+                guidance: guidance_scale,
+            });
+            const startTime = Date.now();
+
+            sseEmit(res, { type: 'status', status: 'PENDING', progress: 0, elapsed: 0 });
 
             let imageUrl = null;
             for (let i = 0; i < 150; i++) {
                 await new Promise((r) => setTimeout(r, i === 0 ? 2000 : 3000));
+                const elapsed = Math.round((Date.now() - startTime) / 1000);
                 let pollData;
                 try {
                     const pollResp = await fetch(`https://api-inference.modelscope.ai/v1/tasks/${taskId}`, {
@@ -1917,30 +1980,49 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                         signal: AbortSignal.timeout(15000),
                     });
                     pollData = await pollResp.json();
-                } catch (e) { continue; }
+                } catch (e) {
+                    sseEmit(res, { type: 'status', status: 'PENDING', progress: Math.min(Math.round((elapsed / estimatedDuration) * 100), 90), elapsed });
+                    continue;
+                }
 
                 const status = pollData?.task_status;
+                const progress = Math.min(Math.round((elapsed / estimatedDuration) * 100), 90);
+
                 if (status === 'SUCCEED') {
                     imageUrl = pollData?.output_images?.[0];
-                    if (!imageUrl) { await cleanupB2(); return res.status(500).json({ success: false, message: 'ModelScope SUCCEED de nincs output_images' }); }
+                    if (!imageUrl) {
+                        await cleanupB2();
+                        sseEmit(res, { type: 'error', message: 'ModelScope SUCCEED de nincs output_images' });
+                        return res.end();
+                    }
+                    sseEmit(res, { type: 'status', status: 'PROCESSING', progress: Math.max(progress, 90), elapsed });
                     break;
                 } else if (status === 'FAILED') {
                     await cleanupB2();
-                    return res.status(500).json({ success: false, message: `ModelScope generálás sikertelen` });
+                    sseEmit(res, { type: 'error', message: 'ModelScope generálás sikertelen' });
+                    return res.end();
+                } else {
+                    sseEmit(res, { type: 'status', status: status || 'PENDING', progress, elapsed });
                 }
             }
 
-            if (!imageUrl) return res.status(504).json({ success: false, message: 'ModelScope időtúllépés' });
+            if (!imageUrl) {
+                sseEmit(res, { type: 'error', message: 'ModelScope időtúllépés' });
+                return res.end();
+            }
 
             const { url: finalUrl, base64 } = await postProcess(imageUrl, resizeMultiplier);
             await cleanupB2();
             await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
-            return res.json({ success: true, images: [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }] });
+            sseEmit(res, { type: 'done', images: [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }] });
+            return res.end();
         }
 
         else if (provider === 'cloudflare') {
             if (!process.env.CLOUDFLARE_API_KEY || !process.env.CLOUDFLARE_ACCOUNT_ID) {
-                return res.status(500).json({ success: false, message: 'CLOUDFLARE_API_KEY vagy CLOUDFLARE_ACCOUNT_ID nincs beállítva' });
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'CLOUDFLARE_API_KEY vagy CLOUDFLARE_ACCOUNT_ID nincs beállítva' });
+                return res.end();
             }
 
             const cfResp = await axios.post(
@@ -1964,12 +2046,17 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             const base64 = Buffer.from(cfResp.data).toString('base64');
             const contentType = cfResp.headers['content-type']?.split(';')[0] || 'image/png';
             await logUsage(req.userId, 'image', { provider: 'cloudflare', apiId, numImages: 1 });
-            return res.json({ success: true, images: [{ url: `data:${contentType};base64,${base64}`, width: image_size.width || 1024, height: image_size.height || 1024 }] });
+            sseStart(res);
+            sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
+            sseEmit(res, { type: 'done', images: [{ url: `data:${contentType};base64,${base64}`, width: image_size.width || 1024, height: image_size.height || 1024 }] });
+            return res.end();
         }
 
         else if (provider === 'nvidia-image') {
             if (!process.env.NVIDIA_API_KEY) {
-                return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'NVIDIA_API_KEY nincs beállítva' });
+                return res.end();
             }
 
             const id = apiId.toLowerCase();
@@ -1995,19 +2082,36 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                     timeout: 180000,
                 });
             } catch (err) {
-                return res.status(500).json({ success: false, message: err.response?.data?.detail || err.message });
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: err.response?.data?.detail || err.message });
+                return res.end();
             }
 
             const base64Image = nimResp.data?.image ?? nimResp.data?.artifacts?.[0]?.base64;
-            if (!base64Image) return res.status(500).json({ success: false, message: 'Nem érkezett kép az NVIDIA API-tól' });
+            if (!base64Image) {
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'Nem érkezett kép az NVIDIA API-tól' });
+                return res.end();
+            }
 
             await logUsage(req.userId, 'image', { provider: 'nvidia-image', apiId, numImages: 1 });
-            return res.json({ success: true, images: [{ url: `data:image/png;base64,${base64Image}`, width: image_size.width || 1024, height: image_size.height || 1024 }] });
+            sseStart(res);
+            sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
+            sseEmit(res, { type: 'done', images: [{ url: `data:image/png;base64,${base64Image}`, width: image_size.width || 1024, height: image_size.height || 1024 }] });
+            return res.end();
         }
 
         else {
-            if (!apiId) return res.status(400).json({ success: false, message: 'Hiányzó apiId' });
-            if (!process.env.FAL_KEY) return res.status(500).json({ success: false, message: 'FAL_KEY nincs beállítva' });
+            if (!apiId) {
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'Hiányzó apiId' });
+                return res.end();
+            }
+            if (!process.env.FAL_KEY) {
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'FAL_KEY nincs beállítva' });
+                return res.end();
+            }
 
             const result = await fal.subscribe(apiId, {
                 input: {
@@ -2027,14 +2131,17 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             if (images.length === 0) throw new Error('Nem érkezett kép');
 
             await logUsage(req.userId, 'image', { apiId, numImages: num_images });
-            return res.json({ success: true, images });
+            sseStart(res);
+            sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
+            sseEmit(res, { type: 'done', images });
+            return res.end();
         }
 
     } catch (err) {
         console.error('❌ Image gen hiba:', err);
-        if (err.response?.status === 402) return res.status(402).json({ success: false, message: 'Nincs elegendő kredit' });
-        if (err.response?.status === 403) return res.status(403).json({ success: false, message: 'Érvénytelen API kulcs' });
-        return res.status(500).json({ success: false, message: err?.message?.includes('safety') ? 'Safety filter' : err?.message || 'Képgenerálási hiba' });
+        if (err.response?.status === 402) { sseStart(res); sseEmit(res, { type: 'error', message: 'Nincs elegendő kredit' }); return res.end(); }
+        if (err.response?.status === 403) { sseStart(res); sseEmit(res, { type: 'error', message: 'Érvénytelen API kulcs' }); return res.end(); }
+        sseStart(res); sseEmit(res, { type: 'error', message: err?.message?.includes('safety') ? 'Safety filter' : err?.message || 'Képgenerálási hiba' }); return res.end();
     }
 });
 
