@@ -1792,6 +1792,9 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
             if (images.length === 0) throw new Error('A Gemini nem adott vissza képet.');
             await logUsage(req.userId, 'image', { provider: 'google-image', apiId, numImages: images.length });
+            for (const img of images) {
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'google-image', aspect_ratio, width: img.width, height: img.height });
+            }
             sseStart(res);
             sseEmit(res, { type: 'done', images });
             return res.end();
@@ -1952,9 +1955,13 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             if (immediateUrl) {
                 await cleanupB2();
                 const { url: finalUrl, base64 } = await postProcess(immediateUrl, resizeMultiplier);
+                const finalImages = [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }];
                 await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
+                for (const img of finalImages) {
+                    processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
+                }
                 sseStart(res);
-                sseEmit(res, { type: 'done', images: [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }] });
+                sseEmit(res, { type: 'done', images: finalImages });
                 return res.end();
             }
 
@@ -2012,9 +2019,13 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             }
 
             const { url: finalUrl, base64 } = await postProcess(imageUrl, resizeMultiplier);
+            const finalImages = [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }];
             await cleanupB2();
             await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
-            sseEmit(res, { type: 'done', images: [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }] });
+            for (const img of finalImages) {
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
+            }
+            sseEmit(res, { type: 'done', images: finalImages });
             return res.end();
         }
 
@@ -2045,10 +2056,14 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
             const base64 = Buffer.from(cfResp.data).toString('base64');
             const contentType = cfResp.headers['content-type']?.split(';')[0] || 'image/png';
+            const finalImages = [{ url: `data:${contentType};base64,${base64}`, width: image_size.width || 1024, height: image_size.height || 1024 }];
             await logUsage(req.userId, 'image', { provider: 'cloudflare', apiId, numImages: 1 });
+            for (const img of finalImages) {
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'cloudflare', aspect_ratio, width: img.width, height: img.height });
+            }
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
-            sseEmit(res, { type: 'done', images: [{ url: `data:${contentType};base64,${base64}`, width: image_size.width || 1024, height: image_size.height || 1024 }] });
+            sseEmit(res, { type: 'done', images: finalImages });
             return res.end();
         }
 
@@ -2094,10 +2109,14 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 return res.end();
             }
 
+            const finalImages = [{ url: `data:image/png;base64,${base64Image}`, width: image_size.width || 1024, height: image_size.height || 1024 }];
             await logUsage(req.userId, 'image', { provider: 'nvidia-image', apiId, numImages: 1 });
+            for (const img of finalImages) {
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'nvidia-image', aspect_ratio, width: img.width, height: img.height });
+            }
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
-            sseEmit(res, { type: 'done', images: [{ url: `data:image/png;base64,${base64Image}`, width: image_size.width || 1024, height: image_size.height || 1024 }] });
+            sseEmit(res, { type: 'done', images: finalImages });
             return res.end();
         }
 
@@ -2131,6 +2150,9 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             if (images.length === 0) throw new Error('Nem érkezett kép');
 
             await logUsage(req.userId, 'image', { apiId, numImages: num_images });
+            for (const img of images) {
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'fal', aspect_ratio, width: img.width, height: img.height });
+            }
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
             sseEmit(res, { type: 'done', images });
@@ -2389,17 +2411,75 @@ const b2 = new S3Client({
     forcePathStyle: true,
 });
 
-async function uploadGlbToB2(base64Glb, filename) {
-    const buffer = Buffer.from(base64Glb, 'base64');
-    const key = `trellis/${filename}`;
-    await b2.send(new PutObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key, Body: buffer, ContentType: 'model/gltf-binary' }));
+async function uploadMediaToB2(buffer, key, contentType) {
+    await b2.send(new PutObjectCommand({
+        Bucket: process.env.B2_BUCKET_NAME,
+        Key: key,
+        Body: buffer,
+        ContentType: contentType,
+    }));
     return key;
+}
+
+async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
+    try {
+        let inputBuffer;
+        let originalMime = 'image/png';
+
+        if (sourceUrlOrBase64.startsWith('data:')) {
+            const parts = sourceUrlOrBase64.split(',');
+            inputBuffer = Buffer.from(parts[1], 'base64');
+            originalMime = parts[0].match(/:(.*?);/)?.[1] || 'image/png';
+        } else {
+            const resp = await axios.get(sourceUrlOrBase64, { responseType: 'arraybuffer' });
+            inputBuffer = Buffer.from(resp.data);
+            originalMime = resp.headers['content-type'] || 'image/png';
+        }
+
+        const meta = await sharp(inputBuffer).metadata();
+        const ext = meta.format || 'png';
+
+        const timestamp = Date.now();
+        const rand = Math.random().toString(36).slice(2, 7);
+        const baseFilename = `${timestamp}_${rand}`;
+
+        // 1. Full resolution upload - DIRECT BUFFER (No re-encoding!)
+        const fullKey = `users/${userId}/images/full/${baseFilename}.${ext}`;
+        await uploadMediaToB2(inputBuffer, fullKey, originalMime);
+
+        // 2. Thumbnail upload - (Still re-encoded for speed)
+        const thumbKey = `users/${userId}/images/thumb/${baseFilename}.webp`;
+        const thumbBuffer = await sharp(inputBuffer)
+            .resize(300, null, { withoutEnlargement: true })
+            .webp({ quality: 80 })
+            .toBuffer();
+        await uploadMediaToB2(thumbBuffer, thumbKey, 'image/webp');
+
+        // 3. Save to Firestore
+        const docRef = await admin.firestore().collection('generated_images').add({
+            userId,
+            full_key: fullKey,
+            thumb_key: thumbKey,
+            prompt: metadata.prompt || '',
+            modelId: metadata.modelId || '',
+            provider: metadata.provider || '',
+            aspect_ratio: metadata.aspect_ratio || '1:1',
+            width: metadata.width || 1024,
+            height: metadata.height || 1024,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        return docRef.id;
+    } catch (err) {
+        console.error('[GalleryStore] Error:', err.message);
+        return null;
+    }
 }
 
 async function streamB2Key(key, filename, res) {
     const cmd = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key });
     const data = await b2.send(cmd);
-    res.setHeader('Content-Type', 'model/gltf-binary');
+    res.setHeader('Content-Type', key.endsWith('.glb') ? 'model/gltf-binary' : 'image/png');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Cache-Control', 'private, max-age=3600');
     data.Body.pipe(res);
@@ -2665,6 +2745,103 @@ router.post('/chat/switch-model', verifyFirebaseToken, async (req, res) => {
     } catch (e) {
         console.error('Switch model hiba:', e);
         return res.status(500).json({ success: false, message: e.message });
+    }
+});
+
+// ════════════════════════════════════════════════════
+// IMAGE GALLERY endpoints
+// ════════════════════════════════════════════════════
+
+router.get('/image-gallery', verifyFirebaseToken, async (req, res) => {
+    try {
+        const userId = req.userId;
+        const snap = await admin.firestore()
+            .collection('generated_images')
+            .where('userId', '==', userId)
+            .orderBy('createdAt', 'desc')
+            .limit(100)
+            .get();
+
+        if (snap.empty) return res.json({ success: true, images: [] });
+
+        const images = await Promise.all(snap.docs.map(async (doc) => {
+            const data = doc.data();
+            const fullUrl = await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.full_key }), { expiresIn: 3600 });
+            const thumbUrl = await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.thumb_key }), { expiresIn: 3600 });
+            
+            // Specifically for downloading: force attachment header
+            const downloadUrl = await getSignedUrl(b2, new GetObjectCommand({ 
+                Bucket: process.env.B2_BUCKET_NAME, 
+                Key: data.full_key,
+                ResponseContentDisposition: `attachment; filename="ludusgen_${doc.id}.png"`
+            }), { expiresIn: 3600 });
+
+            return {
+                id: doc.id,
+                ...data,
+                fullUrl,
+                thumbUrl,
+                downloadUrl,
+                createdAt: data.createdAt?.toDate?.() || new Date(),
+            };
+        }));
+
+        res.json({ success: true, images });
+    } catch (err) {
+        console.error('[GalleryList] Error:', err);
+        res.status(500).json({ success: false, message: 'Galéria lekérdezése sikertelen' });
+    }
+});
+
+router.delete('/image-gallery/:id', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const userId = req.userId;
+        const docRef = admin.firestore().collection('generated_images').doc(id);
+        const doc = await docRef.get();
+
+        if (!doc.exists) return res.status(404).json({ success: false, message: 'Kép nem található' });
+        const data = doc.data();
+        if (data.userId !== userId) return res.status(403).json({ success: false, message: 'Nincs jogosultság' });
+
+        // Delete from B2
+        if (data.full_key) await deleteFromB2(data.full_key);
+        if (data.thumb_key) await deleteFromB2(data.thumb_key);
+
+        // Delete from Firestore
+        await docRef.delete();
+
+        res.json({ success: true, message: 'Kép sikeresen törölve' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Törlés sikertelen' });
+    }
+});
+
+router.delete('/image-gallery', verifyFirebaseToken, async (req, res) => {
+    try {
+        const userId = req.userId;
+        const col = admin.firestore().collection('generated_images');
+        const snap = await col.where('userId', '==', userId).get();
+
+        if (snap.empty) return res.json({ success: true, message: 'Nincs mit törölni' });
+
+        // Chunking deletions for B2
+        for (const doc of snap.docs) {
+            const data = doc.data();
+            if (data.full_key) await deleteFromB2(data.full_key);
+            if (data.thumb_key) await deleteFromB2(data.thumb_key);
+        }
+
+        // Batch delete Firestore documents
+        const batch = admin.firestore().batch();
+        snap.docs.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+
+        console.log(`[GalleryBulkDelete] Purged ${snap.size} objects for user ${userId}`);
+        res.json({ success: true, message: 'Összes kép sikeresen törölve' });
+    } catch (err) {
+        console.error('[GalleryBulkDelete] Error:', err);
+        res.status(500).json({ success: false, message: 'Csoportos törlés sikertelen' });
     }
 });
 
