@@ -12,6 +12,7 @@ import {
   createTask,
   getTask,
   cancelTask,
+  acknowledgeTask,
   listTasks,
   getBalance,
   uploadFile,
@@ -110,6 +111,9 @@ export function createTripoRouter(verifyAuth) {
 
   /** Cancel a running/queued task */
   router.post("/tripo/task/:taskId/cancel", verifyAuth, cancelTask);
+
+  /** Acknowledge task completion (stops background poll) */
+  router.post("/tripo/task/:taskId/ack", verifyAuth, acknowledgeTask);
 
   /** List tasks with pagination + status filter */
   router.get("/tripo/tasks", verifyAuth, listTasks);

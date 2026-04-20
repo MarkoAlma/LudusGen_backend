@@ -39,16 +39,17 @@ const TYPE_TO_MODE = {
 };
 
 /* ─── Register a task for background tracking ─────────────────────────── */
-export function registerTask(taskId, userId, type, modelVersion) {
+export function registerTask(taskId, userId, type, modelVersion, prompt = null) {
   if (!taskId || !userId) return;
   pendingTasks.set(taskId, {
     taskId,
     userId,
     type: type ?? "unknown",
     modelVersion: modelVersion ?? "unknown",
+    prompt,
     startedAt: Date.now(),
   });
-  console.log(`[TaskRecovery] Registered task ${taskId} for user ${userId}`);
+  console.log(`[TaskRecovery] Registered task ${taskId} for user ${userId}${prompt ? ` (${prompt})` : ''}`);
 }
 
 /* ─── Unregister a task (called when frontend successfully polls it) ──── */
@@ -89,8 +90,10 @@ export function startTaskRecovery() {
         } else if (status === "failed" || status === "cancelled") {
           await handleFailedTask(entry, taskData);
           pendingTasks.delete(entry.taskId);
+        } else {
+          // "queued" or "running" — keep polling
+          console.log(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) still ${status}...`);
         }
-        // "queued" or "running" — keep polling
       } catch (err) {
         console.error(`[TaskRecovery] Poll error for task ${entry.taskId}:`, err.message);
       }
@@ -126,12 +129,26 @@ export function stopTaskRecovery() {
 async function saveToHistory(entry, taskData) {
   const db = admin.firestore();
   const out = taskData.output ?? {};
-  const modelUrl = out.model ?? out.pbr_model ?? out.base_model
-    ?? out.rigged_model ?? out.animated_model
-    ?? out.converted_model ?? out.stylized_model ?? null;
+
+  // prerigcheck only returns is_animatable — no model to save
+  if (entry.type === "animate_prerigcheck") {
+    console.log(`[TaskRecovery] prerigcheck task ${entry.taskId} completed (is_animatable=${out.is_animatable}) — no model to save`);
+    return;
+  }
+
+  const animatedModels = Array.isArray(out.animated_models) && out.animated_models.length > 0
+    ? out.animated_models
+    : null;
+  if (animatedModels && entry.type === "animate_retarget") {
+    console.log(`[TaskRecovery] animate_retarget ${entry.taskId}: animated_models count=${animatedModels.length}`, animatedModels);
+  }
+  const modelUrl = out.model ?? out.model_url ?? out.pbr_model ?? out.base_model
+    ?? out.rigged_model ?? (animatedModels ? animatedModels[0] : out.animated_model)
+    ?? out.converted_model ?? out.low_poly_model
+    ?? out.stylized_model ?? null;
 
   if (!modelUrl) {
-    console.log(`[TaskRecovery] No model URL for completed task ${entry.taskId}`);
+    console.warn(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) succeeded but no model URL found in output:`, JSON.stringify(out));
     return;
   }
 
@@ -150,23 +167,34 @@ async function saveToHistory(entry, taskData) {
   const mode = TYPE_TO_MODE[entry.type] ?? "generate";
   const now = Date.now();
 
-  await db.collection(HISTORY_COLLECTION).add({
-    userId: entry.userId,
-    prompt: taskData.prompt ?? entry.type,
-    status: "succeeded",
-    model_url: modelUrl,
-    source: "tripo",
-    mode,
-    taskId: entry.taskId,
-    params: {
-      model_version: entry.modelVersion,
+  const urlsToSave = animatedModels ?? [modelUrl];
+  for (let i = 0; i < urlsToSave.length; i++) {
+    const url = urlsToSave[i];
+    if (!url) continue;
+    const stableDocId = urlsToSave.length > 1 ? `tripo_${entry.taskId}_${i}` : `tripo_${entry.taskId}`;
+    await db.collection(HISTORY_COLLECTION).doc(stableDocId).set({
+      userId: entry.userId,
+      prompt: entry.prompt ?? taskData.prompt ?? entry.type,
+      status: "succeeded",
+      model_url: url,
+      source: "tripo",
       mode,
-      type: entry.type,
-    },
-    ts: now,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    expiresAt: now + HISTORY_TTL_MS,
-  });
+      taskId: entry.taskId,
+      ...(urlsToSave.length > 1 && { animationIndex: i }),
+      params: {
+        model_version: entry.modelVersion,
+        mode,
+        type: entry.type,
+        rig_type: out.rig_type ?? out.topology ?? null,
+        topology: out.topology ?? null,
+        is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,
+      },
+      ts: now,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: now + HISTORY_TTL_MS,
+    }, { merge: true });
+  }
+  console.log(`[TaskRecovery] Saved ${urlsToSave.length} model(s) for task ${entry.taskId} to history for user ${entry.userId}`);
 
   console.log(`[TaskRecovery] Saved task ${entry.taskId} to history for user ${entry.userId}`);
 }
@@ -175,13 +203,17 @@ async function saveToHistory(entry, taskData) {
 async function handleFailedTask(entry, taskData) {
   const taskId = entry.taskId;
   const userId = entry.userId;
+  console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. rawOutput:`, JSON.stringify(taskData.rawOutput ?? {}));
 
   // Look up the charged amount from credit_history
+  // NOTE: collectionGroup with multiple where() requires a composite index.
+  // Instead, query by taskId only and filter type in-memory to avoid index setup.
   const db = admin.firestore();
-  const snap = await db.collectionGroup("transactions")
+  const snap = await db.collection("credit_history")
+    .doc(userId)
+    .collection("transactions")
     .where("taskId", "==", taskId)
-    .where("type", "==", "debit")
-    .limit(1)
+    .limit(10)
     .get();
 
   if (snap.empty) {
@@ -189,7 +221,13 @@ async function handleFailedTask(entry, taskData) {
     return;
   }
 
-  const data = snap.docs[0].data();
+  // Find the debit transaction in-memory
+  const debitDoc = snap.docs.find(d => d.data().type === "debit");
+  if (!debitDoc) {
+    console.log(`[TaskRecovery] No debit transaction found for failed task ${taskId}`);
+    return;
+  }
+  const data = debitDoc.data();
 
   // Check for NSFW/content policy — no refund
   const errorMsg = (taskData.error ?? "").toLowerCase();

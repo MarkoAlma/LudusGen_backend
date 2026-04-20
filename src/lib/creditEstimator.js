@@ -23,6 +23,15 @@ const isP1 = (mv) => mv === "P1-20260311";
 export function estimateCost(req) {
   const mv  = req.model_version ?? DEFAULT_MODEL;
   const key = `${req.type}:${mv}`;
+
+  // Non-generation task types have flat costs (no model_version variant).
+  // Examples: animate_prerigcheck, animate_rig, animate_retarget, convert_model,
+  // smart_low_poly, stylize_model, refine_model, mesh_segmentation, etc.
+  // These are stored in CREDIT_COSTS without a model_version suffix.
+  if (CREDIT_COSTS[req.type] !== undefined) {
+    return { total: CREDIT_COSTS[req.type], breakdown: { [req.type]: CREDIT_COSTS[req.type] } };
+  }
+
   const base = CREDIT_COSTS[key] ?? 10;
   const breakdown = { base };
 
