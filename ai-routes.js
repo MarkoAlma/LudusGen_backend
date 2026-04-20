@@ -1238,12 +1238,14 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         max_tokens: safeMax,
                         top_p: Math.min(Math.max(0, top_p), 1),
                         stream: true,
-                        stream_options: { include_usage: true }
+                        stream_options: { include_usage: true },
+                        chat_template_kwargs: { enable_thinking: true }
                     },
                     {
                         headers: {
                             'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
                             'Content-Type': 'application/json',
+                            'Accept': 'text/event-stream'
                         },
                         responseType: 'stream',
                         timeout: 300000,
@@ -1263,6 +1265,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             const keepAlive = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, 15000);
 
             let clientConnected = true;
+            let hasReasoningStarted = false;
+
             req.on('close', () => {
                 clientConnected = false;
                 clearInterval(keepAlive);
@@ -1275,7 +1279,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 if (!clientConnected) return;
                 buf += chunk.toString('utf8');
                 const lines = buf.split('\n');
-                buf = lines.pop();
+                buf = lines.pop(); // Maradék a következő darabhoz
                 for (const line of lines) {
                     const trimmed = line.trim();
                     if (!trimmed.startsWith('data: ')) continue;
@@ -1283,11 +1287,32 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     if (raw === '[DONE]') continue;
                     try {
                         const parsed = JSON.parse(raw);
-                        const delta = parsed.choices?.[0]?.delta?.content || '';
-                        if (delta && clientConnected) {
-                            totalContent += delta;
-                            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+                        const deltaObj = parsed.choices?.[0]?.delta || {};
+                        
+                        let deltaOut = '';
+                        
+                        // Ha kapunk gondolkodási fázist (NVIDIA / DeepSeek reasoning_content)
+                        if (deltaObj.reasoning_content) {
+                            if (!hasReasoningStarted) {
+                                hasReasoningStarted = true;
+                                deltaOut += '```thinking\n'; // Opcionális formázás a UI-nak
+                            }
+                            deltaOut += deltaObj.reasoning_content;
+                        } 
+                        
+                        if (deltaObj.content) {
+                            if (hasReasoningStarted) {
+                                hasReasoningStarted = false;
+                                deltaOut += '\n```\n'; // Lezárjuk a blokkot
+                            }
+                            deltaOut += deltaObj.content;
                         }
+
+                        if (deltaOut && clientConnected) {
+                            totalContent += deltaOut;
+                            res.write(`data: ${JSON.stringify({ delta: deltaOut })}\n\n`);
+                        }
+
                         if (parsed.usage) {
                             usageInfo = parsed.usage;
                         }
@@ -2723,7 +2748,6 @@ router.post('/chat/switch-model', verifyFirebaseToken, async (req, res) => {
         await sessionRef.set({
             modelId: newModelId,
             modelName: modelConfig.apiModel,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
 
         const messagesSnap = await sessionRef.collection('messages').orderBy('timestamp', 'asc').get();
@@ -2790,6 +2814,29 @@ router.get('/image-gallery', verifyFirebaseToken, async (req, res) => {
     } catch (err) {
         console.error('[GalleryList] Error:', err);
         res.status(500).json({ success: false, message: 'Galéria lekérdezése sikertelen' });
+    }
+});
+
+router.get('/image-gallery/proxy', verifyFirebaseToken, async (req, res) => {
+    try {
+        const userId = req.userId;
+        const { key } = req.query;
+        if (!key) return res.status(400).json({ success: false, message: 'Missing key' });
+
+        // Verify the key belongs to this user
+        if (!key.startsWith(`users/${userId}/`)) {
+            return res.status(403).json({ success: false, message: 'Forbidden' });
+        }
+
+        const signedUrl = await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key }), { expiresIn: 60 });
+        const response = await axios.get(signedUrl, { responseType: 'arraybuffer' });
+        const contentType = response.headers['content-type'] || 'image/png';
+        res.set('Content-Type', contentType);
+        res.set('Cache-Control', 'private, max-age=3600');
+        res.send(response.data);
+    } catch (err) {
+        console.error('[GalleryProxy] Error:', err);
+        res.status(500).json({ success: false, message: 'Proxy failed' });
     }
 });
 
