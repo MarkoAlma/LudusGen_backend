@@ -122,7 +122,7 @@ class TaskService {
           }
           if (!b["texture"] && !b["pbr"]) delete b["texture_quality"];
           if (!b["texture"]) delete b["texture"];
-          if (!b["pbr"])     delete b["pbr"];
+          if (!b["pbr"]) delete b["pbr"];
           break; // P1 validáció kész, többi szabály nem vonatkozik rá
         }
 
@@ -132,6 +132,13 @@ class TaskService {
           if (body.type === "text_to_model" && !p?.trim())
             throw new Error("prompt is required for text_to_model");
           if (p && p.length > 1000) throw new Error("prompt max 1000 characters");
+        }
+
+        // negative_prompt length — Tripo API max 255 characters
+        const np = b["negative_prompt"];
+        if (np && np.length > 255) {
+          b["negative_prompt"] = np.slice(0, 255);
+          console.warn(`[TaskService] negative_prompt truncated to 255 chars (was ${np.length})`);
         }
 
         // generate_parts constraints
@@ -215,23 +222,54 @@ class TaskService {
         if (!["glb", "fbx"].includes(fmt))
           throw new Error("out_format must be glb or fbx");
         b["out_format"] = fmt;
-        const spec = b["spec"] ?? "mixamo";
+
+        // Default to "tripo" spec (API preferred)
+        const spec = b["spec"] ?? "tripo";
         if (!["mixamo", "tripo"].includes(spec))
           throw new Error("spec must be mixamo or tripo");
         b["spec"] = spec;
+
+        // Set rig_type if not provided
+        if (!b["rig_type"]) b["rig_type"] = "biped";
+        const validRigTypes = ["biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic"];
+        if (!validRigTypes.includes(b["rig_type"]))
+          throw new Error(`Invalid rig_type. Valid: ${validRigTypes.join(", ")}`);
+
+        // Add missing optional flags with proper defaults
+        // FIX: handle export_geometry alias from older frontend code
+        if (b["export_with_geometry"] === undefined && b["export_geometry"] !== undefined) {
+          b["export_with_geometry"] = b["export_geometry"];
+        }
+        delete b["export_geometry"]; // always cleanup the alias
+
+        if (b["bake_animation"] === undefined) b["bake_animation"] = true;
+        if (b["export_with_geometry"] === undefined) b["export_with_geometry"] = true;
+        if (b["animate_in_place"] === undefined) b["animate_in_place"] = false;
+
         break;
       }
 
       case "animate_retarget": {
         if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
+
         const fmt = b["out_format"] ?? "glb";
         if (!["glb", "fbx"].includes(fmt))
           throw new Error("out_format must be glb or fbx");
         b["out_format"] = fmt;
+
+        // Handle both animation (single) and animations (array) formats
+        // taskController már preset:biped:walk formátumra alakítja az értéket
         const animList = b["animations"] ?? (b["animation"] ? [b["animation"]] : []);
         if (animList.length === 0) throw new Error("animation or animations array required");
-        const invalid = animList.filter(a => !VALID_ANIMATIONS.has(a));
+
+        // Validate: preset: prefixes always pass, otherwise check VALID_ANIMATIONS
+        const invalid = animList.filter(a => {
+          if (a.startsWith("preset:")) return false;
+          return !VALID_ANIMATIONS.has(a);
+        });
         if (invalid.length) throw new Error(`Unknown animation(s): ${invalid.join(", ")}`);
+
+        // Normalize to API format: arrays > 1 item, single strings for 1 item
         if (animList.length > 1) {
           b["animations"] = animList;
           delete b["animation"];
@@ -239,6 +277,12 @@ class TaskService {
           b["animation"] = animList[0];
           delete b["animations"];
         }
+
+        // Add optional parameters with proper defaults
+        if (b["bake_animation"] === undefined) b["bake_animation"] = true;
+        if (b["export_with_geometry"] === undefined) b["export_with_geometry"] = true;
+        if (b["animate_in_place"] === undefined) b["animate_in_place"] = false;
+
         break;
       }
 
@@ -281,8 +325,17 @@ class TaskService {
       }
 
       case "import_model":
-        if (!b["file"]?.["object"])
-          throw new Error("file.object required for import_model");
+        if (!b["file"])
+          throw new Error("file required for import_model");
+        break;
+
+      case "texture_edit":
+        b["type"] = "texture_model";
+        if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
+        if (!["standard", "detailed"].includes(b["texture_quality"])) {
+          b["texture_quality"] = "standard";
+        }
+        delete b["creativity_strength"];
         break;
     }
 
@@ -292,18 +345,32 @@ class TaskService {
   /* ── Convert raw task to PollResult ──────────────────────────────── */
   taskToPollResult(task) {
     const out = task.output ?? {};
+    if (task.status === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
+      console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
+    }
     return {
       success: task.status === "success",
       status: task.status,
       progress: task.progress ?? 0,
       modelUrl:
-        out.model ??
         out.pbr_model ??
+        out.textured_model ??
+        out.model ??
+        out.model_url ??
         out.base_model ??
         out.rigged_model ??
-        out.animated_model ??
+        (Array.isArray(out.animated_models) && out.animated_models.length > 0
+          ? out.animated_models[0]
+          : out.animated_model) ??
+        out.converted_model ??
+        out.low_poly_model ??
+        out.segmented_model ??
+        out.stylized_model ??
+        out.refined_model ??
         null,
-      rigCheckResult: out.is_animatable ?? null,
+      rigCheckResult: out.is_animatable ?? out.animatable ?? out.riggable ?? out.rig_check_result ?? null,
+      rigType: out.rig_type ?? out.topology ?? null,
+      topology: out.topology ?? null,
       rawOutput: out,
     };
   }

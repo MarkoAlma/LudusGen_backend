@@ -8,7 +8,7 @@ const HISTORY_COLLECTION = "trellis_history";
 
 export async function handleWebhook(req, res) {
   // Signature verification — raw body must be captured by express.raw() middleware
-  const rawBody   = req.rawBody ?? Buffer.from(JSON.stringify(req.body));
+  const rawBody = req.rawBody ?? Buffer.from(JSON.stringify(req.body));
   const sigHeader = (req.headers["x-tripo-signature"] ?? "");
 
   if (!webhookService.verifySignature(rawBody, sigHeader)) {
@@ -96,8 +96,10 @@ async function saveCompletedTaskToHistory(taskId, payload) {
 
   const out = taskData.output ?? {};
   const modelUrl = out.model ?? out.pbr_model ?? out.base_model
-    ?? out.rigged_model ?? out.animated_model
-    ?? out.converted_model ?? out.stylized_model ?? null;
+    ?? out.rigged_model
+    ?? (Array.isArray(out.animated_models) ? out.animated_models[0] : out.animated_model)
+    ?? out.converted_model ?? out.low_poly_model
+    ?? out.stylized_model ?? null;
 
   if (!modelUrl) {
     console.log(`[WebhookController] No model URL for completed task ${taskId}`);

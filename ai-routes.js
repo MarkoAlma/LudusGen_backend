@@ -1584,23 +1584,32 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
             return res.status(500).json({ success: false, message: 'GROQ_API_KEY nincs beállítva' });
         }
 
-        const safeMax = Math.min(Math.max(128, max_tokens), 1024);
+        const isReasoningModel = model.includes('gpt-oss') || model.includes('deepseek-r1') || model.includes('qwq');
+        const tokenCap = isReasoningModel ? 16384 : 1024;
+        const safeMax = Math.min(Math.max(128, max_tokens), tokenCap);
 
         // FIX: messages helyesen átadva (nem optimizedMessages)
         const chatMsgs = normalizeMessages(messages);
 
         let resp;
         try {
-            resp = await groqWithRetry({
+            const body = {
                 model,
                 messages: chatMsgs,
-                temperature: Math.min(Math.max(0, temperature), 2),
-                max_tokens: safeMax,
-                top_p: Math.min(Math.max(0, top_p), 1),
-                frequency_penalty: Math.min(Math.max(-2, frequency_penalty), 2),
-                presence_penalty: Math.min(Math.max(-2, presence_penalty), 2),
                 stream: false,
-            });
+            };
+
+            if (isReasoningModel) {
+                body.max_completion_tokens = safeMax;
+            } else {
+                body.temperature       = Math.min(Math.max(0, temperature), 2);
+                body.max_tokens        = safeMax;
+                body.top_p             = Math.min(Math.max(0, top_p), 1);
+                body.frequency_penalty = Math.min(Math.max(-2, frequency_penalty), 2);
+                body.presence_penalty  = Math.min(Math.max(-2, presence_penalty), 2);
+            }
+
+            resp = await groqWithRetry(body);
         } catch (err) {
             const msg = err.response?.data?.error?.message || err.message || 'Groq API hiba';
             console.error('❌ Groq API hiba:', msg);

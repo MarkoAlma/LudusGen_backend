@@ -159,6 +159,32 @@ export async function refundCredits(userId, amount, taskId, reason) {
 }
 
 /**
+ * Link a real Tripo taskId to an existing transaction.
+ * Usually used to replace the "pending_..." temporary ID after task creation.
+ *
+ * @param {string} userId - Firebase UID
+ * @param {string} tempTaskId - The temporary ID used during deduction
+ * @param {string} realTaskId - The actual ID returned by Tripo
+ */
+export async function linkTaskIdToTransaction(userId, tempTaskId, realTaskId) {
+  const db = admin.firestore();
+  const snap = await db.collection(CREDIT_HISTORY_COLLECTION)
+    .doc(userId)
+    .collection("transactions")
+    .where("taskId", "==", tempTaskId)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    console.warn(`[CreditService] No transaction found with temp ID ${tempTaskId} for user ${userId}`);
+    return;
+  }
+
+  await snap.docs[0].ref.update({ taskId: realTaskId });
+  console.log(`[CreditService] Linked temp ID ${tempTaskId} to real taskId ${realTaskId}`);
+}
+
+/**
  * Get current credit balance for a user.
  *
  * @param {string} userId - Firebase UID

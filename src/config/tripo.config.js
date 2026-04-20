@@ -29,11 +29,31 @@ export const RIGGED_UNSUPPORTED_FORMATS = new Set(["obj", "stl"]);
 export const VALID_ANIMATIONS = new Set([
   "idle", "walk", "run", "jump", "wave",
   "dance", "attack", "die", "crouch", "swim",
+  // Full Tripo animation library (all slugs from animationlibrary.js)
+  "afraid", "agree", "angry_01", "angry_02", "angry_03",
+  "basketball_shot", "bow", "box_01", "box_02", "box_03",
+  "cast_a_spell", "cheer", "chop", "clap", "climb",
+  "complain_01", "complain_02", "crossover_dribble", "cry",
+  "dance_01", "dance_02", "dance_03", "dance_04", "dance_05", "dance_06",
+  "defeat", "defeat_02", "depressed", "dig", "dive", "dribble",
+  "fall", "fire", "flee_01", "flee_02", "flip", "fold_arms",
+  "football_catch", "football_save", "football_pass", "freaky", "frightened",
+  "front_kick_01", "front_kick_02", "frustrated_01", "frustrated_02",
+  "greet_01", "greet_02", "greet_03", "greet_04", "heart_pose",
+  "hit_to_body_01", "hit_to_body_02", "hit_to_head", "hit_to_side", "hit_to_stomach",
+  "hug", "jump_down", "jump_rope_01", "jump_rope_02",
+  "laugh_01", "laugh_02", "lift_heavy", "look_around",
+  "make_a_call_01", "make_a_call_02", "pitch_baseball",
+  "play_mobile_game", "play_video_game", "press-up",
+  "run_upstairs", "scared_01", "scared_02", "scratch", "shoot",
+  "shovel", "sing_01", "sing_02", "sing_03", "sing_04",
+  "sit", "slash", "sob", "standing_relax", "surf", "swagger",
+  "turn", "volleyball", "wait", "warm_up",
+  "wave_goodbye_01", "wave_goodbye_02",
 ]);
 
 export const VALID_STYLES = new Set([
-  "cartoon", "clay", "alien", "christmas", "steampunk",
-  "lego", "voxel", "voronoi", "minecraft", "gold", "ancient_bronze",
+  "lego", "voxel", "voronoi", "minecraft",
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────────
