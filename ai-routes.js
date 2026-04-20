@@ -168,14 +168,14 @@ const genLimiter = rateLimit({
 function printTokenUsage(provider, model, usage) {
     const p = provider.toUpperCase().padEnd(10);
     const m = model.padEnd(25);
-    
+
     // Alap mezők
     const inT = (usage.prompt_tokens || usage.input_tokens || 0);
     const outT = (usage.completion_tokens || usage.output_tokens || 0);
-    
+
     // Ha az API adott total-t, azt tekintjük alapnak
     const totalT = (usage.total_tokens || (inT + outT));
-    
+
     // Kiszámoljuk az eltérést (pl. cache kért tartalom)
     const extraT = Math.max(0, totalT - (inT + outT));
 
@@ -605,16 +605,16 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                                 completion_tokens: usageInfo.output_tokens,
                                 total_tokens: usageInfo.input_tokens + usageInfo.output_tokens
                             };
-                            await logUsage(req.userId, 'chat', { 
-                                model: apiModel, 
-                                provider: 'anthropic', 
-                                ...finalUsage 
+                            await logUsage(req.userId, 'chat', {
+                                model: apiModel,
+                                provider: 'anthropic',
+                                ...finalUsage
                             });
                             const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'anthropic');
                             res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
                         } catch (e) {
                             console.error('[Chat] Anthropic mentés sikertelen:', e.message);
-                            
+
                         }
                     }
                     activeStreams.delete(streamKey);
@@ -699,9 +699,9 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             total_tokens: Math.ceil(totalContent.length / 4)
                         };
 
-                        await logUsage(req.userId, 'chat', { 
-                            model: apiModel, 
-                            provider: 'openai', 
+                        await logUsage(req.userId, 'chat', {
+                            model: apiModel,
+                            provider: 'openai',
                             ...finalUsage
                         });
                         const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'openai');
@@ -824,10 +824,10 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             completion_tokens: Math.ceil(totalContent.length / 4),
                             total_tokens: Math.ceil(totalContent.length / 4)
                         };
-                        await logUsage(req.userId, 'chat', { 
-                            model: apiModel, 
-                            provider: 'cerebras', 
-                            ...finalUsage 
+                        await logUsage(req.userId, 'chat', {
+                            model: apiModel,
+                            provider: 'cerebras',
+                            ...finalUsage
                         });
                         const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'cerebras');
                         res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
@@ -944,10 +944,10 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             completion_tokens: Math.ceil(totalContent.length / 4),
                             total_tokens: Math.ceil(totalContent.length / 4)
                         };
-                        await logUsage(req.userId, 'chat', { 
-                            model: apiModel, 
-                            provider: 'mistral', 
-                            ...finalUsage 
+                        await logUsage(req.userId, 'chat', {
+                            model: apiModel,
+                            provider: 'mistral',
+                            ...finalUsage
                         });
                         const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'mistral');
                         res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
@@ -1186,10 +1186,10 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                             completion_tokens: Math.ceil(totalContent.length / 4),
                             total_tokens: Math.ceil(totalContent.length / 4)
                         };
-                        await logUsage(req.userId, 'chat', { 
-                            model: apiModel, 
-                            provider: 'gemini', 
-                            ...finalUsage 
+                        await logUsage(req.userId, 'chat', {
+                            model: apiModel,
+                            provider: 'gemini',
+                            ...finalUsage
                         });
                         const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'gemini');
                         res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
@@ -1223,6 +1223,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             res.setHeader('Connection', 'keep-alive');
             res.setHeader('X-Accel-Buffering', 'no');
             res.flushHeaders();
+
 
             let streamResp;
             let totalContent = '';
@@ -1288,9 +1289,9 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     try {
                         const parsed = JSON.parse(raw);
                         const deltaObj = parsed.choices?.[0]?.delta || {};
-                        
+
                         let deltaOut = '';
-                        
+
                         // Ha kapunk gondolkodási fázist (NVIDIA / DeepSeek reasoning_content)
                         if (deltaObj.reasoning_content) {
                             if (!hasReasoningStarted) {
@@ -1298,8 +1299,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                                 deltaOut += '```thinking\n'; // Opcionális formázás a UI-nak
                             }
                             deltaOut += deltaObj.reasoning_content;
-                        } 
-                        
+                        }
+
                         if (deltaObj.content) {
                             if (hasReasoningStarted) {
                                 hasReasoningStarted = false;
@@ -1602,11 +1603,11 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
             if (isReasoningModel) {
                 body.max_completion_tokens = safeMax;
             } else {
-                body.temperature       = Math.min(Math.max(0, temperature), 2);
-                body.max_tokens        = safeMax;
-                body.top_p             = Math.min(Math.max(0, top_p), 1);
+                body.temperature = Math.min(Math.max(0, temperature), 2);
+                body.max_tokens = safeMax;
+                body.top_p = Math.min(Math.max(0, top_p), 1);
                 body.frequency_penalty = Math.min(Math.max(-2, frequency_penalty), 2);
-                body.presence_penalty  = Math.min(Math.max(-2, presence_penalty), 2);
+                body.presence_penalty = Math.min(Math.max(-2, presence_penalty), 2);
             }
 
             resp = await groqWithRetry(body);
@@ -2801,10 +2802,10 @@ router.get('/image-gallery', verifyFirebaseToken, async (req, res) => {
             const data = doc.data();
             const fullUrl = await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.full_key }), { expiresIn: 3600 });
             const thumbUrl = await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.thumb_key }), { expiresIn: 3600 });
-            
+
             // Specifically for downloading: force attachment header
-            const downloadUrl = await getSignedUrl(b2, new GetObjectCommand({ 
-                Bucket: process.env.B2_BUCKET_NAME, 
+            const downloadUrl = await getSignedUrl(b2, new GetObjectCommand({
+                Bucket: process.env.B2_BUCKET_NAME,
                 Key: data.full_key,
                 ResponseContentDisposition: `attachment; filename="ludusgen_${doc.id}.png"`
             }), { expiresIn: 3600 });
