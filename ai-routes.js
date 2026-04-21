@@ -27,6 +27,8 @@ import {
     trimToContextLimit,
 } from './src/lib/contextBuilder.js';
 
+import { registerJob, unregisterJob, activeJobs } from './src/lib/jobRegistry.js';
+
 import { existsSync, writeFileSync, unlinkSync } from 'fs';
 
 // ── Riva proto betöltés ───────────────────────────────────────────────────────
@@ -109,17 +111,6 @@ REQUIRED_KEYS.forEach((key) => {
 
 const activeStreams = new Map();
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-fal.config({ credentials: process.env.FAL_KEY });
-
-const MESHY_KEY = process.env.MESHY_API_KEY || process.env.TRIPO3D_API_KEY || process.env.TRIPO3D;
-const meshy = axios.create({
-    baseURL: 'https://api.meshy.ai',
-    headers: { Authorization: `Bearer ${MESHY_KEY}` },
-});
-
 // ── Firebase Auth middleware ──────────────────────────────────────────────────
 const verifyFirebaseToken = async (req, res, next) => {
     try {
@@ -141,6 +132,34 @@ const verifyFirebaseToken = async (req, res, next) => {
         return res.status(401).json({ success: false, message: 'Érvénytelen token' });
     }
 };
+
+// ── Job Registry for Cancellation & Timeouts (Moved to src/lib/jobRegistry.js) ──
+
+router.post('/cancel-job', verifyFirebaseToken, (req, res) => {
+    const { jobId } = req.body;
+    if (!jobId) return res.status(400).json({ success: false, message: 'Hiányzó jobId' });
+    const job = activeJobs.get(jobId);
+    if (job) {
+        console.log(`[Cancel] User requested cancellation for job: ${jobId}`);
+        job.controller.abort();
+        clearTimeout(job.timeoutId);
+        activeJobs.delete(jobId);
+        return res.json({ success: true, message: 'Folyamat megszakítva' });
+    }
+    return res.status(404).json({ success: false, message: 'Folyamat nem található vagy már véget ért' });
+});
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+fal.config({ credentials: process.env.FAL_KEY });
+
+const MESHY_KEY = process.env.MESHY_API_KEY || process.env.TRIPO3D_API_KEY || process.env.TRIPO3D;
+const meshy = axios.create({
+    baseURL: 'https://api.meshy.ai',
+    headers: { Authorization: `Bearer ${MESHY_KEY}` },
+});
+
 
 // ── Rate limitek ─────────────────────────────────────────────────────────────
 const chatLimiter = rateLimit({
@@ -273,7 +292,7 @@ function getModelConfig(modelId) {
         'gpt4o_mini': { apiModel: 'gpt-4o-mini', provider: 'openai', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'gpt4o': { apiModel: 'gpt-4o', provider: 'openai', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'gpt4o_code': { apiModel: 'gpt-4o', provider: 'openai', defaultSystemPrompt: 'You are an elite software engineer with deep expertise across all programming languages and paradigms.\n- Produce production-ready, optimized code\n- Apply SOLID principles and design patterns\n- Include comprehensive error handling\n- Write thorough technical explanations\n- Review and suggest improvements proactively\n- Respond in the same language the user writes in' },
-        'deepseek_code': { apiModel: 'arcee-ai/trinity-large-preview:free', provider: 'openrouter', defaultSystemPrompt: 'You are an elite software engineer with deep expertise across all programming languages and paradigms.\n- Produce production-ready, optimized code\n- Apply SOLID principles and design patterns\n- Include comprehensive error handling\n- Write thorough technical explanations\n- Review and suggest improvements proactively\n- Respond in the same language the user writes in' },
+        'trinity-large': { apiModel: 'arcee-ai/trinity-large-preview:free', provider: 'openrouter', defaultSystemPrompt: 'You are an elite software engineer with deep expertise across all programming languages and paradigms.\n- Produce production-ready, optimized code\n- Apply SOLID principles and design patterns\n- Include comprehensive error handling\n- Write thorough technical explanations\n- Review and suggest improvements proactively\n- Respond in the same language the user writes in' },
         'gemini-3-flash': { apiModel: 'gemini-3-flash-preview', provider: 'gemini', defaultSystemPrompt: 'You are a helpful AI assistant powered by Google Gemini. Respond in the same language the user writes in.' },
         'gemini-2.5-pro': { apiModel: 'gemini-2.5-pro', provider: 'gemini', defaultSystemPrompt: 'You are a helpful AI assistant powered by Google Gemini. Respond in the same language the user writes in.' },
         'groq-gpt120b': { apiModel: 'openai/gpt-oss-120b', provider: 'groq', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
@@ -317,6 +336,30 @@ async function groqWithRetry(body, retries = 3) {
                 throw err;
             }
         }
+    }
+}
+
+async function generateSessionTitle(firstUserMessage) {
+    try {
+        const resp = await groqWithRetry({
+            model: 'llama-3.3-70b-versatile',
+            messages: [
+                {
+                    role: 'system',
+                    content: 'You are a title generator. Given a user message, respond with ONLY a 2-4 word title summarizing the topic. No punctuation, no quotes, no explanation. Just the title words.',
+                },
+                { role: 'user', content: `Message: ${String(firstUserMessage).slice(0, 500)}\n\nTitle:` },
+            ],
+            temperature: 0.3,
+            max_tokens: 20,
+            stream: false,
+        });
+        const raw = resp.data?.choices?.[0]?.message?.content?.trim();
+        if (!raw || raw.toLowerCase() === 'null' || raw.length < 2) return null;
+        return raw;
+    } catch (e) {
+        console.warn('[Title] Generation failed:', e.message);
+        return null;
     }
 }
 
@@ -480,6 +523,19 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         context = trimToContextLimit(context, 8192 * 32 * 0.8);
 
         console.log(`[Chat] Kontextus: ${context.length} üzenet, summary: ${sessionData.summary ? 'igen' : 'nem'}`);
+
+        // ── Title generálás (csak az első üzenetnél) ──
+        if (!sessionData.title) {
+            const firstUserText = typeof message === 'string' ? message : '[kép]';
+            console.log(`[Title] Generating for session ${sessionId}, message: "${firstUserText.slice(0, 60)}"`);
+            const generatedTitle = await generateSessionTitle(firstUserText);
+            console.log(`[Title] Generated: "${generatedTitle}"`);
+            if (generatedTitle) {
+                await sessionRef.set({ title: generatedTitle }, { merge: true });
+                sessionData.title = generatedTitle;
+                console.log(`[Title] Saved to Firestore: "${generatedTitle}"`);
+            }
+        }
 
         // ── API paraméterek ──
         const temperature = sessionData.temperature ?? 0.7;
@@ -1750,7 +1806,11 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             seed, num_images = 1,
             aspect_ratio = '1:1',
             input_image,
+            jobId,
         } = req.body;
+
+        const controller = new AbortController();
+        registerJob(jobId, controller, 600000); // 10 minutes timeout
 
         if (!prompt?.trim()) {
             return res.status(400).json({ success: false, message: 'Hiányzó prompt' });
@@ -1810,6 +1870,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                         'Content-Type': 'application/json',
                     },
                     timeout: 120000,
+                    signal: controller.signal,
                 }
             );
 
@@ -1830,6 +1891,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             for (const img of images) {
                 processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'google-image', aspect_ratio, width: img.width, height: img.height });
             }
+            unregisterJob(jobId);
             sseStart(res);
             sseEmit(res, { type: 'done', images });
             return res.end();
@@ -1865,10 +1927,15 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             if (isEditModel) {
                 try {
                     for (let idx = 0; idx < rawInputImages.length; idx++) {
-                        const inputBuffer = Buffer.from(
-                            rawInputImages[idx].replace(/^data:image\/\w+;base64,/, ''),
-                            'base64'
-                        );
+                        const base64Str = rawInputImages[idx].includes(';base64,')
+                            ? rawInputImages[idx].split(';base64,').pop()
+                            : rawInputImages[idx];
+                        const inputBuffer = Buffer.from(base64Str, 'base64');
+
+                        if (!inputBuffer || inputBuffer.length === 0) {
+                            throw new Error('Üres kép puffer (Base64 dekódolási hiba)');
+                        }
+
                         const meta = await sharp(inputBuffer).metadata();
                         if (idx === 0) { originalWidth = meta.width; originalHeight = meta.height; }
 
@@ -2013,13 +2080,15 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
             let imageUrl = null;
             for (let i = 0; i < 150; i++) {
+                if (controller.signal.aborted) break;
                 await new Promise((r) => setTimeout(r, i === 0 ? 2000 : 3000));
+                if (controller.signal.aborted) break;
                 const elapsed = Math.round((Date.now() - startTime) / 1000);
                 let pollData;
                 try {
                     const pollResp = await fetch(`https://api-inference.modelscope.ai/v1/tasks/${taskId}`, {
                         headers: { ...msHeaders, 'X-ModelScope-Task-Type': 'image_generation' },
-                        signal: AbortSignal.timeout(15000),
+                        signal: controller.signal,
                     });
                     pollData = await pollResp.json();
                 } catch (e) {
@@ -2060,6 +2129,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             for (const img of finalImages) {
                 processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
             }
+            unregisterJob(jobId);
             sseEmit(res, { type: 'done', images: finalImages });
             return res.end();
         }
@@ -2195,6 +2265,16 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
         }
 
     } catch (err) {
+        unregisterJob(req.body.jobId);
+        if (err.name === 'AbortError') {
+            console.log(`[Abort] Job ${req.body.jobId} was aborted.`);
+            if (!res.headersSent) {
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'Folyamat megszakítva (Timeout/User cancel)' });
+                return res.end();
+            }
+            return;
+        }
         console.error('❌ Image gen hiba:', err);
         if (err.response?.status === 402) { sseStart(res); sseEmit(res, { type: 'error', message: 'Nincs elegendő kredit' }); return res.end(); }
         if (err.response?.status === 403) { sseStart(res); sseEmit(res, { type: 'error', message: 'Érvénytelen API kulcs' }); return res.end(); }
@@ -2207,7 +2287,9 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 // ════════════════════════════════════════════════════
 router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res) => {
     try {
-        const { model = 'tts-1', provider = 'openai', text, voice = 'nova', speed = 1.0, format = 'mp3' } = req.body;
+        const { model = 'tts-1', provider = 'openai', text, voice = 'nova', speed = 1.0, format = 'mp3', jobId } = req.body;
+        const controller = new AbortController();
+        registerJob(jobId, controller, 600000);
 
         if (!text?.trim()) return res.status(400).json({ success: false, message: 'Hiányzó szöveg' });
         if (text.length > 4096) return res.status(400).json({ success: false, message: 'Max 4096 karakter' });
@@ -2219,7 +2301,7 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
         if (provider === 'openai') {
             if (!process.env.OPENAI_API_KEY) return res.status(500).json({ success: false, message: 'OPENAI_API_KEY nincs beállítva' });
             const safeVoice = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'].includes(voice) ? voice : 'nova';
-            const resp = await openai.audio.speech.create({ model, voice: safeVoice, input: text.trim(), speed: safeSpeed, response_format: safeFormat });
+            const resp = await openai.audio.speech.create({ model, voice: safeVoice, input: text.trim(), speed: safeSpeed, response_format: safeFormat }, { signal: controller.signal });
             const mimeTypes = { mp3: 'audio/mpeg', opus: 'audio/ogg', aac: 'audio/aac', flac: 'audio/flac' };
             const buffer = Buffer.from(await resp.arrayBuffer());
             audioUrl = `data:${mimeTypes[safeFormat]};base64,${buffer.toString('base64')}`;
@@ -2237,9 +2319,17 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
             meta.add('function-id', FUNCTION_ID);
 
             const audioBuffer = await new Promise((resolve, reject) => {
-                client.synthesize({ text: text.trim(), language_code, voice_name: voice, encoding: 'LINEAR_PCM', sample_rate_hz: 22050 }, meta, (err, response) => {
-                    if (err) reject(new Error(`gRPC hiba: ${err.message}`));
-                    else resolve(response.audio);
+                const call = client.synthesize({ text: text.trim(), language_code, voice_name: voice, encoding: 'LINEAR_PCM', sample_rate_hz: 22050 }, meta, (err, response) => {
+                    if (err) {
+                        if (err.code === 1) reject(new Error('AbortError')); // gRPC CANCELLED
+                        else reject(new Error(`gRPC hiba: ${err.message}`));
+                    } else resolve(response.audio);
+                });
+                controller.signal.addEventListener('abort', () => {
+                    call.cancel();
+                    const e = new Error('Folyamat megszakítva');
+                    e.name = 'AbortError';
+                    reject(e);
                 });
             });
 
@@ -2255,6 +2345,7 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
                 method: 'POST',
                 headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
                 body: JSON.stringify({ text: text.trim(), model_id: model, voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.0, use_speaker_boost: true } }),
+                signal: controller.signal,
             });
             if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err?.detail?.message || `ElevenLabs hiba: ${resp.status}`); }
             const buffer = Buffer.from(await resp.arrayBuffer());
@@ -2266,9 +2357,12 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
         }
 
         await logUsage(req.userId, 'tts', { provider, model, chars: text.length });
+        unregisterJob(jobId);
         return res.json({ success: true, audioUrl });
 
     } catch (err) {
+        unregisterJob(req.body.jobId);
+        if (err.name === 'AbortError' || err.message === 'AbortError') return res.status(499).json({ success: false, message: 'Folyamat megszakítva (User/Timeout)' });
         console.error('❌ TTS hiba:', err);
         return res.status(500).json({ success: false, message: err.message || 'TTS hiba' });
     }
@@ -2279,7 +2373,9 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
 // ════════════════════════════════════════════════════
 router.post('/generate-music', verifyFirebaseToken, audioLimiter, async (req, res) => {
     try {
-        const { apiId, prompt, genre = '', mood = '', duration = 30, instrumental = true } = req.body;
+        const { apiId, prompt, genre = '', mood = '', duration = 30, instrumental = true, jobId } = req.body;
+        const controller = new AbortController();
+        registerJob(jobId, controller, 600000);
 
         if (!apiId || !prompt?.trim()) return res.status(400).json({ success: false, message: 'Hiányzó apiId vagy prompt' });
         if (!process.env.FAL_KEY) return res.status(500).json({ success: false, message: 'FAL_KEY nincs beállítva' });
@@ -2290,10 +2386,10 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, async (req, re
         let audioUrl = '';
 
         if (apiId.includes('musicgen')) {
-            const result = await fal.subscribe(apiId, { input: { prompt: fullPrompt, duration: safeDuration }, logs: false });
+            const result = await fal.subscribe(apiId, { input: { prompt: fullPrompt, duration: safeDuration }, logs: false, signal: controller.signal });
             audioUrl = result.data?.audio?.url || result.data?.audio_file?.url || '';
         } else if (apiId.includes('stable-audio')) {
-            const result = await fal.subscribe(apiId, { input: { prompt: fullPrompt, seconds_total: safeDuration, steps: 100 }, logs: false });
+            const result = await fal.subscribe(apiId, { input: { prompt: fullPrompt, seconds_total: safeDuration, steps: 100 }, logs: false, signal: controller.signal });
             audioUrl = result.data?.audio_file?.url || result.data?.audio?.url || '';
         } else {
             return res.status(400).json({ success: false, message: `Ismeretlen zene API: ${apiId}` });
@@ -2301,9 +2397,12 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, async (req, re
 
         if (!audioUrl) throw new Error('Nem érkezett audio URL');
         await logUsage(req.userId, 'music', { apiId, duration: safeDuration });
+        unregisterJob(jobId);
         return res.json({ success: true, audioUrl });
 
     } catch (err) {
+        unregisterJob(req.body.jobId);
+        if (err.name === 'AbortError') return res.status(408).json({ success: false, message: 'Folyamat megszakítva (User/Timeout)' });
         console.error('❌ Music gen hiba:', err);
         return res.status(500).json({ success: false, message: err.message || 'Zenegenerálási hiba' });
     }
@@ -2342,16 +2441,27 @@ router.get('/usage-stats', verifyFirebaseToken, async (req, res) => {
 router.post('/meshy/text-to-3d', verifyFirebaseToken, genLimiter, async (req, res) => {
     if (!MESHY_KEY) return res.status(500).json({ success: false, message: 'MESHY_API_KEY nincs beállítva' });
 
-    const { prompt, ai_model = 'latest', topology = 'triangle', target_polycount = 100_000, should_remesh = false, symmetry_mode = 'auto', pose_mode = '', moderation = false } = req.body;
+    const { prompt, ai_model = 'latest', topology = 'triangle', target_polycount = 100_000, should_remesh = false, symmetry_mode = 'auto', pose_mode = '', moderation = false, jobId } = req.body;
 
     if (!prompt?.trim()) return res.status(400).json({ success: false, message: 'Prompt megadása kötelező' });
     if (prompt.length > 600) return res.status(400).json({ success: false, message: 'Prompt max 600 karakter' });
 
+    const controller = new AbortController();
+    registerJob(jobId, controller, 1800000);
+
     try {
-        const { data } = await meshy.post('/openapi/v2/text-to-3d', { mode: 'preview', prompt: prompt.trim(), ai_model, topology, target_polycount: Math.min(Math.max(100, Number(target_polycount)), 300_000), should_remesh, symmetry_mode, ...(pose_mode ? { pose_mode } : {}), moderation });
+        const { data } = await meshy.post('/openapi/v2/text-to-3d', {
+            mode: 'preview', prompt: prompt.trim(), ai_model, topology,
+            target_polycount: Math.min(Math.max(100, Number(target_polycount)), 300_000),
+            should_remesh, symmetry_mode, ...(pose_mode ? { pose_mode } : {}), moderation
+        }, { signal: controller.signal });
+
         await logUsage(req.userId, 'meshy_text_to_3d', { prompt: prompt.slice(0, 80), ai_model });
+        unregisterJob(jobId);
         return res.json({ success: true, task_id: data.result });
     } catch (err) {
+        unregisterJob(jobId);
+        if (err.name === 'AbortError') return res.status(499).json({ success: false, message: 'Folyamat megszakítva' });
         return res.status(err.response?.status || 500).json({ success: false, message: err.response?.data?.message || err.message || 'Meshy API hiba' });
     }
 });
@@ -2362,15 +2472,28 @@ router.post('/meshy/text-to-3d', verifyFirebaseToken, genLimiter, async (req, re
 router.post('/meshy/image-to-3d', verifyFirebaseToken, genLimiter, async (req, res) => {
     if (!MESHY_KEY) return res.status(500).json({ success: false, message: 'MESHY_API_KEY nincs beállítva' });
 
-    const { image_url, model_type = 'standard', ai_model = 'latest', topology = 'triangle', target_polycount = 100_000, symmetry_mode = 'auto', should_remesh = false, should_texture = true, enable_pbr = false, pose_mode = '', texture_prompt = '', moderation = false } = req.body;
+    const { image_url, model_type = 'standard', ai_model = 'latest', topology = 'triangle', target_polycount = 100_000, symmetry_mode = 'auto', should_remesh = false, should_texture = true, enable_pbr = false, pose_mode = '', texture_prompt = '', moderation = false, jobId } = req.body;
 
     if (!image_url) return res.status(400).json({ success: false, message: 'image_url megadása kötelező' });
 
+    const controller = new AbortController();
+    registerJob(jobId, controller, 1800000);
+
     try {
-        const { data } = await meshy.post('/openapi/v1/image-to-3d', { image_url, model_type, ai_model, topology, target_polycount: Math.min(Math.max(100, Number(target_polycount)), 300_000), symmetry_mode, should_remesh, should_texture, enable_pbr, ...(pose_mode ? { pose_mode } : {}), ...(texture_prompt ? { texture_prompt } : {}), moderation });
+        const { data } = await meshy.post('/openapi/v1/image-to-3d', {
+            image_url, model_type, ai_model, topology,
+            target_polycount: Math.min(Math.max(100, Number(target_polycount)), 300_000),
+            symmetry_mode, should_remesh, should_texture, enable_pbr,
+            ...(pose_mode ? { pose_mode } : {}),
+            ...(texture_prompt ? { texture_prompt } : {}), moderation
+        }, { signal: controller.signal });
+
         await logUsage(req.userId, 'meshy_image_to_3d', { ai_model });
+        unregisterJob(jobId);
         return res.json({ success: true, task_id: data.result });
     } catch (err) {
+        unregisterJob(jobId);
+        if (err.name === 'AbortError') return res.status(499).json({ success: false, message: 'Folyamat megszakítva' });
         return res.status(err.response?.status || 500).json({ success: false, message: err.response?.data?.message || err.message || 'Meshy API hiba' });
     }
 });
@@ -2381,15 +2504,26 @@ router.post('/meshy/image-to-3d', verifyFirebaseToken, genLimiter, async (req, r
 router.post('/meshy/refine', verifyFirebaseToken, async (req, res) => {
     if (!MESHY_KEY) return res.status(500).json({ success: false, message: 'MESHY_API_KEY nincs beállítva' });
 
-    const { preview_task_id, enable_pbr = true, texture_prompt = '', texture_image_url = '', ai_model = 'latest', moderation = false } = req.body;
+    const { preview_task_id, enable_pbr = true, texture_prompt = '', texture_image_url = '', ai_model = 'latest', moderation = false, jobId } = req.body;
 
     if (!preview_task_id) return res.status(400).json({ success: false, message: 'preview_task_id kötelező' });
 
+    const controller = new AbortController();
+    registerJob(jobId, controller, 1800000);
+
     try {
-        const { data } = await meshy.post('/openapi/v2/text-to-3d', { mode: 'refine', preview_task_id, enable_pbr, ai_model, moderation, ...(texture_prompt ? { texture_prompt } : {}), ...(texture_image_url ? { texture_image_url } : {}) });
+        const { data } = await meshy.post('/openapi/v2/text-to-3d', {
+            mode: 'refine', preview_task_id, enable_pbr, ai_model, moderation,
+            ...(texture_prompt ? { texture_prompt } : {}),
+            ...(texture_image_url ? { texture_image_url } : {})
+        }, { signal: controller.signal });
+
         await logUsage(req.userId, 'meshy_refine', { preview_task_id });
+        unregisterJob(jobId);
         return res.json({ success: true, task_id: data.result });
     } catch (err) {
+        unregisterJob(jobId);
+        if (err.name === 'AbortError') return res.status(499).json({ success: false, message: 'Folyamat megszakítva' });
         return res.status(err.response?.status || 500).json({ success: false, message: err.response?.data?.message || err.message || 'Meshy refine hiba' });
     }
 });
@@ -2598,7 +2732,7 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
 // TRELLIS — Generálás
 // ════════════════════════════════════════════════════
 router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
-    const { prompt, seed = 0, slat_cfg_scale = 3, ss_cfg_scale = 7.5, slat_sampling_steps = 25, ss_sampling_steps = 25 } = req.body;
+    const { prompt, seed = 0, slat_cfg_scale = 3, ss_cfg_scale = 7.5, slat_sampling_steps = 25, ss_sampling_steps = 25, jobId } = req.body;
 
     if (!prompt || !String(prompt).trim()) return res.status(400).json({ success: false, message: 'A prompt megadása kötelező' });
     if (String(prompt).length > 1000) return res.status(400).json({ success: false, message: 'A prompt maximum 1000 karakter lehet' });
@@ -2616,10 +2750,8 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     };
 
     const controller = new AbortController();
-    let timeoutId = setTimeout(() => { controller.abort(); }, 180_000);
-
-    const onClose = () => { controller.abort(); };
-    req.on('close', onClose);
+    // Modell generálásnál 30 perc (1800s) timeout
+    registerJob(jobId, controller, 1800000);
 
     try {
         const nimResp = await fetch(TRELLIS_NIM_URL, {
@@ -2629,9 +2761,6 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
             signal: controller.signal,
             agent: keepAliveAgent,
         });
-
-        clearTimeout(timeoutId);
-        timeoutId = null;
 
         if (!nimResp.ok) {
             const errText = await nimResp.text();
@@ -2781,6 +2910,57 @@ router.post('/chat/switch-model', verifyFirebaseToken, async (req, res) => {
         return res.status(500).json({ success: false, message: e.message });
     }
 });
+
+router.patch('/chat/session/:sessionId', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const { title } = req.body;
+        if (!title) return res.status(400).json({ success: false, message: 'Hiányzó cím' });
+
+        const db = admin.firestore();
+        const userId = req.userId;
+        const sessionRef = db.collection('conversations').doc(userId).collection('sessions').doc(sessionId);
+
+        await sessionRef.update({ title });
+
+        return res.json({ success: true, message: 'Munkamenet átnevezve' });
+    } catch (e) {
+        console.error('Rename session hiba:', e);
+        return res.status(500).json({ success: false, message: e.message });
+    }
+});
+
+router.delete('/chat/session/:sessionId', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const db = admin.firestore();
+        const userId = req.userId;
+        const sessionRef = db.collection('conversations').doc(userId).collection('sessions').doc(sessionId);
+
+        const sessionDoc = await sessionRef.get();
+        if (!sessionDoc.exists) return res.status(404).json({ success: false, message: 'Munkamenet nem található' });
+
+        // Töröljük az összes üzenetet
+        const messagesSnap = await sessionRef.collection('messages').get();
+        const batch = db.batch();
+        messagesSnap.docs.forEach(doc => batch.delete(doc.ref));
+
+        // Töröljük az összefoglalókat
+        const summariesSnap = await sessionRef.collection(SUMMARY_COLLECTION).get();
+        summariesSnap.docs.forEach(doc => batch.delete(doc.ref));
+
+        // Töröljük magát a sessiont
+        batch.delete(sessionRef);
+
+        await batch.commit();
+
+        return res.json({ success: true, message: 'Munkamenet törölve' });
+    } catch (e) {
+        console.error('Delete session hiba:', e);
+        return res.status(500).json({ success: false, message: e.message });
+    }
+});
+
 
 // ════════════════════════════════════════════════════
 // IMAGE GALLERY endpoints

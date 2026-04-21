@@ -43,6 +43,11 @@ export class TripoClient {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
+      // Link external signal if provided
+      if (options.signal) {
+          options.signal.addEventListener('abort', () => controller.abort());
+      }
+
       try {
         const res = await fetch(url, { ...options, headers, signal: controller.signal });
         clearTimeout(timer);
@@ -95,24 +100,24 @@ export class TripoClient {
   }
 
   /* ── Convenience wrappers ─────────────────────────────────────── */
-  get(path) {
-    return this.fetch(path, { method: "GET" });
+  get(path, signal) {
+    return this.fetch(path, { method: "GET", signal });
   }
 
-  post(path, body, idempotencyKey) {
+  post(path, body, idempotencyKey, signal) {
     return this.fetch(
       path,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal },
       idempotencyKey,
     );
   }
 
-  postForm(path, form) {
-    return this.fetch(path, { method: "POST", body: form });
+  postForm(path, form, signal) {
+    return this.fetch(path, { method: "POST", body: form, signal });
   }
 
   /* ── Task operations ──────────────────────────────────────────── */
-  async createTask(taskBody, idempotencyKey) {
+  async createTask(taskBody, idempotencyKey, opts = {}) {
     console.log("[TripoClient] createTask body:", JSON.stringify(taskBody, null, 2));
 
     // Extra logging for animate tasks to help debugging
@@ -130,7 +135,7 @@ export class TripoClient {
       });
     }
 
-    const res = await this.post("/task", taskBody, idempotencyKey);
+    const res = await this.post("/task", taskBody, idempotencyKey, opts.signal);
     const taskId = res.data?.task_id;
     if (!taskId) throw new Error(`No task_id in response: ${JSON.stringify(res).slice(0, 200)}`);
     return taskId;

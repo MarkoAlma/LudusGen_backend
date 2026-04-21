@@ -9,6 +9,7 @@ import { registerTask as registerForRecovery, unregisterTask } from "../services
 import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
+import { registerJob, unregisterJob } from "../lib/jobRegistry.js";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
 const HISTORY_COLLECTION = "trellis_history";
@@ -21,6 +22,12 @@ export async function createTask(req, res) {
   try {
     const body = { type, ...rest };
     const userId = req.user?.uid;
+    const jobId = req.body.jobId;
+
+    const controller = new AbortController();
+    if (jobId) {
+      registerJob(jobId, controller, 1800000); // 30 min for 3D
+    }
 
     // Estimate credit cost for this task
     const { total: estimatedCost } = estimateCost(body);
@@ -150,6 +157,7 @@ export async function createTask(req, res) {
       const taskId = await taskService.create(body, {
         callbackUrl: callback_url,
         idempotencyKey: idempotency_key,
+        signal: controller.signal,
       });
 
       // Link real taskId to credit transaction for refunds
@@ -163,9 +171,14 @@ export async function createTask(req, res) {
       if (userId) {
         registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt);
       }
+      unregisterJob(jobId);
       res.json({ success: true, taskId });
     }
   } catch (err) {
+    unregisterJob(jobId);
+    if (err.name === 'AbortError') {
+      return res.status(499).json({ success: false, message: "Folyamat megszakítva" });
+    }
     console.error(`[TaskController] create error:`, err.message);
 
     // Tripo 403 = insufficient credit → refund the locally deducted amount

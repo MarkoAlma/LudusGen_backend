@@ -25,7 +25,7 @@ class TaskService {
     const startMs = Date.now();
 
     try {
-      const taskId = await client.createTask(validated, idempotencyKey);
+      const taskId = await client.createTask(validated, idempotencyKey, opts);
       analyticsService.recordTaskStart(taskId, body.type, body.model_version);
       console.log(`[TaskService] created task ${taskId} (type=${body.type}) in ${Date.now() - startMs}ms`);
       return taskId;
