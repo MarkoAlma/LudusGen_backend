@@ -1,6 +1,7 @@
 // src/services/taskService.js
 import { getTripoClient } from "../lib/tripoClient.js";
 import { analyticsService } from "./analyticsService.js";
+import { extractModelUrl } from "../utils/tripoUtils.js";
 import {
   VALID_MODEL_VERSIONS,
   VALID_CONVERT_FORMATS,
@@ -45,9 +46,10 @@ class TaskService {
   /* ── Cancel ──────────────────────────────────────────────────────── */
   async cancel(taskId) {
     const client = getTripoClient();
-    await client.cancelTask(taskId);
-    analyticsService.recordTaskEnd(taskId, "cancelled", 0);
-    console.log(`[TaskService] cancelled task ${taskId}`);
+    const result = await client.cancelTask(taskId);
+    analyticsService.recordTaskEnd(taskId, "stop_requested", 0);
+    console.log(`[TaskService] stop requested for ${taskId} — task is still running on Tripo servers`);
+    return result;
   }
 
   /* ── List ────────────────────────────────────────────────────────── */
@@ -121,7 +123,7 @@ class TaskService {
             delete b["texture_quality"];
           }
           if (!b["texture"] && !b["pbr"]) delete b["texture_quality"];
-          if (!b["texture"]) delete b["texture"];
+          if (b["texture"] === undefined) delete b["texture"];
           if (!b["pbr"]) delete b["pbr"];
           break; // P1 validáció kész, többi szabály nem vonatkozik rá
         }
@@ -173,8 +175,7 @@ class TaskService {
             b["texture_quality"] = "detailed"; // "HD", undefined, egyéb → detailed
           }
         }
-        // FIX: texture/pbr false értéket ne küldjük el
-        if (!b["texture"]) delete b["texture"];
+        if (b["texture"] === undefined) delete b["texture"];
         if (!b["pbr"]) delete b["pbr"];
 
         // style
@@ -348,30 +349,16 @@ class TaskService {
     if (task.status === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
       console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
     }
+    const { modelUrl, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task);
     return {
       success: task.status === "success",
       status: task.status,
       progress: task.progress ?? 0,
-      modelUrl:
-        out.pbr_model ??
-        out.textured_model ??
-        out.model ??
-        out.model_url ??
-        out.base_model ??
-        out.rigged_model ??
-        (Array.isArray(out.animated_models) && out.animated_models.length > 0
-          ? out.animated_models[0]
-          : out.animated_model) ??
-        out.converted_model ??
-        out.low_poly_model ??
-        out.segmented_model ??
-        out.stylized_model ??
-        out.refined_model ??
-        null,
-      rigCheckResult: out.is_animatable ?? out.animatable ?? out.riggable ?? out.rig_check_result ?? null,
-      rigType: out.rig_type ?? out.topology ?? null,
-      topology: out.topology ?? null,
-      rawOutput: out,
+      modelUrl,
+      rigCheckResult,
+      rigType,
+      topology,
+      rawOutput,
     };
   }
 }

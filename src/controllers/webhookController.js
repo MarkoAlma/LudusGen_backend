@@ -126,6 +126,7 @@ async function saveCompletedTaskToHistory(taskId, payload) {
   const now = Date.now();
   const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+  const taskInput = taskData.input ?? taskData.request ?? {};
   await db.collection(HISTORY_COLLECTION).add({
     userId,
     prompt: taskData.prompt ?? payload.type ?? "3D Model",
@@ -138,6 +139,7 @@ async function saveCompletedTaskToHistory(taskId, payload) {
       model_version: taskData.model_version ?? "unknown",
       mode,
       type: taskData.type,
+      ...(taskInput.texture === true && { texture: true }),
     },
     ts: now,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),

@@ -11,6 +11,7 @@ import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
 
 import aiRoutes from './ai-routes.js';
+import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
 
 dotenv.config();
 
@@ -282,41 +283,7 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
   }
 }
 
-// ==================== MIDDLEWARE: Firebase Auth Token ellenőrzés ====================
-const verifyFirebaseToken = async (req, res, next) => {
-  try {
-    const token = req.headers.authorization?.split("Bearer ")[1];
-
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: "Nincs autentikációs token"
-      });
-    }
-
-    const decodedToken = await admin.auth().verifyIdToken(token);
-
-    // Email verifikáció ellenőrzése
-    const userRecord = await admin.auth().getUser(decodedToken.uid);
-    if (!userRecord.emailVerified) {
-      return res.status(403).json({
-        success: false,
-        message: "Email nincs megerősítve"
-      });
-    }
-
-    req.userId = decodedToken.uid;
-    req.userEmail = decodedToken.email;
-    req.user = { uid: decodedToken.uid, email: decodedToken.email };
-    next();
-  } catch (error) {
-    console.error("Token verify error:", error);
-    return res.status(401).json({
-      success: false,
-      message: "Érvénytelen token"
-    });
-  }
-};
+// verifyFirebaseToken imported from ./src/middleware/verifyFirebaseToken.js
 
 // ==================== HELPER FUNCTIONS ====================
 

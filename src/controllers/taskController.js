@@ -11,7 +11,8 @@ import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
-const HISTORY_COLLECTION = "trellis_history";
+// NOTE: existing docs with tripo_ prefixed IDs in 'trellis_history' need a one-time migration
+const HISTORY_COLLECTION = "tripo_history";
 
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
 export async function createTask(req, res) {
@@ -161,7 +162,7 @@ export async function createTask(req, res) {
 
       // Register for background recovery with inherited prompt
       if (userId) {
-        registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt);
+        registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt, { texture: body.texture === true });
       }
       res.json({ success: true, taskId });
     }
@@ -178,7 +179,13 @@ export async function createTask(req, res) {
       }
     }
 
-    res.status(400).json({ success: false, message: err.message });
+    // Tripo 1004 on refine_model = model has no draft output (was generated with texture, or wrong task type)
+    let userMessage = err.message;
+    if (type === "refine_model" && err.message?.includes("1004")) {
+      userMessage = "Ez a modell nem finomítható. A Refine csak textúra nélkül generált (draft) modelleknél működik. Generálj új modellt textúra nélkül, majd alkalmazd rá a Refine-t.";
+    }
+
+    res.status(400).json({ success: false, message: userMessage });
   }
 }
 
@@ -198,13 +205,11 @@ export async function getTask(req, res) {
 /* ─── Task: cancel ────────────────────────────────────────────────────── */
 export async function cancelTask(req, res) {
   try {
-    await taskService.cancel(req.params.taskId);
-    res.json({ success: true, cancelled: true });
+    const result = await taskService.cancel(req.params.taskId);
+    res.json({ success: true, cancelled: result.cancelled, message: result.message });
   } catch (err) {
     console.warn("[TaskController] cancelTask:", err.message);
-    // Már befejezett/failed task cancel kísérlete nem kritikus hiba
-    // A frontend kezeli, 200-at küldünk vissza hogy ne logoljon hibát
-    res.json({ success: false, message: err.message });
+    res.json({ success: false, cancelled: false, message: err.message });
   }
 }
 
@@ -566,8 +571,7 @@ export async function batchGenerate(req, res) {
           ? { prompt: item }
           : { file: { type: "jpg", file_token: item } }),
         model_version: mv,
-        // FIX: csak true értéket küldünk, explicit false-t soha
-        ...(texture !== false && { texture: true }),
+        texture: texture === true,
         ...(pbr === true && { pbr: true }),
         texture_quality: texture_quality ?? "detailed",
       },
@@ -684,7 +688,16 @@ export async function clearHistory(req, res) {
 
 /**
  * DELETE /api/tripo/history/expired
- * Deletes history items older than HISTORY_TTL_MS for the authenticated user.
+ * Deletes tripo_history items older than HISTORY_TTL_MS for the authenticated user.
+ *
+ * Requires a composite Firestore index on (userId ASC, createdAt ASC).
+ * Create it in Firestore console or firestore.indexes.json:
+ *   collection: "tripo_history", fields: [userId ASC, createdAt ASC]
+ *
+ * To run this daily without Cloud Functions, add a cron job that calls:
+ *   curl -X DELETE https://<host>/api/tripo/history/expired \
+ *        -H "Authorization: Bearer <service-account-token>"
+ * Or use a Cloud Scheduler job pointing at this endpoint with OIDC auth.
  */
 export async function cleanupExpiredHistory(req, res) {
   const uid = req.user?.uid;
@@ -692,11 +705,12 @@ export async function cleanupExpiredHistory(req, res) {
 
   try {
     const db = admin.firestore();
-    const cutoffMs = Date.now() - HISTORY_TTL_MS;
+    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - HISTORY_TTL_MS);
 
-    // Filter in memory to avoid needing a composite index
+    // Composite index on (userId, createdAt) required for this server-side filter
     const snap = await db.collection(HISTORY_COLLECTION)
       .where("userId", "==", uid)
+      .where("createdAt", "<", cutoff)
       .get();
 
     if (snap.empty) {
@@ -704,35 +718,13 @@ export async function cleanupExpiredHistory(req, res) {
       return;
     }
 
-    const docsToDelete = snap.docs.filter(doc => {
-      const data = doc.data();
-      if (!data.createdAt) return false;
-      let createdMs = 0;
-      if (typeof data.createdAt.toMillis === "function") {
-        createdMs = data.createdAt.toMillis();
-      } else if (data.createdAt.seconds !== undefined) {
-        createdMs = data.createdAt.seconds * 1000;
-      } else if (data.createdAt instanceof Date) {
-        createdMs = data.createdAt.getTime();
-      } else {
-        createdMs = new Date(data.createdAt).getTime();
-      }
-      return createdMs && createdMs < cutoffMs;
-    });
-
-    if (docsToDelete.length === 0) {
-      res.json({ success: true, deleted: 0, message: "Nothing to clean up" });
-      return;
-    }
-
     // Firestore batch limit = 500
     let deleted = 0;
-    for (let i = 0; i < docsToDelete.length; i += 500) {
+    for (let i = 0; i < snap.docs.length; i += 500) {
       const b = db.batch();
-      const chunk = docsToDelete.slice(i, i + 500);
-      chunk.forEach(doc => b.delete(doc.ref));
+      snap.docs.slice(i, i + 500).forEach(d => b.delete(d.ref));
       await b.commit();
-      deleted += chunk.length;
+      deleted += Math.min(500, snap.docs.length - i);
     }
 
     console.log(`[HistoryController] cleaned up ${deleted} expired items for user ${uid}`);

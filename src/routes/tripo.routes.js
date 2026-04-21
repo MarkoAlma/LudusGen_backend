@@ -3,9 +3,9 @@
 // Unified Tripo API router.
 // Mounts on /api or wherever your app registers it.
 
-import { Router } from "express";
+import express, { Router } from "express";
 import multer from "multer";
-import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import rateLimit from "express-rate-limit";
 
 // Controllers
 import {
@@ -66,16 +66,11 @@ const assetUpload = multer({
   },
 });
 
-/** Generation rate limiter — 30 req/min per user */
+/** Generation rate limiter — 30 req/min per authenticated user */
 const genLimiter = rateLimit({
   windowMs: 60_000,
   max: 30,
-  keyGenerator: (req) => {
-    if (req.user?.uid) {
-      return `user:${req.user.uid}`;
-    }
-    return ipKeyGenerator(req);
-  },
+  keyGenerator: (req) => `user:${req.user.uid}`,
   message: {
     success: false,
     message: "Rate limit exceeded. Max 30 generation requests per minute.",
@@ -129,12 +124,14 @@ export function createTripoRouter(verifyAuth) {
    * ════════════════════════════════════════════════════════════════════ */
 
   /**
-   * Tripo webhook receiver.
-   * NOTE: mount express.raw({ verify: captureRawBody }) BEFORE express.json()
-   * on this route in your app setup:
-   *   app.use("/api/tripo/webhook", express.raw({ type: "application/json", verify: (req, res, buf) => { req.rawBody = buf; } }))
+   * Tripo webhook receiver — express.raw captures the raw body for signature verification
+   * before express.json() in the app can parse and discard it.
    */
-  router.post("/tripo/webhook", handleWebhook);
+  router.post(
+    "/tripo/webhook",
+    express.raw({ type: "application/json", verify: (req, _res, buf) => { req.rawBody = buf; } }),
+    handleWebhook,
+  );
 
   /** Local test — POST { task_id, status } to simulate a webhook */
   router.post("/tripo/webhook/test", verifyAuth, testWebhook);

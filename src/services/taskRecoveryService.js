@@ -19,7 +19,7 @@ const CLEANUP_INTERVAL_MS = 60_000; // cleanup completed tasks every minute
 
 const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-/** @type {Map<string, { taskId: string, userId: string, type: string, modelVersion: string, startedAt: number }>} */
+/** @type {Map<string, { taskId: string, userId: string, type: string, modelVersion: string, texture: boolean, startedAt: number }>} */
 const pendingTasks = new Map();
 
 /* ─── Type → mode mapping (same as webhookController) ─────────────────── */
@@ -39,7 +39,7 @@ const TYPE_TO_MODE = {
 };
 
 /* ─── Register a task for background tracking ─────────────────────────── */
-export function registerTask(taskId, userId, type, modelVersion, prompt = null) {
+export function registerTask(taskId, userId, type, modelVersion, prompt = null, extra = {}) {
   if (!taskId || !userId) return;
   pendingTasks.set(taskId, {
     taskId,
@@ -47,6 +47,7 @@ export function registerTask(taskId, userId, type, modelVersion, prompt = null) 
     type: type ?? "unknown",
     modelVersion: modelVersion ?? "unknown",
     prompt,
+    texture: extra.texture === true,
     startedAt: Date.now(),
   });
   console.log(`[TaskRecovery] Registered task ${taskId} for user ${userId}${prompt ? ` (${prompt})` : ''}`);
@@ -185,6 +186,7 @@ async function saveToHistory(entry, taskData) {
         model_version: entry.modelVersion,
         mode,
         type: entry.type,
+        texture: entry.texture === true ? true : undefined,
         rig_type: out.rig_type ?? out.topology ?? null,
         topology: out.topology ?? null,
         is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,
