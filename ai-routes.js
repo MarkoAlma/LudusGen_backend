@@ -26,6 +26,7 @@ import {
     SUMMARY_TRIGGER_COUNT,
     trimToContextLimit,
 } from './src/lib/contextBuilder.js';
+import { storageService } from './src/services/storageService.js';
 
 import { existsSync, writeFileSync, unlinkSync } from 'fs';
 
@@ -2607,9 +2608,11 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
         let glbUrl, b2Key = null;
 
         try {
-            b2Key = await uploadGlbToB2(base64Glb, filename);
+            const buffer = Buffer.from(base64Glb, 'base64');
+            b2Key = await storageService.uploadFile(buffer, `trellis/${filename}`, 'model/gltf-binary');
             glbUrl = `/api/trellis/model/${filename}`;
         } catch (b2Err) {
+            console.error('Trellis B2 upload failed:', b2Err.message);
             glbUrl = `data:model/gltf-binary;base64,${base64Glb}`;
         }
 

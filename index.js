@@ -12,6 +12,8 @@ import { v2 as cloudinary } from "cloudinary";
 
 import aiRoutes from './ai-routes.js';
 import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
+import { createTripoRouter } from './src/routes/tripo.routes.js';
+import { startTaskRecovery, stopTaskRecovery } from './src/services/taskRecoveryService.js';
 
 dotenv.config();
 
@@ -24,6 +26,12 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
+// 1. RAW body capture for Tripo webhooks — must come BEFORE bodyParser.json()
+app.use("/api/tripo/webhook", express.raw({
+  type: "application/json",
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
+
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/api', aiRoutes);     // Add routes after middlewares
 
@@ -1704,27 +1712,11 @@ app.get('/api/credit-history', verifyFirebaseToken, async (req, res) => {
   }
 });
 
-import { createTripoRouter } from './src/routes/tripo.routes.js';
-
-// 1. RAW body capture — must come BEFORE bodyParser.json()
-app.use("/api/tripo/webhook", express.raw({
-  type: "application/json",
-  verify: (req, _res, buf) => { req.rawBody = buf; }
-}));
-
-// 2. Your existing middleware (cors, bodyParser, etc.)
-// app.use(cors(...))
-// app.use(express.json())
-
-// 3. Your existing routes
-// app.use('/api', aiRoutes)
-
 // 4. Tripo router — after bodyParser, after aiRoutes
 const tripoRouter = createTripoRouter(verifyFirebaseToken);
 app.use("/api", tripoRouter);
 
 // 5. Background task recovery — polls pending tasks and saves to history
-import { startTaskRecovery, stopTaskRecovery } from './src/services/taskRecoveryService.js';
 startTaskRecovery();
 
 // ==================== SERVER START ====================

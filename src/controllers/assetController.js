@@ -8,7 +8,7 @@ import { getTripoClient } from "../lib/tripoClient.js";
 import { taskService } from "../services/taskService.js";
 import admin from "firebase-admin";
 
-const HISTORY_COLLECTION = "trellis_history";
+const HISTORY_COLLECTION = "tripo_history";
 const ALLOWED_MIME_TYPES = new Set([
   "model/gltf-binary",       // .glb
   "model/gltf+json",         // .gltf

@@ -1,6 +1,7 @@
 // src/controllers/taskController.js
 import { taskService } from "../services/taskService.js";
 import { getTripoClient } from "../lib/tripoClient.js";
+import { storageService } from "../services/storageService.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
@@ -16,10 +17,13 @@ const HISTORY_COLLECTION = "tripo_history";
 
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
 export async function createTask(req, res) {
+  const { type, callback_url, idempotency_key, ...rest } = req.body;
+  const userId = req.user?.uid;
+  let estimatedCost = 0;
+
   try {
     let body = { type, ...rest };
-    const userId = req.user?.uid;
-
+    
     // Normalize image inputs
     if (type === "image_to_model") {
       const tokens = (body.images && Array.isArray(body.images)) ? body.images 
@@ -39,7 +43,8 @@ export async function createTask(req, res) {
     }
 
     // Estimate credit cost for this task
-    const { total: estimatedCost } = estimateCost(body);
+    const estimateResult = estimateCost(body);
+    estimatedCost = estimateResult.total;
     console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"} cost=${estimatedCost}`);
 
     let tempTxId = null;
@@ -223,11 +228,13 @@ export async function createTask(req, res) {
 
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
-      console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
-      try {
-        await refundCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, "tripo_403_insufficient_credit");
-      } catch (refundErr) {
-        console.error(`[TaskController] Refund error:`, refundErr.message);
+      if (userId && estimatedCost > 0) {
+        console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
+        try {
+          await refundCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, "tripo_403_insufficient_credit");
+        } catch (refundErr) {
+          console.error(`[TaskController] Refund error:`, refundErr.message);
+        }
       }
     }
 
@@ -438,7 +445,31 @@ export async function modelProxy(req, res) {
       MODEL_CACHE.delete(taskIdParam); // expired
     }
 
-    // ── Fetch from upstream ────────────────────────────────────────────
+    // ── Permanent Storage: Check B2 first ─────────────────────────────
+    if (taskIdParam) {
+      try {
+        const db = admin.firestore();
+        const snap = await db.collection(HISTORY_COLLECTION)
+          .where("taskId", "==", taskIdParam)
+          .limit(1)
+          .get();
+        
+        if (!snap.empty) {
+          const histData = snap.docs[0].data();
+          if (histData.b2_key) {
+            console.log(`[TaskController] modelProxy: found B2 key ${histData.b2_key} for task ${taskIdParam}`);
+            const b2Url = await storageService.getSignedUrl(histData.b2_key);
+            if (b2Url) {
+              url = b2Url; // Use B2 URL instead of Tripo URL
+            }
+          }
+        }
+      } catch (fsErr) {
+        console.warn(`[TaskController] modelProxy: B2 lookup failed:`, fsErr.message);
+      }
+    }
+
+    // ── Fetch from upstream (B2 or Tripo) ────────────────────────────
     let { error, upstream, message } = await performFetch(url);
 
     // If upstream returns 401/403/410/502, try to refresh URL via taskId
@@ -687,7 +718,8 @@ export async function deleteHistoryItem(req, res) {
 
   try {
     const db = admin.firestore();
-    const ref = db.collection(HISTORY_COLLECTION).doc(id);
+    const collection = req.query.collection || HISTORY_COLLECTION;
+    const ref = db.collection(collection).doc(id);
     const doc = await ref.get();
 
     if (!doc.exists) {
@@ -718,10 +750,11 @@ export async function clearHistory(req, res) {
 
   const ALLOWED_SOURCES = ["tripo", "trellis", "upload"];
   const source = ALLOWED_SOURCES.includes(req.query.source) ? req.query.source : "tripo";
+  const collection = req.query.collection || HISTORY_COLLECTION;
 
   try {
     const db = admin.firestore();
-    const snap = await db.collection(HISTORY_COLLECTION)
+    const snap = await db.collection(collection)
       .where("userId", "==", uid)
       .where("source", "==", source)
       .get();

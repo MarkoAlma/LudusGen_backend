@@ -3,6 +3,8 @@ import { webhookService } from "../services/webhookService.js";
 import { refundCredits, hasBeenCharged } from "../services/creditService.js";
 import { getTripoClient } from "../lib/tripoClient.js";
 import admin from "firebase-admin";
+import { storageService } from "../services/storageService.js";
+import axios from "axios";
 
 const HISTORY_COLLECTION = "tripo_history";
 
@@ -127,7 +129,7 @@ async function saveCompletedTaskToHistory(taskId, payload) {
   const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
   const taskInput = taskData.input ?? taskData.request ?? {};
-  await db.collection(HISTORY_COLLECTION).add({
+  const docRef = await db.collection(HISTORY_COLLECTION).add({
     userId,
     prompt: taskData.prompt ?? payload.type ?? "3D Model",
     status: "succeeded",
@@ -145,6 +147,40 @@ async function saveCompletedTaskToHistory(taskId, payload) {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     expiresAt: now + HISTORY_TTL_MS,
   });
+
+  const historyId = docRef.id;
+
+  // ── Permanent Storage: Save to B2 ───────────────────────────────
+  // We do this in the background after acknowledging the webhook
+  (async () => {
+    try {
+      console.log(`[WebhookController] Downloading model from Tripo for task ${taskId}...`);
+      const resp = await axios.get(modelUrl, { responseType: 'arraybuffer', timeout: 60000 });
+      const buffer = Buffer.from(resp.data);
+      
+      const ext = modelUrl.split("?")[0].split(".").pop()?.toLowerCase() || "glb";
+      const contentTypeMap = {
+        glb: "model/gltf-binary",
+        fbx: "application/octet-stream",
+        obj: "text/plain",
+        usdz: "model/vnd.usdz+zip",
+      };
+      const contentType = contentTypeMap[ext] || "application/octet-stream";
+      
+      const b2Key = `tripo/${taskId}.${ext}`;
+      await storageService.uploadFile(buffer, b2Key, contentType);
+      
+      // Update history with B2 info
+      await db.collection(HISTORY_COLLECTION).doc(historyId).update({
+        b2_key: b2Key,
+        // We keep model_url as a fallback, but we'll prefer b2_key in proxy
+      });
+      
+      console.log(`[WebhookController] Task ${taskId} successfully archived to B2: ${b2Key}`);
+    } catch (archiveErr) {
+      console.error(`[WebhookController] Failed to archive task ${taskId} to B2:`, archiveErr.message);
+    }
+  })();
 
   console.log(`[WebhookController] Saved task ${taskId} to history for user ${userId}`);
 }
