@@ -4,7 +4,7 @@ import { refundCredits, hasBeenCharged } from "../services/creditService.js";
 import { getTripoClient } from "../lib/tripoClient.js";
 import admin from "firebase-admin";
 
-const HISTORY_COLLECTION = "trellis_history";
+const HISTORY_COLLECTION = "tripo_history";
 
 export async function handleWebhook(req, res) {
   // Signature verification — raw body must be captured by express.raw() middleware
@@ -99,7 +99,7 @@ async function saveCompletedTaskToHistory(taskId, payload) {
     ?? out.rigged_model
     ?? (Array.isArray(out.animated_models) ? out.animated_models[0] : out.animated_model)
     ?? out.converted_model ?? out.low_poly_model
-    ?? out.stylized_model ?? null;
+    ?? out.segmented_model ?? out.stylized_model ?? null;
 
   if (!modelUrl) {
     console.log(`[WebhookController] No model URL for completed task ${taskId}`);

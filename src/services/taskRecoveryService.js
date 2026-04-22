@@ -12,7 +12,7 @@ import { getTripoClient } from "../lib/tripoClient.js";
 import { refundCredits } from "./creditService.js";
 import admin from "firebase-admin";
 
-const HISTORY_COLLECTION = "trellis_history";
+const HISTORY_COLLECTION = "tripo_history";
 const POLL_INTERVAL_MS = 5_000; // check every 5 seconds
 const MAX_POLL_MS = 600_000; // 10 minutes max per task
 const CLEANUP_INTERVAL_MS = 60_000; // cleanup completed tasks every minute
@@ -146,7 +146,7 @@ async function saveToHistory(entry, taskData) {
   const modelUrl = out.model ?? out.model_url ?? out.pbr_model ?? out.base_model
     ?? out.rigged_model ?? (animatedModels ? animatedModels[0] : out.animated_model)
     ?? out.converted_model ?? out.low_poly_model
-    ?? out.stylized_model ?? null;
+    ?? out.segmented_model ?? out.stylized_model ?? null;
 
   if (!modelUrl) {
     console.warn(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) succeeded but no model URL found in output:`, JSON.stringify(out));
@@ -186,7 +186,7 @@ async function saveToHistory(entry, taskData) {
         model_version: entry.modelVersion,
         mode,
         type: entry.type,
-        texture: entry.texture === true ? true : undefined,
+        ...(entry.texture === true && { texture: true }),
         rig_type: out.rig_type ?? out.topology ?? null,
         topology: out.topology ?? null,
         is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,

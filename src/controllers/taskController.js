@@ -16,12 +16,27 @@ const HISTORY_COLLECTION = "tripo_history";
 
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
 export async function createTask(req, res) {
-  const { type, callback_url, idempotency_key, ...rest } = req.body;
-  if (!type) { res.status(400).json({ success: false, message: "type field required" }); return; }
-
   try {
-    const body = { type, ...rest };
+    let body = { type, ...rest };
     const userId = req.user?.uid;
+
+    // Normalize image inputs
+    if (type === "image_to_model") {
+      const tokens = (body.images && Array.isArray(body.images)) ? body.images 
+                   : (body.batch_images && Array.isArray(body.batch_images)) ? body.batch_images
+                   : [];
+
+      if (tokens.length === 1) {
+        // Normalize single image task
+        body.file = { type: "jpg", file_token: tokens[0] };
+        delete body.images;
+        delete body.batch_images;
+      } else if (tokens.length > 1) {
+        // Keep tokens for later splitting in this controller
+        body.batch_images = tokens;
+        delete body.images;
+      }
+    }
 
     // Estimate credit cost for this task
     const { total: estimatedCost } = estimateCost(body);
@@ -139,32 +154,69 @@ export async function createTask(req, res) {
     }
 
     if (USE_QUEUE) {
-      const jobId = await enqueueTripoTask({
-        jobType: "single",
-        taskBody: body,
-        userId,
-        callbackUrl: callback_url,
-        idempotencyKey: idempotency_key ?? uuid(),
-      });
-      res.json({ success: true, queued: true, jobId });
+      if (body.batch_images && body.batch_images.length > 1) {
+        const { batch_images, ...common } = body;
+        const items = batch_images.map(token => ({
+          jobType: "single",
+          taskBody: { ...common, file: { type: "jpg", file_token: token } },
+          userId,
+          callbackUrl: callback_url,
+          idempotencyKey: uuid(),
+        }));
+        const jobIds = await enqueueBatch(items);
+        res.json({ success: true, queued: true, jobIds });
+      } else {
+        const jobId = await enqueueTripoTask({
+          jobType: "single",
+          taskBody: body,
+          userId,
+          callbackUrl: callback_url,
+          idempotencyKey: idempotency_key ?? uuid(),
+        });
+        res.json({ success: true, queued: true, jobId });
+      }
     } else {
-      const taskId = await taskService.create(body, {
-        callbackUrl: callback_url,
-        idempotencyKey: idempotency_key,
-      });
+      // Sequential/Direct execution
+      if (body.batch_images && body.batch_images.length > 1) {
+        const { batch_images, ...common } = body;
+        const taskIds = [];
+        for (const token of batch_images) {
+          const subBody = { ...common, file: { type: "jpg", file_token: token } };
+          const taskId = await taskService.create(subBody, {
+            callbackUrl: callback_url,
+            idempotencyKey: uuid(),
+          });
+          
+          if (userId && tempTxId) {
+            linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
+              console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
+            );
+          }
+          if (userId) {
+            registerForRecovery(taskId, userId, subBody.type, subBody.model_version ?? DEFAULT_MODEL, inheritedPrompt, { texture: subBody.texture === true });
+          }
+          taskIds.push(taskId);
+        }
+        res.json({ success: true, taskIds });
+      } else {
+        const taskId = await taskService.create(body, {
+          callbackUrl: callback_url,
+          idempotencyKey: idempotency_key,
+        });
 
-      // Link real taskId to credit transaction for refunds
-      if (userId && tempTxId) {
-        linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
-          console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
-        );
-      }
+        // Link real taskId to credit transaction for refunds
+        if (userId && tempTxId) {
+          linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
+            console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
+          );
+        }
 
-      // Register for background recovery with inherited prompt
-      if (userId) {
-        registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt, { texture: body.texture === true });
+        // Register for background recovery with inherited prompt
+        if (userId) {
+          registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt, { texture: body.texture === true });
+        }
+        res.json({ success: true, taskId });
       }
-      res.json({ success: true, taskId });
     }
   } catch (err) {
     console.error(`[TaskController] create error:`, err.message);

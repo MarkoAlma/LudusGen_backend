@@ -97,10 +97,11 @@ class TaskService {
         if (mv === "P1-20260311") {
           const P1_ALLOWED = new Set([
             "type", "model_version", "prompt", "file", "files",
+            "images", "batch_images",
             "texture", "pbr", "texture_quality",
             "face_limit", "model_seed", "texture_seed",
             "auto_size", "compress", "export_uv",
-            "negative_prompt",  // FIX: P1 supports negative_prompt
+            "negative_prompt",
             "callback_url",
           ]);
           for (const key of Object.keys(b)) {
@@ -134,6 +135,12 @@ class TaskService {
           if (body.type === "text_to_model" && !p?.trim())
             throw new Error("prompt is required for text_to_model");
           if (p && p.length > 1000) throw new Error("prompt max 1000 characters");
+        }
+
+        // image/batch validation
+        if (body.type === "image_to_model") {
+          const hasFile = !!b.file || (!!b.images && b.images.length > 0) || (!!b.batch_images && b.batch_images.length > 0);
+          if (!hasFile) throw new Error("file, images, or batch_images required for image_to_model");
         }
 
         // negative_prompt length — Tripo API max 255 characters
@@ -190,16 +197,7 @@ class TaskService {
         break;
       }
 
-      case "smart_low_poly": {
-        if (!b["original_model_task_id"])
-          throw new Error("original_model_task_id required");
-        const fl = validateFaceLimit(b["face_limit"], true, !!b["quad"]);
-        if (fl === undefined)
-          throw new Error("face_limit is required for smart_low_poly");
-        b["face_limit"] = fl;
-        if (!b["quad"]) delete b["quad"];
-        break;
-      }
+
 
       case "convert_model": {
         if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
@@ -210,10 +208,15 @@ class TaskService {
           throw new Error(`Format "${fmt}" is not supported for rigged model inputs. Use GLB or FBX.`);
         if (b["quad"]) b["format"] = "fbx";
         delete b["is_rigged_input"];
-        const fl = validateFaceLimit(b["face_limit"], false, !!b["quad"]);
+        
+        const isSlp = !!b["smart_low_poly"];
+        const fl = validateFaceLimit(b["face_limit"], isSlp, !!b["quad"]);
         if (fl !== undefined) b["face_limit"] = fl; else delete b["face_limit"];
+        
         if (!b["quad"]) delete b["quad"];
         if (!b["pivot_to_center_bottom"]) delete b["pivot_to_center_bottom"];
+        // Tripo does not accept smart_low_poly parameter here, so delete it before passing to API
+        delete b["smart_low_poly"];
         break;
       }
 
