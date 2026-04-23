@@ -35,6 +35,9 @@ export function estimateCost(req) {
     if (req.type === "convert_model" && req.smart_low_poly) {
       cost = CREDIT_COSTS["smart_low_poly"] ?? 10;
       breakdown.convert_model = cost;
+    } else if (req.type === "convert_model" && req.quad) {
+      cost = CREDIT_COSTS["convert_model:advanced"] ?? 10;
+      breakdown.convert_model = cost;
     }
 
     return { total: cost, breakdown };

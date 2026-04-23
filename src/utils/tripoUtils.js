@@ -5,36 +5,77 @@
  *
  * @param {object} task - Raw task object from Tripo API
  * @param {{ preferBaseModel?: boolean, preferPbrModel?: boolean }} [opts]
- * @returns {{ modelUrl: string|null, rigCheckResult: boolean|null, rigType: string|null, topology: string|null, rawOutput: object }}
+ * @returns {{ modelUrl: string|null, chosenSource: string|null, rigCheckResult: boolean|null, rigType: string|null, topology: string|null, rawOutput: object }}
  */
 export function extractModelUrl(task, opts = {}) {
   const out = task.output ?? {};
+  const taskType = task.type ?? null;
   const animatedModel =
     Array.isArray(out.animated_models) && out.animated_models.length > 0
       ? out.animated_models[0]
       : out.animated_model;
-  const orderedUrls = [
-    opts.preferPbrModel ? out.pbr_model : null,
-    opts.preferPbrModel ? out.textured_model : null,
-    opts.preferBaseModel ? out.base_model : null,
-    out.pbr_model,
-    out.textured_model,
-    out.model,
-    out.model_url,
-    out.base_model,
-    out.rigged_model,
-    animatedModel,
-    out.converted_model,
-    out.low_poly_model,
-    out.segmented_model,
-    out.stylized_model,
-    out.refined_model,
-  ];
-  const modelUrl =
-    orderedUrls.find(Boolean) ?? null;
+  const hasExplicitTexturedVariants = Boolean(out.pbr_model || out.textured_model);
+  const shouldPreferTextured =
+    opts.preferPbrModel === true || taskType === "texture_model";
+  const shouldPreferDraft =
+    opts.preferBaseModel === true ||
+    (!shouldPreferTextured &&
+      ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskType));
+  let orderedOutputs;
+
+  if (shouldPreferTextured) {
+    orderedOutputs = [
+      { key: "pbr_model", value: out.pbr_model },
+      { key: "model", value: out.model },
+      { key: "textured_model", value: out.textured_model },
+      { key: "model_url", value: out.model_url },
+      { key: "base_model", value: out.base_model },
+      { key: "rigged_model", value: out.rigged_model },
+      { key: "animated_model", value: animatedModel },
+      { key: "converted_model", value: out.converted_model },
+      { key: "low_poly_model", value: out.low_poly_model },
+      { key: "segmented_model", value: out.segmented_model },
+      { key: "stylized_model", value: out.stylized_model },
+      { key: "refined_model", value: out.refined_model },
+    ];
+  } else if (shouldPreferDraft) {
+    orderedOutputs = [
+      { key: "base_model", value: hasExplicitTexturedVariants ? out.base_model : null },
+      { key: "model", value: out.model },
+      { key: "model_url", value: out.model_url },
+      { key: "base_model", value: out.base_model },
+      { key: "pbr_model", value: out.pbr_model },
+      { key: "textured_model", value: out.textured_model },
+      { key: "rigged_model", value: out.rigged_model },
+      { key: "animated_model", value: animatedModel },
+      { key: "converted_model", value: out.converted_model },
+      { key: "low_poly_model", value: out.low_poly_model },
+      { key: "segmented_model", value: out.segmented_model },
+      { key: "stylized_model", value: out.stylized_model },
+      { key: "refined_model", value: out.refined_model },
+    ];
+  } else {
+    orderedOutputs = [
+      { key: "pbr_model", value: out.pbr_model },
+      { key: "textured_model", value: out.textured_model },
+      { key: "model", value: out.model },
+      { key: "model_url", value: out.model_url },
+      { key: "base_model", value: out.base_model },
+      { key: "rigged_model", value: out.rigged_model },
+      { key: "animated_model", value: animatedModel },
+      { key: "converted_model", value: out.converted_model },
+      { key: "low_poly_model", value: out.low_poly_model },
+      { key: "segmented_model", value: out.segmented_model },
+      { key: "stylized_model", value: out.stylized_model },
+      { key: "refined_model", value: out.refined_model },
+    ];
+  }
+  const selected = orderedOutputs.find((entry) => Boolean(entry.value)) ?? null;
+  const modelUrl = selected?.value ?? null;
 
   return {
     modelUrl,
+    chosenSource: selected?.key ?? null,
     rigCheckResult: out.is_animatable ?? out.animatable ?? out.riggable ?? out.rig_check_result ?? null,
     rigType: out.rig_type ?? out.topology ?? null,
     topology: out.topology ?? null,

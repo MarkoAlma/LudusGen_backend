@@ -32,6 +32,7 @@ export async function createTask(req, res) {
 
   try {
     let body = { type, ...rest };
+
     logDebug("[TaskController][create-debug] incoming req.body:", req.body);
     if (type === "refine_model") {
       console.log("[TaskController][refine-debug] incoming request:", {
@@ -62,9 +63,30 @@ export async function createTask(req, res) {
     }
     logDebug("[TaskController][create-debug] normalized body:", body);
 
+    if (type === "texture_model" && body.original_model_task_id) {
+      try {
+        const sourceTask = await getTripoClient().getTask(body.original_model_task_id);
+        const sourceType = sourceTask?.type ?? null;
+        const upstreamId =
+          sourceTask?.input?.original_model_id ??
+          sourceTask?.input?.original_model_task_id ??
+          null;
+        if (
+          upstreamId &&
+          (sourceType === "convert_model" || sourceType === "smart_low_poly")
+        ) {
+          console.log(`[TaskController][texture-source] Rewriting texture source ${body.original_model_task_id} (${sourceType}) -> ${upstreamId}`);
+          body.original_model_task_id = upstreamId;
+        }
+      } catch (sourceErr) {
+        console.warn(`[TaskController][texture-source] Failed to inspect source task ${body.original_model_task_id}:`, sourceErr.message);
+      }
+    }
+
     // Estimate credit cost for this task
     const estimateResult = estimateCost(body);
     estimatedCost = estimateResult.total;
+    console.log(`[TaskController][create] type=${body.type} model=${body.model_version} base_cost=${estimateResult.breakdown.base} tex_addon=${estimateResult.breakdown.texture || 0} total_cost=${estimatedCost}`);
     console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"} cost=${estimatedCost}`);
 
     let tempTxId = null;
@@ -359,6 +381,8 @@ export async function getTask(req, res) {
       status: result.status ?? null,
       progress: result.progress ?? null,
       modelUrl: result.modelUrl ?? null,
+      errorMessage: result.errorMessage ?? null,
+      errorCode: result.errorCode ?? null,
       outputKeys: Object.keys(result.rawOutput ?? {}),
       rawOutput: result.rawOutput ?? null,
     });

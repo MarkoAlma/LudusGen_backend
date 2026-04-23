@@ -93,14 +93,6 @@ export function startTaskRecovery() {
       try {
         const taskData = await getTripoClient().getTask(entry.taskId);
         const status = taskData.status;
-        console.log("[TaskRecovery] polled task payload:", JSON.stringify({
-          taskId: entry.taskId,
-          type: entry.type,
-          status,
-          progress: taskData.progress ?? null,
-          output: taskData.output ?? null,
-          error: taskData.error ?? null,
-        }, null, 2));
 
         if (status === "success") {
           await saveToHistory(entry, taskData);
@@ -108,9 +100,7 @@ export function startTaskRecovery() {
         } else if (status === "failed" || status === "cancelled") {
           await handleFailedTask(entry, taskData);
           pendingTasks.delete(entry.taskId);
-        } else {
           // "queued" or "running" — keep polling
-          console.log(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) still ${status}...`);
         }
       } catch (err) {
         console.error(`[TaskRecovery] Poll error for task ${entry.taskId}:`, err.message);
@@ -152,11 +142,6 @@ export function stopTaskRecovery() {
 async function saveToHistory(entry, taskData) {
   const db = admin.firestore();
   const out = taskData.output ?? {};
-  console.log("[TaskRecovery] saveToHistory payload:", JSON.stringify({
-    taskId: entry.taskId,
-    type: entry.type,
-    output: out,
-  }, null, 2));
 
   // prerigcheck only returns is_animatable — no model to save
   if (entry.type === "animate_prerigcheck") {
@@ -172,10 +157,19 @@ async function saveToHistory(entry, taskData) {
   }
   const prefersTexturedOutput = entry.type === "texture_model" || entry.texture === true || entry.pbr === true;
   const prefersDraftOutput = !prefersTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(entry.type);
-  const { modelUrl } = extractModelUrl(
+  const { modelUrl, chosenSource } = extractModelUrl(
     { output: out, type: entry.type },
     { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput },
   );
+  console.log("[TaskRecovery] output selection:", JSON.stringify({
+    taskId: entry.taskId,
+    type: entry.type,
+    prefersDraftOutput,
+    prefersTexturedOutput,
+    chosenSource,
+    modelUrl,
+    availableOutputKeys: Object.keys(out),
+  }, null, 2));
 
   if (!modelUrl) {
     console.warn(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) succeeded but no model URL found in output:`, JSON.stringify(out));
@@ -215,8 +209,8 @@ async function saveToHistory(entry, taskData) {
         model_version: entry.modelVersion,
         mode,
         type: entry.type,
-        ...(entry.texture === true && { texture: true }),
-        ...(entry.pbr === true && { pbr: true }),
+        texture: !!entry.texture,
+        pbr: !!entry.pbr,
         rig_type: out.rig_type ?? out.topology ?? null,
         topology: out.topology ?? null,
         is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,
@@ -235,16 +229,26 @@ async function saveToHistory(entry, taskData) {
 async function handleFailedTask(entry, taskData) {
   const taskId = entry.taskId;
   const userId = entry.userId;
-  console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. rawOutput:`, JSON.stringify(taskData.rawOutput ?? {}));
-  console.error("[TaskRecovery] failed task payload:", JSON.stringify({
-    taskId,
-    type: entry.type,
-    status: taskData.status ?? null,
-    progress: taskData.progress ?? null,
-    error: taskData.error ?? null,
-    output: taskData.output ?? null,
-    rawOutput: taskData.rawOutput ?? null,
-  }, null, 2));
+  const out = taskData.output ?? taskData.rawOutput ?? {};
+  const taskError =
+    taskData.error_msg ??
+    taskData.error_message ??
+    taskData.error ??
+    taskData.message ??
+    taskData.reason ??
+    out.error_msg ??
+    out.error_message ??
+    out.error ??
+    out.message ??
+    out.reason ??
+    null;
+  const taskErrorCode =
+    taskData.error_code ??
+    taskData.code ??
+    out.error_code ??
+    out.code ??
+    null;
+  console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. error=${taskError ?? "unknown"} code=${taskErrorCode ?? "unknown"} rawOutput:`, JSON.stringify(taskData.rawOutput ?? taskData.output ?? {}));
 
   // Look up the charged amount from credit_history
   // NOTE: collectionGroup with multiple where() requires a composite index.
@@ -271,7 +275,7 @@ async function handleFailedTask(entry, taskData) {
   const data = debitDoc.data();
 
   // Check for NSFW/content policy — no refund
-  const errorMsg = (taskData.error ?? "").toLowerCase();
+  const errorMsg = String(taskError ?? "").toLowerCase();
   if (errorMsg.includes("nsfw") || errorMsg.includes("content policy") || errorMsg.includes("safety") || errorMsg.includes("moderat")) {
     console.log(`[TaskRecovery] No refund for task ${taskId}: NSFW/content policy violation`);
     return;

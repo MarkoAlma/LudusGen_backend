@@ -149,14 +149,6 @@ export class TripoClient {
   async getTask(taskId) {
     const res = await this.get(`/task/${taskId}`);
     if (!res.data) throw new Error(`No task data for ${taskId}`);
-    logDebug("[TripoClient] getTask response:", {
-      taskId,
-      status: res.data?.status ?? null,
-      progress: res.data?.progress ?? null,
-      type: res.data?.type ?? null,
-      output: res.data?.output ?? null,
-      error: res.data?.error ?? null,
-    });
     return res.data;
   }
 
@@ -204,7 +196,6 @@ export class TripoClient {
 
     while (Date.now() < deadline) {
       const task = await this.getTask(taskId);
-      console.log(`[TripoClient] pollTask tick ${taskId}: status=${task.status ?? "unknown"} progress=${task.progress ?? 0}`);
       opts.onProgress?.(task.progress ?? 0, task.status);
 
       if (task.status === "success") {

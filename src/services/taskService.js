@@ -13,6 +13,34 @@ import {
 import { validateFaceLimit } from "../lib/enginePresets.js";
 import crypto from "crypto";
 
+function extractTaskError(task = {}) {
+  const out = task.output ?? {};
+  return (
+    task.error_msg ??
+    task.error_message ??
+    task.error ??
+    task.message ??
+    task.reason ??
+    out.error_msg ??
+    out.error_message ??
+    out.error ??
+    out.message ??
+    out.reason ??
+    null
+  );
+}
+
+function extractTaskErrorCode(task = {}) {
+  const out = task.output ?? {};
+  return (
+    task.error_code ??
+    task.code ??
+    out.error_code ??
+    out.code ??
+    null
+  );
+}
+
 /* ─── TaskService ─────────────────────────────────────────────────────── */
 
 class TaskService {
@@ -43,17 +71,8 @@ class TaskService {
   /* ── Get ─────────────────────────────────────────────────────────── */
   async get(taskId, outputHints = {}) {
     const client = getTripoClient();
-    console.log("[TaskService] get request:", JSON.stringify({ taskId, outputHints }, null, 2));
     const task = await client.getTask(taskId);
-    const result = this.taskToPollResult(task, outputHints);
-    console.log("[TaskService] get normalized result:", JSON.stringify({
-      taskId,
-      status: result.status ?? null,
-      progress: result.progress ?? null,
-      modelUrl: result.modelUrl ?? null,
-      outputKeys: Object.keys(result.rawOutput ?? {}),
-    }, null, 2));
-    return result;
+    return this.taskToPollResult(task, outputHints);
   }
 
   /* ── Cancel ──────────────────────────────────────────────────────── */
@@ -77,17 +96,7 @@ class TaskService {
     const client = getTripoClient();
     const startMs = Date.now();
     try {
-      const result = await client.pollTask(taskId, {
-        onProgress: (p, s) =>
-          console.log(`[TaskService] poll ${taskId}: ${s} ${p}%`),
-      });
-      console.log("[TaskService] poll raw result:", JSON.stringify({
-        taskId,
-        status: result.status ?? null,
-        progress: result.progress ?? null,
-        modelUrl: result.modelUrl ?? null,
-        rawOutput: result.rawOutput ?? null,
-      }, null, 2));
+      const result = await client.pollTask(taskId);
       analyticsService.recordTaskEnd(taskId, result.status, Date.now() - startMs);
       if (!outputHints || Object.keys(outputHints).length === 0) {
         return result;
@@ -149,9 +158,11 @@ class TaskService {
             console.warn(`[TaskService] P1-20260311: dropping unsupported texture_quality "${b["texture_quality"]}", using standard`);
             delete b["texture_quality"];
           }
-          if (!b["texture"] && !b["pbr"]) delete b["texture_quality"];
+          if (!b["texture"] && !b["pbr"]) {
+            delete b["texture_quality"];
+          }
           if (b["texture"] === undefined) delete b["texture"];
-          if (!b["pbr"]) delete b["pbr"];
+          if (b["pbr"] === undefined) delete b["pbr"];
           break; // P1 validáció kész, többi szabály nem vonatkozik rá
         }
 
@@ -209,7 +220,7 @@ class TaskService {
           }
         }
         if (b["texture"] === undefined) delete b["texture"];
-        if (!b["pbr"]) delete b["pbr"];
+        if (b["pbr"] === undefined) delete b["pbr"];
 
         // style
         if (b["style"] && !VALID_STYLES.has(b["style"]))
@@ -398,19 +409,34 @@ class TaskService {
   /* ── Convert raw task to PollResult ──────────────────────────────── */
   taskToPollResult(task, outputHints = {}) {
     const out = task.output ?? {};
+    const errorMessage = extractTaskError(task);
+    const errorCode = extractTaskErrorCode(task);
     if (task.status === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
       console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
     }
-    const { modelUrl, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task, outputHints);
+    const { modelUrl, chosenSource, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task, outputHints);
+    if (task.status === "success") {
+      console.log("[TaskService] output selection:", JSON.stringify({
+        taskId: task.task_id ?? null,
+        type: task.type ?? null,
+        preferDraftOutput: outputHints.preferBaseModel === true,
+        preferTexturedOutput: outputHints.preferPbrModel === true,
+        chosenSource,
+        availableOutputKeys: Object.keys(out),
+      }, null, 2));
+    }
     return {
       success: task.status === "success",
       status: task.status,
       progress: task.progress ?? 0,
       modelUrl,
+      chosenSource,
       rigCheckResult,
       rigType,
       topology,
       rawOutput,
+      errorMessage,
+      errorCode,
     };
   }
 }
