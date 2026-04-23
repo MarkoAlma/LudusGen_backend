@@ -37,10 +37,10 @@ class TaskService {
   }
 
   /* ── Get ─────────────────────────────────────────────────────────── */
-  async get(taskId) {
+  async get(taskId, outputHints = {}) {
     const client = getTripoClient();
     const task = await client.getTask(taskId);
-    return this.taskToPollResult(task);
+    return this.taskToPollResult(task, outputHints);
   }
 
   /* ── Cancel ──────────────────────────────────────────────────────── */
@@ -60,7 +60,7 @@ class TaskService {
   }
 
   /* ── Poll ────────────────────────────────────────────────────────── */
-  async poll(taskId) {
+  async poll(taskId, outputHints = {}) {
     const client = getTripoClient();
     const startMs = Date.now();
     try {
@@ -69,7 +69,13 @@ class TaskService {
           console.log(`[TaskService] poll ${taskId}: ${s} ${p}%`),
       });
       analyticsService.recordTaskEnd(taskId, result.status, Date.now() - startMs);
-      return result;
+      if (!outputHints || Object.keys(outputHints).length === 0) {
+        return result;
+      }
+      return {
+        ...result,
+        ...this.taskToPollResult({ ...result, output: result.rawOutput ?? {}, type: result.rawOutput?.type ?? null }, outputHints),
+      };
     } catch (err) {
       analyticsService.recordTaskError(taskId, "unknown", err.message);
       throw err;
@@ -199,14 +205,34 @@ class TaskService {
 
 
 
+      case "smart_low_poly": {
+        if (!b["original_model_task_id"])
+          throw new Error("original_model_task_id required");
+        const fl = validateFaceLimit(b["face_limit"], true, !!b["quad"]);
+        if (fl === undefined)
+          throw new Error("face_limit is required for smart_low_poly");
+        b["face_limit"] = fl;
+        if (!b["quad"]) delete b["quad"];
+        break;
+      }
+
       case "convert_model": {
         if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
-        const fmt = b["format"] ?? "glb";
+        const fmt = String(b["format"] ?? "glb").trim().toLowerCase();
         if (!VALID_CONVERT_FORMATS.has(fmt))
           throw new Error(`Invalid format "${fmt}". Valid: ${[...VALID_CONVERT_FORMATS].join(", ")}`);
         if (b["is_rigged_input"] && RIGGED_UNSUPPORTED_FORMATS.has(fmt))
           throw new Error(`Format "${fmt}" is not supported for rigged model inputs. Use GLB or FBX.`);
-        if (b["quad"]) b["format"] = "fbx";
+        const apiFormatMap = {
+          glb: "GLTF",
+          gltf: "GLTF",
+          fbx: "FBX",
+          obj: "OBJ",
+          stl: "STL",
+          "3mf": "3MF",
+          usdz: "USDZ",
+        };
+        b["format"] = b["quad"] ? "FBX" : (apiFormatMap[fmt] ?? fmt.toUpperCase());
         delete b["is_rigged_input"];
         
         const isSlp = !!b["smart_low_poly"];
@@ -319,6 +345,9 @@ class TaskService {
       case "refine_model":
         if (!b["original_model_task_id"] && !b["draft_model_task_id"])
           throw new Error("original_model_task_id / draft_model_task_id required");
+        // Refine also accepts prompt and negative_prompt to guide refinement
+        if (b["prompt"] && b["prompt"].length > 1000) throw new Error("prompt max 1000 characters");
+        if (b["negative_prompt"] && b["negative_prompt"].length > 255) b["negative_prompt"] = b["negative_prompt"].slice(0, 255);
         break;
 
       case "text_to_image": {
@@ -347,12 +376,12 @@ class TaskService {
   }
 
   /* ── Convert raw task to PollResult ──────────────────────────────── */
-  taskToPollResult(task) {
+  taskToPollResult(task, outputHints = {}) {
     const out = task.output ?? {};
     if (task.status === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
       console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
     }
-    const { modelUrl, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task);
+    const { modelUrl, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task, outputHints);
     return {
       success: task.status === "success",
       status: task.status,

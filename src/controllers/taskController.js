@@ -6,7 +6,7 @@ import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
 import { deductCredits, refundCredits, linkTaskIdToTransaction } from "../services/creditService.js";
-import { registerTask as registerForRecovery, unregisterTask } from "../services/taskRecoveryService.js";
+import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskMeta } from "../services/taskRecoveryService.js";
 import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
@@ -20,9 +20,19 @@ export async function createTask(req, res) {
   const { type, callback_url, idempotency_key, ...rest } = req.body;
   const userId = req.user?.uid;
   let estimatedCost = 0;
+  let creditsDeducted = false;
 
   try {
     let body = { type, ...rest };
+    if (type === "refine_model") {
+      console.log("[TaskController][refine-debug] incoming request:", {
+        userId,
+        draft_model_task_id: body.draft_model_task_id ?? null,
+        original_model_task_id: body.original_model_task_id ?? null,
+        hasPrompt: typeof body.prompt === "string" && body.prompt.trim().length > 0,
+        hasNegativePrompt: typeof body.negative_prompt === "string" && body.negative_prompt.trim().length > 0,
+      });
+    }
     
     // Normalize image inputs
     if (type === "image_to_model") {
@@ -67,6 +77,7 @@ export async function createTask(req, res) {
 
       try {
         await deductCredits(userId, estimatedCost, tempTxId, type);
+        creditsDeducted = true;
       } catch (creditErr) {
         if (creditErr.code === "INSUFFICIENT_CREDITS") {
           return res.status(402).json({
@@ -122,7 +133,39 @@ export async function createTask(req, res) {
           if (type === "refine_model") {
             const histType = parentData.params?.type;
             const VALID_REFINE_SOURCES = new Set(["text_to_model", "image_to_model", "multiview_to_model"]);
+            const hasTexture = (
+              parentData.mode === "texture" ||
+              parentData.params?.mode === "texture" ||
+              parentData.params?.type === "texture_model" ||
+              parentData.params?.texture === true ||
+              parentData.params?.texture === "true" ||
+              parentData.params?.pbr === true ||
+              parentData.params?.pbr === "true"
+            );
+            console.log("[TaskController][refine-debug] parent resolved:", {
+              parentTaskId,
+              parentMode: parentData.mode ?? null,
+              parentType: histType ?? null,
+              parentTexture: parentData.params?.texture ?? null,
+              parentPbr: parentData.params?.pbr ?? null,
+              hasTexture,
+            });
+            if (hasTexture) {
+              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
+                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_textured_source");
+                creditsDeducted = false;
+              }
+              return res.status(400).json({
+                success: false,
+                message: "Ez a modell texturazott, ezert nem finomithato. A Refine csak texture OFF (draft) modellre mukodik.",
+                code: "UNSUPPORTED_REFINE_SOURCE",
+              });
+            }
             if (histType && !VALID_REFINE_SOURCES.has(histType)) {
+              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
+                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_source");
+                creditsDeducted = false;
+              }
               return res.status(400).json({
                 success: false,
                 message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható (kivéve: ${histType}).`,
@@ -140,6 +183,11 @@ export async function createTask(req, res) {
           } else if (body.animation && !body.animation.startsWith("preset:")) {
             body.animation = `preset:${defaultRigType}:${body.animation}`;
           }
+        } else if (type === "refine_model") {
+          console.warn("[TaskController][refine-debug] parent task was not found in history", {
+            parentTaskId,
+            userId,
+          });
         }
       } catch (err) {
         console.warn(`[TaskController] Parent metadata lookup failed:`, err.message);
@@ -155,6 +203,14 @@ export async function createTask(req, res) {
         bake_animation: body.bake_animation ?? true,
         export_with_geometry: body.export_with_geometry ?? true,
         animate_in_place: body.animate_in_place ?? false,
+      });
+    }
+    if (type === "refine_model") {
+      console.log("[TaskController][refine-debug] validated body before taskService.create:", {
+        draft_model_task_id: body.draft_model_task_id ?? null,
+        original_model_task_id: body.original_model_task_id ?? null,
+        prompt: body.prompt ?? null,
+        negative_prompt: body.negative_prompt ?? null,
       });
     }
 
@@ -198,7 +254,10 @@ export async function createTask(req, res) {
             );
           }
           if (userId) {
-            registerForRecovery(taskId, userId, subBody.type, subBody.model_version ?? DEFAULT_MODEL, inheritedPrompt, { texture: subBody.texture === true });
+            registerForRecovery(taskId, userId, subBody.type, subBody.model_version ?? DEFAULT_MODEL, inheritedPrompt, {
+              texture: subBody.texture === true,
+              pbr: subBody.pbr === true,
+            });
           }
           taskIds.push(taskId);
         }
@@ -218,7 +277,10 @@ export async function createTask(req, res) {
 
         // Register for background recovery with inherited prompt
         if (userId) {
-          registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt, { texture: body.texture === true });
+          registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt, {
+            texture: body.texture === true,
+            pbr: body.pbr === true,
+          });
         }
         res.json({ success: true, taskId });
       }
@@ -228,10 +290,11 @@ export async function createTask(req, res) {
 
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
-      if (userId && estimatedCost > 0) {
+      if (userId && estimatedCost > 0 && creditsDeducted) {
         console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
         try {
           await refundCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, "tripo_403_insufficient_credit");
+          creditsDeducted = false;
         } catch (refundErr) {
           console.error(`[TaskController] Refund error:`, refundErr.message);
         }
@@ -241,6 +304,14 @@ export async function createTask(req, res) {
     // Tripo 1004 on refine_model = model has no draft output (was generated with texture, or wrong task type)
     let userMessage = err.message;
     if (type === "refine_model" && err.message?.includes("1004")) {
+      if (userId && estimatedCost > 0 && creditsDeducted) {
+        try {
+          await refundCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, "refine_no_draft_output");
+          creditsDeducted = false;
+        } catch (refundErr) {
+          console.error(`[TaskController] Refund error (refine 1004):`, refundErr.message);
+        }
+      }
       userMessage = "Ez a modell nem finomítható. A Refine csak textúra nélkül generált (draft) modelleknél működik. Generálj új modellt textúra nélkül, majd alkalmazd rá a Refine-t.";
     }
 
@@ -251,7 +322,13 @@ export async function createTask(req, res) {
 /* ─── Task: get status ────────────────────────────────────────────────── */
 export async function getTask(req, res) {
   try {
-    const result = await taskService.get(req.params.taskId);
+    const taskMeta = getRegisteredTaskMeta(req.params.taskId);
+    const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
+    const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
+    const result = await taskService.get(req.params.taskId, {
+      preferBaseModel: preferDraftOutput,
+      preferPbrModel: preferTexturedOutput,
+    });
     // FIX: result.success-t kivesszük, hogy ne írja felül a success: true-t
     const { success: _ignored, ...taskData } = result;
     res.json({ success: true, ...taskData });

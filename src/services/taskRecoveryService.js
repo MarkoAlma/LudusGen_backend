@@ -11,6 +11,7 @@
 import { getTripoClient } from "../lib/tripoClient.js";
 import { refundCredits } from "./creditService.js";
 import admin from "firebase-admin";
+import { extractModelUrl } from "../utils/tripoUtils.js";
 
 const HISTORY_COLLECTION = "tripo_history";
 const POLL_INTERVAL_MS = 5_000; // check every 5 seconds
@@ -19,8 +20,9 @@ const CLEANUP_INTERVAL_MS = 60_000; // cleanup completed tasks every minute
 
 const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-/** @type {Map<string, { taskId: string, userId: string, type: string, modelVersion: string, texture: boolean, startedAt: number }>} */
+/** @type {Map<string, { taskId: string, userId: string, type: string, modelVersion: string, texture: boolean, pbr: boolean, startedAt: number }>} */
 const pendingTasks = new Map();
+const recentTaskMeta = new Map();
 
 /* ─── Type → mode mapping (same as webhookController) ─────────────────── */
 const TYPE_TO_MODE = {
@@ -41,16 +43,23 @@ const TYPE_TO_MODE = {
 /* ─── Register a task for background tracking ─────────────────────────── */
 export function registerTask(taskId, userId, type, modelVersion, prompt = null, extra = {}) {
   if (!taskId || !userId) return;
-  pendingTasks.set(taskId, {
+  const meta = {
     taskId,
     userId,
     type: type ?? "unknown",
     modelVersion: modelVersion ?? "unknown",
     prompt,
     texture: extra.texture === true,
+    pbr: extra.pbr === true,
     startedAt: Date.now(),
-  });
+  };
+  pendingTasks.set(taskId, meta);
+  recentTaskMeta.set(taskId, meta);
   console.log(`[TaskRecovery] Registered task ${taskId} for user ${userId}${prompt ? ` (${prompt})` : ''}`);
+}
+
+export function getRegisteredTaskMeta(taskId) {
+  return pendingTasks.get(taskId) ?? recentTaskMeta.get(taskId) ?? null;
 }
 
 /* ─── Unregister a task (called when frontend successfully polls it) ──── */
@@ -110,6 +119,11 @@ export function startTaskRecovery() {
         pendingTasks.delete(taskId);
       }
     }
+    for (const [taskId, entry] of recentTaskMeta) {
+      if (now - entry.startedAt > MAX_POLL_MS) {
+        recentTaskMeta.delete(taskId);
+      }
+    }
   }, CLEANUP_INTERVAL_MS);
 }
 
@@ -143,10 +157,12 @@ async function saveToHistory(entry, taskData) {
   if (animatedModels && entry.type === "animate_retarget") {
     console.log(`[TaskRecovery] animate_retarget ${entry.taskId}: animated_models count=${animatedModels.length}`, animatedModels);
   }
-  const modelUrl = out.model ?? out.model_url ?? out.pbr_model ?? out.base_model
-    ?? out.rigged_model ?? (animatedModels ? animatedModels[0] : out.animated_model)
-    ?? out.converted_model ?? out.low_poly_model
-    ?? out.segmented_model ?? out.stylized_model ?? null;
+  const prefersTexturedOutput = entry.type === "texture_model" || entry.texture === true || entry.pbr === true;
+  const prefersDraftOutput = !prefersTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(entry.type);
+  const { modelUrl } = extractModelUrl(
+    { output: out, type: entry.type },
+    { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput },
+  );
 
   if (!modelUrl) {
     console.warn(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) succeeded but no model URL found in output:`, JSON.stringify(out));
@@ -187,6 +203,7 @@ async function saveToHistory(entry, taskData) {
         mode,
         type: entry.type,
         ...(entry.texture === true && { texture: true }),
+        ...(entry.pbr === true && { pbr: true }),
         rig_type: out.rig_type ?? out.topology ?? null,
         topology: out.topology ?? null,
         is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,
