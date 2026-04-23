@@ -24,6 +24,10 @@ class TaskService {
     const idempotencyKey = opts.idempotencyKey ?? crypto.randomUUID();
     const client = getTripoClient();
     const startMs = Date.now();
+    console.log("[TaskService] validated create body:", JSON.stringify({
+      idempotencyKey,
+      validated,
+    }, null, 2));
 
     try {
       const taskId = await client.createTask(validated, idempotencyKey);
@@ -39,8 +43,17 @@ class TaskService {
   /* ── Get ─────────────────────────────────────────────────────────── */
   async get(taskId, outputHints = {}) {
     const client = getTripoClient();
+    console.log("[TaskService] get request:", JSON.stringify({ taskId, outputHints }, null, 2));
     const task = await client.getTask(taskId);
-    return this.taskToPollResult(task, outputHints);
+    const result = this.taskToPollResult(task, outputHints);
+    console.log("[TaskService] get normalized result:", JSON.stringify({
+      taskId,
+      status: result.status ?? null,
+      progress: result.progress ?? null,
+      modelUrl: result.modelUrl ?? null,
+      outputKeys: Object.keys(result.rawOutput ?? {}),
+    }, null, 2));
+    return result;
   }
 
   /* ── Cancel ──────────────────────────────────────────────────────── */
@@ -68,6 +81,13 @@ class TaskService {
         onProgress: (p, s) =>
           console.log(`[TaskService] poll ${taskId}: ${s} ${p}%`),
       });
+      console.log("[TaskService] poll raw result:", JSON.stringify({
+        taskId,
+        status: result.status ?? null,
+        progress: result.progress ?? null,
+        modelUrl: result.modelUrl ?? null,
+        rawOutput: result.rawOutput ?? null,
+      }, null, 2));
       analyticsService.recordTaskEnd(taskId, result.status, Date.now() - startMs);
       if (!outputHints || Object.keys(outputHints).length === 0) {
         return result;

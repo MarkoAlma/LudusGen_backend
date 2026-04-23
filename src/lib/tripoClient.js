@@ -18,6 +18,14 @@ const jitter = ms => ms + Math.floor(Math.random() * RETRY_CONFIG.jitterMs);
 const backoffDelay = attempt =>
   jitter(Math.min(RETRY_CONFIG.baseDelayMs * 2 ** attempt, RETRY_CONFIG.maxDelayMs));
 
+function logDebug(label, payload) {
+  try {
+    console.log(label, JSON.stringify(payload, null, 2));
+  } catch {
+    console.log(label, payload);
+  }
+}
+
 /* ─── TripoClient ─────────────────────────────────────────────────────── */
 export class TripoClient {
   /** @param {string} [apiKey] @param {string} [baseUrl] @param {number} [timeoutMs] */
@@ -132,6 +140,7 @@ export class TripoClient {
     }
 
     const res = await this.post("/task", taskBody, idempotencyKey);
+    logDebug("[TripoClient] createTask response:", res);
     const taskId = res.data?.task_id;
     if (!taskId) throw new Error(`No task_id in response: ${JSON.stringify(res).slice(0, 200)}`);
     return taskId;
@@ -140,6 +149,14 @@ export class TripoClient {
   async getTask(taskId) {
     const res = await this.get(`/task/${taskId}`);
     if (!res.data) throw new Error(`No task data for ${taskId}`);
+    logDebug("[TripoClient] getTask response:", {
+      taskId,
+      status: res.data?.status ?? null,
+      progress: res.data?.progress ?? null,
+      type: res.data?.type ?? null,
+      output: res.data?.output ?? null,
+      error: res.data?.error ?? null,
+    });
     return res.data;
   }
 
@@ -187,6 +204,7 @@ export class TripoClient {
 
     while (Date.now() < deadline) {
       const task = await this.getTask(taskId);
+      console.log(`[TripoClient] pollTask tick ${taskId}: status=${task.status ?? "unknown"} progress=${task.progress ?? 0}`);
       opts.onProgress?.(task.progress ?? 0, task.status);
 
       if (task.status === "success") {

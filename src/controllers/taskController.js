@@ -15,6 +15,14 @@ const USE_QUEUE = process.env.USE_QUEUE === "true";
 // NOTE: existing docs with tripo_ prefixed IDs in 'trellis_history' need a one-time migration
 const HISTORY_COLLECTION = "tripo_history";
 
+function logDebug(label, payload) {
+  try {
+    console.log(label, JSON.stringify(payload, null, 2));
+  } catch {
+    console.log(label, payload);
+  }
+}
+
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
 export async function createTask(req, res) {
   const { type, callback_url, idempotency_key, ...rest } = req.body;
@@ -24,6 +32,7 @@ export async function createTask(req, res) {
 
   try {
     let body = { type, ...rest };
+    logDebug("[TaskController][create-debug] incoming req.body:", req.body);
     if (type === "refine_model") {
       console.log("[TaskController][refine-debug] incoming request:", {
         userId,
@@ -51,6 +60,7 @@ export async function createTask(req, res) {
         delete body.images;
       }
     }
+    logDebug("[TaskController][create-debug] normalized body:", body);
 
     // Estimate credit cost for this task
     const estimateResult = estimateCost(body);
@@ -213,6 +223,7 @@ export async function createTask(req, res) {
         negative_prompt: body.negative_prompt ?? null,
       });
     }
+    logDebug("[TaskController][create-debug] final body before create:", body);
 
     if (USE_QUEUE) {
       if (body.batch_images && body.batch_images.length > 1) {
@@ -287,6 +298,14 @@ export async function createTask(req, res) {
     }
   } catch (err) {
     console.error(`[TaskController] create error:`, err.message);
+    logDebug("[TaskController][create-debug] error context:", {
+      type,
+      userId,
+      estimatedCost,
+      creditsDeducted,
+      requestBody: req.body,
+      error: err.message,
+    });
 
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
@@ -325,9 +344,23 @@ export async function getTask(req, res) {
     const taskMeta = getRegisteredTaskMeta(req.params.taskId);
     const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
     const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
+    logDebug("[TaskController][getTask-debug] request:", {
+      taskId: req.params.taskId,
+      taskMeta,
+      preferTexturedOutput,
+      preferDraftOutput,
+    });
     const result = await taskService.get(req.params.taskId, {
       preferBaseModel: preferDraftOutput,
       preferPbrModel: preferTexturedOutput,
+    });
+    logDebug("[TaskController][getTask-debug] result:", {
+      taskId: req.params.taskId,
+      status: result.status ?? null,
+      progress: result.progress ?? null,
+      modelUrl: result.modelUrl ?? null,
+      outputKeys: Object.keys(result.rawOutput ?? {}),
+      rawOutput: result.rawOutput ?? null,
     });
     // FIX: result.success-t kivesszük, hogy ne írja felül a success: true-t
     const { success: _ignored, ...taskData } = result;

@@ -93,6 +93,14 @@ export function startTaskRecovery() {
       try {
         const taskData = await getTripoClient().getTask(entry.taskId);
         const status = taskData.status;
+        console.log("[TaskRecovery] polled task payload:", JSON.stringify({
+          taskId: entry.taskId,
+          type: entry.type,
+          status,
+          progress: taskData.progress ?? null,
+          output: taskData.output ?? null,
+          error: taskData.error ?? null,
+        }, null, 2));
 
         if (status === "success") {
           await saveToHistory(entry, taskData);
@@ -144,6 +152,11 @@ export function stopTaskRecovery() {
 async function saveToHistory(entry, taskData) {
   const db = admin.firestore();
   const out = taskData.output ?? {};
+  console.log("[TaskRecovery] saveToHistory payload:", JSON.stringify({
+    taskId: entry.taskId,
+    type: entry.type,
+    output: out,
+  }, null, 2));
 
   // prerigcheck only returns is_animatable — no model to save
   if (entry.type === "animate_prerigcheck") {
@@ -223,6 +236,15 @@ async function handleFailedTask(entry, taskData) {
   const taskId = entry.taskId;
   const userId = entry.userId;
   console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. rawOutput:`, JSON.stringify(taskData.rawOutput ?? {}));
+  console.error("[TaskRecovery] failed task payload:", JSON.stringify({
+    taskId,
+    type: entry.type,
+    status: taskData.status ?? null,
+    progress: taskData.progress ?? null,
+    error: taskData.error ?? null,
+    output: taskData.output ?? null,
+    rawOutput: taskData.rawOutput ?? null,
+  }, null, 2));
 
   // Look up the charged amount from credit_history
   // NOTE: collectionGroup with multiple where() requires a composite index.
