@@ -6,6 +6,8 @@ import admin from 'firebase-admin';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import dotenv from 'dotenv';
 import axios from 'axios';
+import FormData from 'form-data';
+import multer from 'multer';
 import dns from "dns";
 dns.setDefaultResultOrder("ipv4first");
 import https from "https";
@@ -99,12 +101,19 @@ function pcmToWav(pcmBuffer, sampleRate = 22050, channels = 1, bitDepth = 16) {
 }
 
 const httpsAgent = new https.Agent({ family: 4 });
+const deapiReferenceAudioUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 },
+});
+const MINIMAX_MUSIC_SAMPLE_RATES = [16000, 24000, 32000, 44100];
+const MINIMAX_MUSIC_BITRATES = [32000, 64000, 128000, 256000];
+const MINIMAX_MUSIC_FORMATS = ['mp3', 'wav', 'pcm'];
 
 dotenv.config();
 
 const router = express.Router();
 
-const REQUIRED_KEYS = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'FAL_KEY', 'OPENROUTER_API_KEY', 'DEEPSEEK_API_KEY'];
+const REQUIRED_KEYS = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'FAL_KEY', 'OPENROUTER_API_KEY', 'DEEPSEEK_API_KEY', 'MINIMAX_API_KEY', 'DEAPI_API_KEY'];
 REQUIRED_KEYS.forEach((key) => {
     if (!process.env[key]) console.warn(`⚠️  Hiányzó .env változó: ${key}`);
 });
@@ -2371,34 +2380,546 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
 // ════════════════════════════════════════════════════
 // 4.  ZENEGENERÁLÁS  —  POST /api/generate-music
 // ════════════════════════════════════════════════════
-router.post('/generate-music', verifyFirebaseToken, audioLimiter, async (req, res) => {
+function getMiniMaxMusicMimeType(format = 'mp3') {
+    if (format === 'wav') return 'audio/wav';
+    if (format === 'pcm') return 'audio/pcm';
+    return 'audio/mpeg';
+}
+
+function tryParseJson(value) {
     try {
-        const { apiId, prompt, genre = '', mood = '', duration = 30, instrumental = true, jobId } = req.body;
+        return JSON.parse(value);
+    } catch {
+        return null;
+    }
+}
+
+function normalizeMiniMaxMusicAudio(audioValue, format) {
+    if (!audioValue || typeof audioValue !== 'string') return '';
+    if (audioValue.startsWith('data:audio/') || /^https?:\/\//i.test(audioValue)) {
+        return audioValue;
+    }
+
+    const audioBuffer = Buffer.from(audioValue, 'hex');
+    return `data:${getMiniMaxMusicMimeType(format)};base64,${audioBuffer.toString('base64')}`;
+}
+
+async function parseMiniMaxMusicStreamResponse(response) {
+    const responseText = await response.text();
+    const directJson = tryParseJson(responseText);
+    if (directJson) return directJson;
+
+    const lines = responseText.split(/\r?\n/);
+    let combinedAudio = '';
+    let lastParsedEvent = null;
+
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || line === 'data: [DONE]') continue;
+
+        const payloadText = line.startsWith('data:') ? line.slice(5).trim() : line;
+        const parsedEvent = tryParseJson(payloadText);
+
+        if (parsedEvent) {
+            lastParsedEvent = parsedEvent;
+            if (typeof parsedEvent?.data?.audio === 'string') {
+                combinedAudio += parsedEvent.data.audio;
+            }
+            continue;
+        }
+
+        if (/^[0-9a-fA-F]+$/.test(payloadText)) {
+            combinedAudio += payloadText;
+        }
+    }
+
+    if (!combinedAudio) {
+        throw new Error('A MiniMax stream válasza nem volt értelmezhető');
+    }
+
+    return {
+        data: {
+            audio: combinedAudio,
+            status: lastParsedEvent?.data?.status ?? 2,
+        },
+        extra_info: lastParsedEvent?.extra_info || {},
+        base_resp: lastParsedEvent?.base_resp || {
+            status_code: 0,
+            status_msg: 'success',
+        },
+    };
+}
+
+async function callMiniMaxMusicGeneration(payload, signal) {
+    const url = `${(process.env.MINIMAX_API_HOST || 'https://api.minimax.io').replace(/\/$/, '')}/v1/music_generation`;
+    const headers = {
+        Authorization: `Bearer ${process.env.MINIMAX_API_KEY}`,
+        'Content-Type': 'application/json',
+    };
+
+    if (!payload.stream) {
+        const response = await axios.post(url, payload, {
+            headers,
+            signal,
+            timeout: 600000,
+            httpsAgent,
+        });
+        return response.data;
+    }
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal,
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        const parsedError = tryParseJson(errorText);
+        throw new Error(parsedError?.base_resp?.status_msg || parsedError?.message || `MiniMax hiba: ${response.status}`);
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+        return response.json();
+    }
+
+    return parseMiniMaxMusicStreamResponse(response);
+}
+
+function getDeapiClient() {
+    return axios.create({
+        baseURL: (process.env.DEAPI_API_HOST || 'https://api.deapi.ai').replace(/\/$/, ''),
+        headers: {
+            Accept: 'application/json',
+            Authorization: `Bearer ${process.env.DEAPI_API_KEY}`,
+        },
+        timeout: 120000,
+        httpsAgent,
+    });
+}
+
+function normalizeDeapiMusicNumber(value, { min, max, fallback, integer = false } = {}) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    const safeValue = Math.min(Math.max(parsed, min), max);
+    return integer ? Math.round(safeValue) : safeValue;
+}
+
+function getDeapiNumericLimit(limits, key, fallback = null) {
+    const parsed = Number(limits?.[key]);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function isSupportedDeapiReferenceAudioFile(file) {
+    if (!file) return false;
+
+    const supportedMimeTypes = new Set([
+        'audio/mpeg',
+        'audio/mp3',
+        'audio/wav',
+        'audio/x-wav',
+        'audio/flac',
+        'audio/x-flac',
+        'audio/ogg',
+        'audio/mp4',
+        'audio/x-m4a',
+        'video/mp4',
+    ]);
+    const supportedExtensions = new Set(['.mp3', '.wav', '.flac', '.ogg', '.m4a']);
+    const extension = path.extname(file.originalname || '').toLowerCase();
+
+    return supportedMimeTypes.has(String(file.mimetype || '').toLowerCase()) || supportedExtensions.has(extension);
+}
+
+function handleDeapiReferenceAudioUpload(req, res, next) {
+    deapiReferenceAudioUpload.single('reference_audio')(req, res, (err) => {
+        if (!err) return next();
+        if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({ success: false, message: 'A referencia audio merete legfeljebb 10 MB lehet' });
+        }
+        return res.status(400).json({ success: false, message: err.message || 'Referencia audio feltoltesi hiba' });
+    });
+}
+
+async function waitForAbortableDelay(ms, signal) {
+    if (!signal) {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+        return;
+    }
+
+    await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+
+        const onAbort = () => {
+            clearTimeout(timeoutId);
+            signal.removeEventListener('abort', onAbort);
+            const abortError = new Error('AbortError');
+            abortError.name = 'AbortError';
+            reject(abortError);
+        };
+
+        if (signal.aborted) {
+            onAbort();
+            return;
+        }
+
+        signal.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
+async function fetchDeapiMusicModels() {
+    const client = getDeapiClient();
+    const response = await client.get('/api/v1/client/models', {
+        params: { 'filter[inference_types]': 'txt2music' },
+    });
+
+    return Array.isArray(response.data?.data) ? response.data.data : [];
+}
+
+async function submitDeapiTextToMusic(payload, signal, referenceAudioFile = null) {
+    const client = getDeapiClient();
+    const form = new FormData();
+
+    Object.entries(payload).forEach(([key, value]) => {
+        if (value === undefined || value === null || value === '') return;
+        form.append(key, String(value));
+    });
+
+    if (referenceAudioFile?.buffer) {
+        form.append('reference_audio', referenceAudioFile.buffer, {
+            filename: referenceAudioFile.originalname || 'reference-audio',
+            contentType: referenceAudioFile.mimetype || 'application/octet-stream',
+            knownLength: referenceAudioFile.size,
+        });
+    }
+
+    const response = await client.post('/api/v1/client/txt2music', form, {
+        headers: {
+            ...form.getHeaders(),
+            Accept: 'application/json',
+            Authorization: `Bearer ${process.env.DEAPI_API_KEY}`,
+        },
+        signal,
+    });
+
+    return response.data;
+}
+
+async function pollDeapiResult(requestId, signal) {
+    const client = getDeapiClient();
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < 600000) {
+        const response = await client.get(`/api/v1/client/request-status/${requestId}`, { signal });
+        const data = response.data?.data || {};
+        const status = String(data.status || '').toLowerCase();
+
+        if (status === 'done' || ((!status || status === 'completed') && (data.result_url || data.result))) {
+            return data;
+        }
+        if (['error', 'failed', 'cancelled', 'canceled'].includes(status)) {
+            throw new Error(data.error || response.data?.message || 'A deAPI zenegenerálás hibával leállt');
+        }
+
+        await waitForAbortableDelay(3000, signal);
+    }
+
+    throw new Error('A deAPI zenegenerálás időtúllépés miatt nem fejeződött be');
+}
+
+router.get('/deapi/music-models', verifyFirebaseToken, audioLimiter, async (req, res) => {
+    try {
+        if (!process.env.DEAPI_API_KEY) {
+            return res.status(500).json({ success: false, message: 'DEAPI_API_KEY nincs beállítva' });
+        }
+
+        const models = await fetchDeapiMusicModels();
+        return res.json({
+            success: true,
+            models: models.map((model) => ({
+                name: model.name || model.slug,
+                slug: model.slug,
+                defaults: model.info?.defaults || {},
+                limits: model.info?.limits || {},
+            })),
+        });
+    } catch (err) {
+        console.error('❌ deAPI model lista hiba:', err.response?.data || err.message || err);
+        return res.status(err.response?.status || 500).json({
+            success: false,
+            message: err.response?.data?.message || err.message || 'A deAPI modelllista nem tölthető be',
+        });
+    }
+});
+
+router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiReferenceAudioUpload, async (req, res) => {
+    try {
+        const {
+            apiId,
+            provider,
+            prompt = '',
+            lyrics = '',
+            lyrics_optimizer = false,
+            is_instrumental = false,
+            stream = false,
+            output_format = 'url',
+            audio_setting = {},
+            model = '',
+            caption = '',
+            duration = 30,
+            inference_steps = 8,
+            guidance_scale = 7,
+            seed = -1,
+            format = 'flac',
+            bpm = null,
+            keyscale = null,
+            timesignature = null,
+            vocal_language = null,
+            webhook_url = null,
+            jobId,
+        } = req.body;
         const controller = new AbortController();
         registerJob(jobId, controller, 600000);
 
-        if (!apiId || !prompt?.trim()) return res.status(400).json({ success: false, message: 'Hiányzó apiId vagy prompt' });
-        if (!process.env.FAL_KEY) return res.status(500).json({ success: false, message: 'FAL_KEY nincs beállítva' });
+        if (provider === 'deapi') {
+            if (!process.env.DEAPI_API_KEY) {
+                return res.status(500).json({ success: false, message: 'DEAPI_API_KEY nincs beállítva' });
+            }
+            if (!apiId) {
+                return res.status(400).json({ success: false, message: 'Hiányzó deAPI task azonosító' });
+            }
 
-        const safeDuration = Math.min(Math.max(5, duration), 90);
-        const fullPrompt = [prompt.trim(), genre ? `genre: ${genre}` : '', mood ? `mood: ${mood}` : '', instrumental ? 'instrumental, no vocals' : ''].filter(Boolean).join(', ');
+            const referenceAudioFile = req.file || null;
+            if (referenceAudioFile && !isSupportedDeapiReferenceAudioFile(referenceAudioFile)) {
+                return res.status(400).json({ success: false, message: 'A referencia audio csak MP3, WAV, FLAC, OGG vagy M4A lehet' });
+            }
 
-        let audioUrl = '';
+            const safeCaption = String(caption || '').trim();
+            const safeModel = String(model || '').trim();
+            const safeLyrics = String(lyrics || '').trim();
+            const hasLyricsField = Object.prototype.hasOwnProperty.call(req.body || {}, 'lyrics');
 
-        if (apiId.includes('musicgen')) {
-            const result = await fal.subscribe(apiId, { input: { prompt: fullPrompt, duration: safeDuration }, logs: false, signal: controller.signal });
-            audioUrl = result.data?.audio?.url || result.data?.audio_file?.url || '';
-        } else if (apiId.includes('stable-audio')) {
-            const result = await fal.subscribe(apiId, { input: { prompt: fullPrompt, seconds_total: safeDuration, steps: 100 }, logs: false, signal: controller.signal });
-            audioUrl = result.data?.audio_file?.url || result.data?.audio?.url || '';
-        } else {
-            return res.status(400).json({ success: false, message: `Ismeretlen zene API: ${apiId}` });
+            if (!safeCaption) {
+                return res.status(400).json({ success: false, message: 'A deAPI caption mező kötelező' });
+            }
+            if (!safeModel) {
+                return res.status(400).json({ success: false, message: 'A deAPI model slug kötelező' });
+            }
+            if (!hasLyricsField) {
+                return res.status(400).json({ success: false, message: 'A deAPI lyrics mező kötelező. Instrumentálhoz használd: [Instrumental]' });
+            }
+
+            if (!safeLyrics) {
+                return res.status(400).json({ success: false, message: 'A deAPI lyrics mezĹ‘ nem lehet ĂĽres. Auto-lyrics mĂłdban elĹ‘bb generĂˇlni kell dalszĂ¶veget.' });
+            }
+
+            const availableModels = await fetchDeapiMusicModels();
+            const selectedDeapiModel = availableModels.find((item) => item.slug === safeModel);
+            if (!selectedDeapiModel) {
+                return res.status(400).json({ success: false, message: `Ismeretlen deAPI modell slug: ${safeModel}` });
+            }
+
+            const modelLimits = selectedDeapiModel.info?.limits || {};
+            const minCaptionLength = getDeapiNumericLimit(modelLimits, 'min_caption');
+            const maxCaptionLength = getDeapiNumericLimit(modelLimits, 'max_caption');
+            const minDuration = getDeapiNumericLimit(modelLimits, 'min_duration', 10);
+            const maxDuration = getDeapiNumericLimit(modelLimits, 'max_duration', 600);
+            const minSteps = getDeapiNumericLimit(modelLimits, 'min_steps', 1);
+            const maxSteps = getDeapiNumericLimit(modelLimits, 'max_steps', 100);
+            const minGuidance = getDeapiNumericLimit(modelLimits, 'min_guidance', 0);
+            const maxGuidance = getDeapiNumericLimit(modelLimits, 'max_guidance', 20);
+            const minBpm = getDeapiNumericLimit(modelLimits, 'min_bpm');
+            const maxBpm = getDeapiNumericLimit(modelLimits, 'max_bpm');
+
+            if (Number.isFinite(minCaptionLength) && safeCaption.length < minCaptionLength) {
+                return res.status(400).json({ success: false, message: `A deAPI caption legalább ${minCaptionLength} karakter legyen ennél a modellnél` });
+            }
+            if (Number.isFinite(maxCaptionLength) && safeCaption.length > maxCaptionLength) {
+                return res.status(400).json({ success: false, message: `A deAPI caption legfeljebb ${maxCaptionLength} karakter lehet ennél a modellnél` });
+            }
+
+            const safeDuration = normalizeDeapiMusicNumber(duration, {
+                min: minDuration,
+                max: maxDuration,
+                fallback: minDuration,
+                integer: true,
+            });
+            const safeInferenceSteps = normalizeDeapiMusicNumber(inference_steps, {
+                min: minSteps,
+                max: maxSteps,
+                fallback: minSteps,
+                integer: true,
+            });
+            const safeGuidanceScale = normalizeDeapiMusicNumber(guidance_scale, {
+                min: minGuidance,
+                max: maxGuidance,
+                fallback: minGuidance,
+            });
+            const safeSeed = Number.isFinite(Number(seed)) ? Math.trunc(Number(seed)) : -1;
+            const safeFormat = String(format || '').trim() || 'flac';
+            const safeBpm = bpm === null || bpm === ''
+                ? null
+                : normalizeDeapiMusicNumber(bpm, {
+                    min: minBpm ?? 30,
+                    max: maxBpm ?? 300,
+                    fallback: null,
+                    integer: true,
+                });
+            const safeKeyscale = String(keyscale || '').trim() || null;
+            const safeTimeSignature = timesignature === null || timesignature === '' ? null : normalizeDeapiMusicNumber(timesignature, { min: 2, max: 6, fallback: null, integer: true });
+            const safeVocalLanguage = 'unknown';
+            const safeWebhookUrl = String(webhook_url || '').trim() || null;
+
+            if (safeTimeSignature !== null && ![2, 3, 4, 6].includes(safeTimeSignature)) {
+                return res.status(400).json({ success: false, message: 'A deAPI timesignature csak 2, 3, 4 vagy 6 lehet' });
+            }
+            if (safeWebhookUrl && !/^https:\/\//i.test(safeWebhookUrl)) {
+                return res.status(400).json({ success: false, message: 'A deAPI webhook_url csak HTTPS URL lehet' });
+            }
+
+            const submissionPayload = {
+                caption: safeCaption,
+                model: safeModel,
+                lyrics: safeLyrics,
+                duration: safeDuration,
+                inference_steps: safeInferenceSteps,
+                guidance_scale: safeGuidanceScale,
+                seed: safeSeed,
+                format: safeFormat,
+                bpm: safeBpm,
+                keyscale: safeKeyscale,
+                timesignature: safeTimeSignature,
+                vocal_language: safeVocalLanguage,
+                webhook_url: safeWebhookUrl,
+            };
+
+            const submission = await submitDeapiTextToMusic(submissionPayload, controller.signal, referenceAudioFile);
+            const requestId = submission?.data?.request_id;
+            if (!requestId) {
+                throw new Error('A deAPI nem adott vissza request_id-t');
+            }
+
+            const result = await pollDeapiResult(requestId, controller.signal);
+            const audioUrl = result?.result_url || result?.result || '';
+            if (!audioUrl) {
+                throw new Error('A deAPI nem adott vissza letölthető audio URL-t');
+            }
+
+            await logUsage(req.userId, 'music', {
+                provider: 'deapi',
+                task: apiId,
+                model: safeModel,
+                duration: safeDuration,
+                inference_steps: safeInferenceSteps,
+                guidance_scale: safeGuidanceScale,
+                seed: safeSeed,
+                format: safeFormat,
+                bpm: safeBpm,
+                keyscale: safeKeyscale,
+                timesignature: safeTimeSignature,
+                vocal_language: safeVocalLanguage,
+                hasWebhook: Boolean(safeWebhookUrl),
+                hasReferenceAudio: Boolean(referenceAudioFile),
+            });
+            unregisterJob(jobId);
+            return res.json({
+                success: true,
+                audioUrl,
+                fileFormat: safeFormat,
+                outputFormat: 'url',
+                requestId,
+                stream: false,
+            });
         }
 
-        if (!audioUrl) throw new Error('Nem érkezett audio URL');
-        await logUsage(req.userId, 'music', { apiId, duration: safeDuration });
+        const safePrompt = String(prompt || '').trim();
+        const safeLyrics = String(lyrics || '').trim();
+        const safeInstrumental = Boolean(is_instrumental);
+        const safeLyricsOptimizer = Boolean(!safeInstrumental && lyrics_optimizer);
+        const safeStream = Boolean(stream);
+        const safeOutputFormat = safeStream ? 'hex' : output_format === 'hex' ? 'hex' : 'url';
+        const safeSampleRate = MINIMAX_MUSIC_SAMPLE_RATES.includes(Number(audio_setting?.sample_rate))
+            ? Number(audio_setting.sample_rate)
+            : 44100;
+        const safeBitrate = MINIMAX_MUSIC_BITRATES.includes(Number(audio_setting?.bitrate))
+            ? Number(audio_setting.bitrate)
+            : 256000;
+        const safeFileFormat = MINIMAX_MUSIC_FORMATS.includes(String(audio_setting?.format || '').toLowerCase())
+            ? String(audio_setting.format).toLowerCase()
+            : 'mp3';
+
+        if (!apiId) {
+            return res.status(400).json({ success: false, message: 'Hiányzó MiniMax modellazonosító' });
+        }
+        if (provider !== 'minimax') {
+            return res.status(400).json({ success: false, message: `Ismeretlen zene provider: ${provider}` });
+        }
+        if (!process.env.MINIMAX_API_KEY) {
+            return res.status(500).json({ success: false, message: 'MINIMAX_API_KEY nincs beállítva' });
+        }
+        if (safeInstrumental && !safePrompt) {
+            return res.status(400).json({ success: false, message: 'Instrumentális módnál prompt megadása kötelező' });
+        }
+        if (!safeInstrumental && !safeLyrics && !(safeLyricsOptimizer && safePrompt)) {
+            return res.status(400).json({ success: false, message: 'Adj meg dalszöveget, vagy kapcsold be az AI dalszöveg-generálást prompttal' });
+        }
+        if (!safeInstrumental && !safeLyrics && safeLyricsOptimizer && !safePrompt) {
+            return res.status(400).json({ success: false, message: 'AI dalszöveg-generáláshoz prompt szükséges' });
+        }
+
+        const payload = {
+            model: apiId,
+            stream: safeStream,
+            output_format: safeOutputFormat,
+            lyrics_optimizer: safeLyricsOptimizer,
+            is_instrumental: safeInstrumental,
+            audio_setting: {
+                sample_rate: safeSampleRate,
+                bitrate: safeBitrate,
+                format: safeFileFormat,
+            },
+        };
+
+        if (safePrompt) payload.prompt = safePrompt;
+        if (safeLyrics) payload.lyrics = safeLyrics;
+
+        const result = await callMiniMaxMusicGeneration(payload, controller.signal);
+        const statusCode = result?.base_resp?.status_code ?? 0;
+        if (statusCode !== 0) {
+            throw new Error(result?.base_resp?.status_msg || 'MiniMax zenegenerálási hiba');
+        }
+
+        const rawAudio = result?.data?.audio || result?.data?.audio_url || '';
+        const audioUrl = normalizeMiniMaxMusicAudio(rawAudio, safeFileFormat);
+        if (!audioUrl) throw new Error('Nem érkezett vissza lejátszható audio a MiniMax API-tól');
+
+        await logUsage(req.userId, 'music', {
+            provider: 'minimax',
+            model: apiId,
+            stream: safeStream,
+            output_format: safeOutputFormat,
+            sample_rate: safeSampleRate,
+            bitrate: safeBitrate,
+            format: safeFileFormat,
+            hasLyrics: Boolean(safeLyrics),
+            lyricsOptimizer: safeLyricsOptimizer,
+            instrumental: safeInstrumental,
+        });
         unregisterJob(jobId);
-        return res.json({ success: true, audioUrl });
+        return res.json({
+            success: true,
+            audioUrl,
+            fileFormat: safeFileFormat,
+            outputFormat: safeOutputFormat,
+            sampleRate: result?.extra_info?.music_sample_rate || safeSampleRate,
+            bitrate: result?.extra_info?.bitrate || safeBitrate,
+            stream: safeStream,
+        });
 
     } catch (err) {
         unregisterJob(req.body.jobId);
