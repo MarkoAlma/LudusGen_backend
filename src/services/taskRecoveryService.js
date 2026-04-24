@@ -14,6 +14,7 @@ import admin from "firebase-admin";
 import { extractModelUrl } from "../utils/tripoUtils.js";
 
 const HISTORY_COLLECTION = "tripo_history";
+const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
 const POLL_INTERVAL_MS = 5_000; // check every 5 seconds
 const MAX_POLL_MS = 600_000; // 10 minutes max per task
 const CLEANUP_INTERVAL_MS = 60_000; // cleanup completed tasks every minute
@@ -161,7 +162,7 @@ async function saveToHistory(entry, taskData) {
     { output: out, type: entry.type },
     { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput },
   );
-  console.log("[TaskRecovery] output selection:", JSON.stringify({
+  if (DEBUG_TRIPO) console.log("[TaskRecovery] output selection:", JSON.stringify({
     taskId: entry.taskId,
     type: entry.type,
     prefersDraftOutput,
@@ -190,6 +191,7 @@ async function saveToHistory(entry, taskData) {
 
   const mode = TYPE_TO_MODE[entry.type] ?? "generate";
   const now = Date.now();
+  const taskInput = taskData.input ?? taskData.request ?? {};
 
   const urlsToSave = animatedModels ?? [modelUrl];
   for (let i = 0; i < urlsToSave.length; i++) {
@@ -211,6 +213,9 @@ async function saveToHistory(entry, taskData) {
         type: entry.type,
         texture: !!entry.texture,
         pbr: !!entry.pbr,
+        chosen_source: chosenSource,
+        originalModelTaskId: taskInput.original_model_task_id ?? taskInput.original_model_id ?? null,
+        draftModelTaskId: taskInput.draft_model_task_id ?? null,
         rig_type: out.rig_type ?? out.topology ?? null,
         topology: out.topology ?? null,
         is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,

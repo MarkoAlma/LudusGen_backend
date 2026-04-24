@@ -13,6 +13,8 @@ import {
 import { validateFaceLimit } from "../lib/enginePresets.js";
 import crypto from "crypto";
 
+const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
+
 function extractTaskError(task = {}) {
   const out = task.output ?? {};
   return (
@@ -374,11 +376,18 @@ class TaskService {
 
       case "animate_prerigcheck":
       case "refine_model":
-        if (!b["original_model_task_id"] && !b["draft_model_task_id"])
-          throw new Error("original_model_task_id / draft_model_task_id required");
-        // Refine also accepts prompt and negative_prompt to guide refinement
-        if (b["prompt"] && b["prompt"].length > 1000) throw new Error("prompt max 1000 characters");
-        if (b["negative_prompt"] && b["negative_prompt"].length > 255) b["negative_prompt"] = b["negative_prompt"].slice(0, 255);
+        if (b["type"] === "refine_model" && !b["draft_model_task_id"] && b["original_model_task_id"]) {
+          b["draft_model_task_id"] = b["original_model_task_id"];
+        }
+        if (b["type"] === "refine_model") {
+          if (!b["draft_model_task_id"]) throw new Error("draft_model_task_id required");
+          delete b["original_model_task_id"];
+          delete b["prompt"];
+          delete b["negative_prompt"];
+          delete b["_sourceName"];
+        } else if (!b["original_model_task_id"]) {
+          throw new Error("original_model_task_id required");
+        }
         break;
 
       case "text_to_image": {
@@ -415,7 +424,7 @@ class TaskService {
       console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
     }
     const { modelUrl, chosenSource, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task, outputHints);
-    if (task.status === "success") {
+    if (DEBUG_TRIPO && task.status === "success") {
       console.log("[TaskService] output selection:", JSON.stringify({
         taskId: task.task_id ?? null,
         type: task.type ?? null,

@@ -12,15 +12,85 @@ import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
+const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
 // NOTE: existing docs with tripo_ prefixed IDs in 'trellis_history' need a one-time migration
 const HISTORY_COLLECTION = "tripo_history";
+const REFINE_DIRECT_SOURCE_TYPES = new Set(["text_to_model", "image_to_model", "multiview_to_model"]);
+const REFINE_UPSTREAM_SOURCE_TYPES = new Set(["texture_model", "convert_model", "smart_low_poly", "stylize_model", "mesh_segmentation", "mesh_completion"]);
+
+function getHistoryModelVersion(data) {
+  return data?.params?.model_version ||
+    data?.params?.modelVersion ||
+    data?.model_version ||
+    data?.modelVersion ||
+    data?.modelVer ||
+    "";
+}
+
+function isRefineModelVersionSupported(version) {
+  if (!version) return true;
+  return String(version).toLowerCase().startsWith("v1.4");
+}
 
 function logDebug(label, payload) {
+  if (!DEBUG_TRIPO) return;
   try {
     console.log(label, JSON.stringify(payload, null, 2));
   } catch {
     console.log(label, payload);
   }
+}
+
+function uniqueDocs(docs) {
+  return Array.from(new Map(docs.filter(Boolean).map(d => [d.ref.path, d])).values());
+}
+
+async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
+  const cleanDocs = uniqueDocs(docs);
+  if (cleanDocs.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0 };
+
+  const b2Keys = [...new Set(cleanDocs.map(doc => doc.data()?.b2_key).filter(Boolean))];
+  let b2Deleted = 0;
+  let b2Failed = 0;
+  for (const key of b2Keys) {
+    const ok = await storageService.deleteFile(key);
+    if (ok) b2Deleted += 1;
+    else b2Failed += 1;
+  }
+
+  let deleted = 0;
+  const db = admin.firestore();
+  for (let i = 0; i < cleanDocs.length; i += 500) {
+    const batch = db.batch();
+    const slice = cleanDocs.slice(i, i + 500);
+    slice.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+    deleted += slice.length;
+  }
+
+  console.log(`[HistoryController] cleanup reason=${reason} docs=${deleted} b2Deleted=${b2Deleted} b2Failed=${b2Failed}`);
+  return { deleted, b2Deleted, b2Failed };
+}
+
+async function deleteHistoryForDeadModel({ taskId, modelUrl, uid = null, reason = "dead_model" }) {
+  const db = admin.firestore();
+  const queries = [];
+
+  if (taskId) {
+    let q = db.collection(HISTORY_COLLECTION).where("taskId", "==", taskId);
+    if (uid) q = q.where("userId", "==", uid);
+    queries.push(q.get());
+  }
+
+  if (modelUrl) {
+    let q = db.collection(HISTORY_COLLECTION).where("model_url", "==", modelUrl);
+    if (uid) q = q.where("userId", "==", uid);
+    queries.push(q.get());
+  }
+
+  if (queries.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0 };
+  const snaps = await Promise.all(queries);
+  return deleteHistoryDocsWithStorage(snaps.flatMap(snap => snap.docs), reason);
 }
 
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
@@ -35,7 +105,7 @@ export async function createTask(req, res) {
 
     logDebug("[TaskController][create-debug] incoming req.body:", req.body);
     if (type === "refine_model") {
-      console.log("[TaskController][refine-debug] incoming request:", {
+      logDebug("[TaskController][refine-debug] incoming request:", {
         userId,
         draft_model_task_id: body.draft_model_task_id ?? null,
         original_model_task_id: body.original_model_task_id ?? null,
@@ -80,6 +150,83 @@ export async function createTask(req, res) {
         }
       } catch (sourceErr) {
         console.warn(`[TaskController][texture-source] Failed to inspect source task ${body.original_model_task_id}:`, sourceErr.message);
+      }
+    }
+
+    if (type === "refine_model" && userId) {
+      const parentTaskId = body.original_model_task_id || body.draft_model_task_id;
+      if (parentTaskId) {
+        const db = admin.firestore();
+        const snap = await db.collection(HISTORY_COLLECTION)
+          .where("taskId", "==", parentTaskId)
+          .limit(1)
+          .get();
+        if (!snap.empty) {
+          const parentData = snap.docs[0].data();
+          let effectiveParentData = parentData;
+          const histType = parentData.params?.type;
+          const upstreamTaskId =
+            parentData.params?.originalModelTaskId ||
+            parentData.params?.original_model_task_id ||
+            parentData.params?.draftModelTaskId ||
+            parentData.params?.draft_model_task_id ||
+            null;
+          const hasTexture = (
+            parentData.mode === "texture" ||
+            parentData.params?.mode === "texture" ||
+            parentData.params?.type === "texture_model" ||
+            parentData.params?.texture === true ||
+            parentData.params?.texture === "true" ||
+            parentData.params?.pbr === true ||
+            parentData.params?.pbr === "true"
+          );
+
+          logDebug("[TaskController][refine-debug] pre-credit parent resolved:", {
+            parentTaskId,
+            parentMode: parentData.mode ?? null,
+            parentType: histType ?? null,
+            upstreamTaskId,
+            hasTexture,
+          });
+
+          if (histType === "refine_model") {
+            return res.status(400).json({
+              success: false,
+              message: "A már refine-olt modelleket nem lehet újra refine-olni.",
+              code: "ALREADY_REFINED_SOURCE",
+            });
+          }
+
+          if (
+            upstreamTaskId &&
+            (hasTexture ||
+              REFINE_UPSTREAM_SOURCE_TYPES.has(histType) ||
+              (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType)))
+          ) {
+            body.draft_model_task_id = upstreamTaskId;
+            delete body.original_model_task_id;
+            const upstreamSnap = await db.collection(HISTORY_COLLECTION)
+              .where("taskId", "==", upstreamTaskId)
+              .limit(1)
+              .get();
+            if (!upstreamSnap.empty) effectiveParentData = upstreamSnap.docs[0].data();
+          } else if (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType)) {
+            return res.status(400).json({
+              success: false,
+              message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható. Forrástípus: ${histType}`,
+              code: "UNSUPPORTED_REFINE_SOURCE",
+            });
+          }
+
+          const sourceVersion = getHistoryModelVersion(effectiveParentData);
+          if (!isRefineModelVersionSupported(sourceVersion)) {
+            return res.status(400).json({
+              success: false,
+              message: `Refine csak Tripo v1.4 draft modellel működik. Ez a modell: ${sourceVersion}`,
+              code: "UNSUPPORTED_REFINE_MODEL_VERSION",
+            });
+          }
+        }
       }
     }
 
@@ -163,8 +310,14 @@ export async function createTask(req, res) {
 
           // Refine source validation
           if (type === "refine_model") {
+            let effectiveParentData = parentData;
             const histType = parentData.params?.type;
-            const VALID_REFINE_SOURCES = new Set(["text_to_model", "image_to_model", "multiview_to_model"]);
+            const upstreamTaskId =
+              parentData.params?.originalModelTaskId ||
+              parentData.params?.original_model_task_id ||
+              parentData.params?.draftModelTaskId ||
+              parentData.params?.draft_model_task_id ||
+              null;
             const hasTexture = (
               parentData.mode === "texture" ||
               parentData.params?.mode === "texture" ||
@@ -174,34 +327,66 @@ export async function createTask(req, res) {
               parentData.params?.pbr === true ||
               parentData.params?.pbr === "true"
             );
-            console.log("[TaskController][refine-debug] parent resolved:", {
+            logDebug("[TaskController][refine-debug] parent resolved:", {
               parentTaskId,
               parentMode: parentData.mode ?? null,
               parentType: histType ?? null,
               parentTexture: parentData.params?.texture ?? null,
               parentPbr: parentData.params?.pbr ?? null,
+              upstreamTaskId,
               hasTexture,
             });
-            if (hasTexture) {
+            if (histType === "refine_model") {
               if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
-                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_textured_source");
+                await refundCredits(userId, estimatedCost, tempTxId, "already_refined_source");
                 creditsDeducted = false;
               }
               return res.status(400).json({
                 success: false,
-                message: "Ez a modell texturazott, ezert nem finomithato. A Refine csak texture OFF (draft) modellre mukodik.",
-                code: "UNSUPPORTED_REFINE_SOURCE",
+                message: "A már refine-olt modelleket nem lehet újra refine-olni.",
+                code: "ALREADY_REFINED_SOURCE",
               });
             }
-            if (histType && !VALID_REFINE_SOURCES.has(histType)) {
+            if (
+              upstreamTaskId &&
+              (hasTexture ||
+                REFINE_UPSTREAM_SOURCE_TYPES.has(histType) ||
+                (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType)))
+            ) {
+              logDebug("[TaskController][refine-debug] rewriting source:", {
+                from: parentTaskId,
+                histType: histType ?? "unknown",
+                to: upstreamTaskId,
+              });
+              body.draft_model_task_id = upstreamTaskId;
+              delete body.original_model_task_id;
+              const upstreamSnap = await db.collection(HISTORY_COLLECTION)
+                .where("taskId", "==", upstreamTaskId)
+                .limit(1)
+                .get();
+              if (!upstreamSnap.empty) effectiveParentData = upstreamSnap.docs[0].data();
+            }
+            if (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType) && !upstreamTaskId) {
               if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
                 await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_source");
                 creditsDeducted = false;
               }
               return res.status(400).json({
                 success: false,
-                message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható (kivéve: ${histType}).`,
+                message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható. Forrástípus: ${histType}`,
                 code: "UNSUPPORTED_REFINE_SOURCE",
+              });
+            }
+            const sourceVersion = getHistoryModelVersion(effectiveParentData);
+            if (!isRefineModelVersionSupported(sourceVersion)) {
+              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
+                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_model_version");
+                creditsDeducted = false;
+              }
+              return res.status(400).json({
+                success: false,
+                message: `Refine csak Tripo v1.4 draft modellel működik. Ez a modell: ${sourceVersion}`,
+                code: "UNSUPPORTED_REFINE_MODEL_VERSION",
               });
             }
           }
@@ -216,7 +401,7 @@ export async function createTask(req, res) {
             body.animation = `preset:${defaultRigType}:${body.animation}`;
           }
         } else if (type === "refine_model") {
-          console.warn("[TaskController][refine-debug] parent task was not found in history", {
+          logDebug("[TaskController][refine-debug] parent task was not found in history", {
             parentTaskId,
             userId,
           });
@@ -238,7 +423,7 @@ export async function createTask(req, res) {
       });
     }
     if (type === "refine_model") {
-      console.log("[TaskController][refine-debug] validated body before taskService.create:", {
+      logDebug("[TaskController][refine-debug] validated body before taskService.create:", {
         draft_model_task_id: body.draft_model_task_id ?? null,
         original_model_task_id: body.original_model_task_id ?? null,
         prompt: body.prompt ?? null,
@@ -529,6 +714,12 @@ export async function modelProxy(req, res) {
     "assets.tripo3d.com",
     "data.tripo3d.com",
   ];
+  try {
+    const b2Host = process.env.B2_ENDPOINT ? new URL(process.env.B2_ENDPOINT).hostname : null;
+    if (b2Host) allowedHosts.push(b2Host);
+  } catch {
+    // Ignore malformed optional B2 endpoint; Tripo hosts are still enforced.
+  }
 
   // Inner helper to perform the actual fetch
   const performFetch = async (targetUrl) => {
@@ -659,21 +850,10 @@ export async function modelProxy(req, res) {
                   .get();
 
                 const allDocs = [...taskSnap.docs, ...urlSnap.docs];
-                const uniqueDocs = Array.from(new Map(allDocs.map(d => [d.id, d])).values());
-
-                if (uniqueDocs.length > 0) {
-                  const batch = db.batch();
-                  uniqueDocs.forEach(doc => {
-                    batch.update(doc.ref, {
-                      status: "failed",
-                      error: "Task expired on Tripo platform (Source deleted)"
-                    });
-                  });
-                  await batch.commit();
-                  console.log(`[TaskController] Marked ${uniqueDocs.length} documents as failed for taskId ${taskId}`);
-                }
+                const cleanup = await deleteHistoryDocsWithStorage(allDocs, "model_proxy_source_missing");
+                if (cleanup.deleted > 0) console.log(`[TaskController] Deleted ${cleanup.deleted} dead history documents for taskId ${taskId}`);
               } catch (fsErr) {
-                console.warn(`[TaskController] Firestore batch update failed:`, fsErr.message);
+                console.warn(`[TaskController] Dead history cleanup failed:`, fsErr.message);
               }
             })();
 
@@ -686,6 +866,18 @@ export async function modelProxy(req, res) {
 
     if (error) {
       const finalStatus = [401, 403, 404, 410].includes(error) ? error : 502;
+      if (taskIdParam && [404, 410].includes(finalStatus)) {
+        try {
+          await deleteHistoryForDeadModel({
+            taskId: taskIdParam,
+            modelUrl: req.query.url,
+            uid: req.user?.uid ?? null,
+            reason: `model_proxy_${finalStatus}`,
+          });
+        } catch (cleanupErr) {
+          console.warn(`[TaskController] modelProxy cleanup failed for ${taskIdParam}:`, cleanupErr.message);
+        }
+      }
       res.status(finalStatus).json({ success: false, message: message || `Upstream ${error}`, code: error === 410 ? "TASK_EXPIRED" : "UPSTREAM_ERROR" });
       return;
     }
@@ -865,9 +1057,9 @@ export async function deleteHistoryItem(req, res) {
       return;
     }
 
-    await ref.delete();
+    const cleanup = await deleteHistoryDocsWithStorage([doc], "single_delete");
     console.log(`[HistoryController] deleted item ${id} for user ${uid}`);
-    res.json({ success: true, id });
+    res.json({ success: true, id, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] deleteHistoryItem error:", err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -893,12 +1085,10 @@ export async function clearHistory(req, res) {
       .where("source", "==", source)
       .get();
 
-    const batch = db.batch();
-    snap.docs.forEach(doc => batch.delete(doc.ref));
-    await batch.commit();
+    const cleanup = await deleteHistoryDocsWithStorage(snap.docs, `clear_${source}`);
 
     console.log(`[HistoryController] cleared ${snap.size} ${source} items for user ${uid}`);
-    res.json({ success: true, deleted: snap.size });
+    res.json({ success: true, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] clearHistory error:", err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -937,17 +1127,10 @@ export async function cleanupExpiredHistory(req, res) {
       return;
     }
 
-    // Firestore batch limit = 500
-    let deleted = 0;
-    for (let i = 0; i < snap.docs.length; i += 500) {
-      const b = db.batch();
-      snap.docs.slice(i, i + 500).forEach(d => b.delete(d.ref));
-      await b.commit();
-      deleted += Math.min(500, snap.docs.length - i);
-    }
+    const cleanup = await deleteHistoryDocsWithStorage(snap.docs, "expired_ttl");
 
-    console.log(`[HistoryController] cleaned up ${deleted} expired items for user ${uid}`);
-    res.json({ success: true, deleted });
+    console.log(`[HistoryController] cleaned up ${cleanup.deleted} expired items for user ${uid}`);
+    res.json({ success: true, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] cleanupExpiredHistory error:", err.message);
     res.status(500).json({ success: false, message: err.message });

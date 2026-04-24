@@ -5,6 +5,7 @@ import { getTripoClient } from "../lib/tripoClient.js";
 import admin from "firebase-admin";
 import { storageService } from "../services/storageService.js";
 import axios from "axios";
+import { extractModelUrl } from "../utils/tripoUtils.js";
 
 const HISTORY_COLLECTION = "tripo_history";
 
@@ -97,11 +98,14 @@ async function saveCompletedTaskToHistory(taskId, payload) {
   }
 
   const out = taskData.output ?? {};
-  const modelUrl = out.model ?? out.pbr_model ?? out.base_model
-    ?? out.rigged_model
-    ?? (Array.isArray(out.animated_models) ? out.animated_models[0] : out.animated_model)
-    ?? out.converted_model ?? out.low_poly_model
-    ?? out.segmented_model ?? out.stylized_model ?? null;
+  const taskInput = taskData.input ?? taskData.request ?? {};
+  const taskType = payload.type ?? taskData.type;
+  const preferTexturedOutput = taskType === "texture_model" || taskInput.texture === true || taskInput.pbr === true;
+  const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskType);
+  const { modelUrl, chosenSource } = extractModelUrl(
+    { output: out, type: taskType },
+    { preferBaseModel: preferDraftOutput, preferPbrModel: preferTexturedOutput },
+  );
 
   if (!modelUrl) {
     console.log(`[WebhookController] No model URL for completed task ${taskId}`);
@@ -123,12 +127,11 @@ async function saveCompletedTaskToHistory(taskId, payload) {
     animate_rig: "animate",
     animate_retarget: "animate",
   };
-  const mode = typeMap[payload.type ?? taskData.type] ?? "generate";
+  const mode = typeMap[taskType] ?? "generate";
 
   const now = Date.now();
   const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-  const taskInput = taskData.input ?? taskData.request ?? {};
   const docRef = await db.collection(HISTORY_COLLECTION).add({
     userId,
     prompt: taskData.prompt ?? payload.type ?? "3D Model",
@@ -140,9 +143,15 @@ async function saveCompletedTaskToHistory(taskId, payload) {
     params: {
       model_version: taskData.model_version ?? "unknown",
       mode,
-      type: taskData.type,
+      type: taskType,
       texture: !!taskInput.texture,
       pbr: !!taskInput.pbr,
+      chosen_source: chosenSource,
+      originalModelTaskId: taskInput.original_model_task_id ?? taskInput.original_model_id ?? null,
+      draftModelTaskId: taskInput.draft_model_task_id ?? null,
+      rig_type: out.rig_type ?? out.topology ?? null,
+      topology: out.topology ?? null,
+      is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,
     },
     ts: now,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
