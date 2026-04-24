@@ -23,6 +23,9 @@ export const TASK_TYPES = /** @type {const} */ ([
   "refine_model",
   "import_model",
   "text_to_image",
+  "generate_image",
+  "generate_multiview_image",
+  "edit_multiview_image",
 ]);
 
 /* ─── Model verziók ───────────────────────────────────────────────────── */

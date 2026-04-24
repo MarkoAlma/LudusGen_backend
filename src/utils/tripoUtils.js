@@ -5,7 +5,7 @@
  *
  * @param {object} task - Raw task object from Tripo API
  * @param {{ preferBaseModel?: boolean, preferPbrModel?: boolean }} [opts]
- * @returns {{ modelUrl: string|null, chosenSource: string|null, rigCheckResult: boolean|null, rigType: string|null, topology: string|null, rawOutput: object }}
+ * @returns {{ modelUrl: string|null, chosenSource: string|null, rigCheckResult: boolean|null, rigType: string|null, topology: string|null, rawOutput: object, previewImageUrl: string|null, previewImageUrls: string[] }}
  */
 export function extractModelUrl(task, opts = {}) {
   const out = task.output ?? {};
@@ -72,6 +72,8 @@ export function extractModelUrl(task, opts = {}) {
   }
   const selected = orderedOutputs.find((entry) => Boolean(entry.value)) ?? null;
   const modelUrl = selected?.value ?? null;
+  const previewImageUrls = extractPreviewImages(out);
+  const previewImageUrl = previewImageUrls[0] ?? null;
 
   return {
     modelUrl,
@@ -80,5 +82,60 @@ export function extractModelUrl(task, opts = {}) {
     rigType: out.rig_type ?? out.topology ?? null,
     topology: out.topology ?? null,
     rawOutput: out,
+    previewImageUrl,
+    previewImageUrls,
   };
+}
+
+function extractUrlFromNode(node) {
+  if (!node) return null;
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const value = extractUrlFromNode(item);
+      if (value) return value;
+    }
+    return null;
+  }
+  if (typeof node !== "object") return null;
+
+  return (
+    node.url ??
+    node.image_url ??
+    node.rendered_image_url ??
+    node.preview_url ??
+    node.file_url ??
+    null
+  );
+}
+
+export function extractPreviewImages(out = {}) {
+  const candidates = [
+    out.rendered_image,
+    out.rendered_images,
+    out.preview_image,
+    out.preview_images,
+    out.image,
+    out.images,
+    out.generated_image,
+    out.generated_images,
+    out.multiview_images,
+    out.views,
+  ];
+
+  const urls = [];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (Array.isArray(candidate)) {
+      candidate.forEach((item) => {
+        const url = extractUrlFromNode(item);
+        if (url) urls.push(url);
+      });
+      continue;
+    }
+    const url = extractUrlFromNode(candidate);
+    if (url) urls.push(url);
+  }
+
+  return [...new Set(urls)];
 }

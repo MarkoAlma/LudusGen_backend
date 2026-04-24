@@ -6,14 +6,157 @@ import {
   VALID_MODEL_VERSIONS,
   VALID_CONVERT_FORMATS,
   VALID_ANIMATIONS,
-  VALID_STYLES,
+  VALID_GENERATION_STYLES,
+  VALID_STYLIZE_STYLES,
+  VALID_TEXTURE_MODEL_VERSIONS,
+  VALID_COMPRESS_TYPES,
+  VALID_IMAGE_ORIENTATIONS,
+  VALID_MULTIVIEW_IMAGE_MODES,
   RIGGED_UNSUPPORTED_FORMATS,
   DEFAULT_MODEL,
+  TRIPO_PROMPT_MAX_LENGTH,
+  TRIPO_NEGATIVE_PROMPT_MAX_LENGTH,
 } from "../config/tripo.config.js";
 import { validateFaceLimit } from "../lib/enginePresets.js";
 import crypto from "crypto";
 
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
+
+function trimString(value) {
+  return typeof value === "string" ? value.trim() : value;
+}
+
+function validatePromptLength(value, fieldName) {
+  if (!value) return;
+  if (String(value).length > TRIPO_PROMPT_MAX_LENGTH) {
+    throw new Error(`${fieldName} max ${TRIPO_PROMPT_MAX_LENGTH} characters`);
+  }
+}
+
+function normalizeBoolean(value, fallback = false) {
+  if (value === undefined) return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") return value === "true";
+  return Boolean(value);
+}
+
+function normalizeStringField(body, key) {
+  if (body[key] === undefined) return;
+  const value = trimString(body[key]);
+  if (value) body[key] = value;
+  else delete body[key];
+}
+
+function normalizeOptionalEnum(body, key, validValues) {
+  if (body[key] === undefined) return;
+  const value = trimString(body[key]);
+  if (!value) {
+    delete body[key];
+    return;
+  }
+  if (!validValues.has(value)) {
+    throw new Error(`Invalid ${key} "${body[key]}". Valid: ${[...validValues].filter(Boolean).join(", ")}`);
+  }
+  body[key] = value;
+}
+
+function normalizeObjectRef(input) {
+  if (!input || typeof input !== "object") return null;
+  const bucket = trimString(input.bucket);
+  const key = trimString(input.key);
+  if (!bucket || !key) return null;
+  return { bucket, key };
+}
+
+function normalizeFileRef(input, fallbackType = "png") {
+  if (!input) return null;
+  if (typeof input === "string") {
+    return { type: fallbackType, file_token: input.trim() };
+  }
+  if (typeof input !== "object") {
+    throw new Error("Invalid file reference");
+  }
+
+  const type = trimString(input.type) || fallbackType;
+  const fileToken = trimString(input.file_token);
+  const url = trimString(input.url);
+  const object = normalizeObjectRef(input.object);
+
+  if (fileToken) return { type, file_token: fileToken };
+  if (url) return { type, url };
+  if (object) return { type, object };
+
+  throw new Error("file reference must include file_token, url, or object");
+}
+
+function normalizeFileRefList(list, fallbackType = "png") {
+  if (!Array.isArray(list)) return [];
+  return list.map((item) => normalizeFileRef(item, fallbackType));
+}
+
+function normalizeSharedGenerationFields(body) {
+  normalizeOptionalEnum(body, "compress", VALID_COMPRESS_TYPES);
+  normalizeOptionalEnum(body, "orientation", VALID_IMAGE_ORIENTATIONS);
+  normalizeStringField(body, "texture_alignment");
+  if (body.render_image !== undefined) {
+    body.render_image = normalizeBoolean(body.render_image, false);
+  }
+  normalizeStringField(body, "original_task_id");
+}
+
+function normalizeTexturePrompt(body) {
+  const prompt = { ...(body.texture_prompt ?? {}) };
+
+  if (body.prompt && !prompt.text) prompt.text = trimString(body.prompt);
+  if (body.file && !prompt.image) prompt.image = body.file;
+  if (body.files && !prompt.images) prompt.images = body.files;
+
+  if (prompt.text) validatePromptLength(prompt.text, "texture_prompt.text");
+  if (Array.isArray(prompt.images) && prompt.images.length === 0) delete prompt.images;
+
+  delete body.prompt;
+  delete body.negative_prompt;
+  delete body.file;
+  delete body.files;
+
+  if (Object.keys(prompt).length > 0) body.texture_prompt = prompt;
+  else delete body.texture_prompt;
+}
+
+function normalizeTextureModelBody(body) {
+  normalizeTexturePrompt(body);
+
+  const mv = body.model_version ?? DEFAULT_MODEL;
+  if (!VALID_TEXTURE_MODEL_VERSIONS.has(mv)) {
+    throw new Error(`Invalid texture model_version "${mv}". Valid: ${[...VALID_TEXTURE_MODEL_VERSIONS].join(", ")}`);
+  }
+  body.model_version = mv;
+
+  if (!["standard", "detailed"].includes(body.texture_quality)) {
+    body.texture_quality = "standard";
+  }
+  if (!body.pbr) delete body.pbr;
+
+  if (body.compress !== undefined) {
+    const compress = String(body.compress ?? "").trim();
+    if (!VALID_COMPRESS_TYPES.has(compress)) {
+      throw new Error(`Invalid compress "${body.compress}". Valid: ${[...VALID_COMPRESS_TYPES].join(", ")}`);
+    }
+    if (compress) body.compress = compress;
+    else delete body.compress;
+  }
+
+  if (body.part_names !== undefined) {
+    const partNames = Array.isArray(body.part_names)
+      ? body.part_names.map(v => String(v).trim()).filter(Boolean)
+      : [];
+    if (partNames.length) body.part_names = partNames;
+    else delete body.part_names;
+  }
+
+  if (body.bake === undefined) delete body.bake;
+  else body.bake = body.bake === true || body.bake === "true";
+}
 
 function extractTaskError(task = {}) {
   const out = task.output ?? {};
@@ -121,11 +264,42 @@ class TaskService {
       case "text_to_model":
       case "image_to_model":
       case "multiview_to_model": {
+        normalizeSharedGenerationFields(b);
+
         // model_version
         const mv = b["model_version"] ?? DEFAULT_MODEL;
         if (!VALID_MODEL_VERSIONS.has(mv))
           throw new Error(`Invalid model_version "${mv}". Valid: ${[...VALID_MODEL_VERSIONS].join(", ")}`);
         b["model_version"] = mv;
+
+        // Core input validation applies to P1 too.
+        if (body.type === "text_to_model" || (body.type === "image_to_model" && b["prompt"])) {
+          const p = b["prompt"];
+          if (body.type === "text_to_model" && !p?.trim())
+            throw new Error("prompt is required for text_to_model");
+          validatePromptLength(p, "prompt");
+        }
+
+        if (body.type === "image_to_model") {
+          if (b.file) b.file = normalizeFileRef(b.file, "png");
+          if (b.images) b.images = normalizeFileRefList(b.images, "png");
+          if (b.batch_images) b.batch_images = normalizeFileRefList(b.batch_images, "png");
+          const hasFile = !!b.file || (!!b.images && b.images.length > 0) || (!!b.batch_images && b.batch_images.length > 0);
+          if (!hasFile) throw new Error("file, images, or batch_images required for image_to_model");
+        }
+
+        if (body.type === "multiview_to_model") {
+          if (b.files) b.files = normalizeFileRefList(b.files, "png");
+          if (!b.original_task_id && (!Array.isArray(b.files) || b.files.length === 0)) {
+            throw new Error("files or original_task_id required for multiview_to_model");
+          }
+        }
+
+        const np = b["negative_prompt"];
+        if (np && np.length > TRIPO_NEGATIVE_PROMPT_MAX_LENGTH) {
+          b["negative_prompt"] = np.slice(0, TRIPO_NEGATIVE_PROMPT_MAX_LENGTH);
+          console.warn(`[TaskService] negative_prompt truncated to ${TRIPO_NEGATIVE_PROMPT_MAX_LENGTH} chars (was ${np.length})`);
+        }
 
         // ── P1-20260311: csak engedélyezett paraméterek ──────────────────
         // A P1 modell nem támogatja: quad, smart_low_poly, generate_parts,
@@ -138,6 +312,7 @@ class TaskService {
             "texture", "pbr", "texture_quality",
             "face_limit", "model_seed", "texture_seed",
             "auto_size", "compress", "export_uv",
+            "orientation", "render_image", "texture_alignment", "original_task_id",
             "negative_prompt",
             "callback_url",
           ]);
@@ -173,20 +348,30 @@ class TaskService {
           const p = b["prompt"];
           if (body.type === "text_to_model" && !p?.trim())
             throw new Error("prompt is required for text_to_model");
-          if (p && p.length > 1000) throw new Error("prompt max 1000 characters");
+          validatePromptLength(p, "prompt");
         }
 
         // image/batch validation
         if (body.type === "image_to_model") {
+          if (b.file) b.file = normalizeFileRef(b.file, "png");
+          if (b.images) b.images = normalizeFileRefList(b.images, "png");
+          if (b.batch_images) b.batch_images = normalizeFileRefList(b.batch_images, "png");
           const hasFile = !!b.file || (!!b.images && b.images.length > 0) || (!!b.batch_images && b.batch_images.length > 0);
           if (!hasFile) throw new Error("file, images, or batch_images required for image_to_model");
         }
 
+        if (body.type === "multiview_to_model") {
+          if (b.files) b.files = normalizeFileRefList(b.files, "png");
+          if (!b.original_task_id && (!Array.isArray(b.files) || b.files.length === 0)) {
+            throw new Error("files or original_task_id required for multiview_to_model");
+          }
+        }
+
         // negative_prompt length — Tripo API max 255 characters
-        const np = b["negative_prompt"];
-        if (np && np.length > 255) {
-          b["negative_prompt"] = np.slice(0, 255);
-          console.warn(`[TaskService] negative_prompt truncated to 255 chars (was ${np.length})`);
+        const np2 = b["negative_prompt"];
+        if (np2 && np2.length > TRIPO_NEGATIVE_PROMPT_MAX_LENGTH) {
+          b["negative_prompt"] = np2.slice(0, TRIPO_NEGATIVE_PROMPT_MAX_LENGTH);
+          console.warn(`[TaskService] negative_prompt truncated to ${TRIPO_NEGATIVE_PROMPT_MAX_LENGTH} chars (was ${np2.length})`);
         }
 
         // generate_parts constraints
@@ -225,8 +410,8 @@ class TaskService {
         if (b["pbr"] === undefined) delete b["pbr"];
 
         // style
-        if (b["style"] && !VALID_STYLES.has(b["style"]))
-          throw new Error(`Invalid style "${b["style"]}". Valid: ${[...VALID_STYLES].join(", ")}`);
+        if (b["style"] && !VALID_GENERATION_STYLES.has(b["style"]))
+          throw new Error(`Invalid style "${b["style"]}". Valid: ${[...VALID_GENERATION_STYLES].join(", ")}`);
 
         // FIX: geometry_quality — csak "detailed" megengedett, "standard"-ot töröljük
         // (az API alapból standard-ot használ, explicit megadása hibát okoz)
@@ -246,6 +431,56 @@ class TaskService {
           throw new Error("face_limit is required for smart_low_poly");
         b["face_limit"] = fl;
         if (!b["quad"]) delete b["quad"];
+        break;
+      }
+
+      case "generate_image": {
+        const prompt = trimString(b.prompt);
+        if (!prompt) throw new Error("prompt required for generate_image");
+        b.prompt = prompt;
+        validatePromptLength(prompt, "prompt");
+        normalizeStringField(b, "negative_prompt");
+        normalizeStringField(b, "model");
+        normalizeStringField(b, "template_id");
+        normalizeSharedGenerationFields(b);
+        if (b.reference_image) b.reference_image = normalizeFileRef(b.reference_image, "png");
+        if (b.reference_images) b.reference_images = normalizeFileRefList(b.reference_images, "png");
+        break;
+      }
+
+      case "generate_multiview_image": {
+        normalizeStringField(b, "prompt");
+        if (!b.prompt && !b.reference_image && !b.reference_images?.length) {
+          throw new Error("prompt or reference image required for generate_multiview_image");
+        }
+        if (b.prompt) validatePromptLength(b.prompt, "prompt");
+        normalizeStringField(b, "model");
+        normalizeStringField(b, "template_id");
+        normalizeOptionalEnum(b, "mode", VALID_MULTIVIEW_IMAGE_MODES);
+        normalizeSharedGenerationFields(b);
+        if (b.reference_image) b.reference_image = normalizeFileRef(b.reference_image, "png");
+        if (b.reference_images) b.reference_images = normalizeFileRefList(b.reference_images, "png");
+        if (b.orthographic_projection !== undefined) {
+          b.orthographic_projection = normalizeBoolean(b.orthographic_projection, false);
+        }
+        break;
+      }
+
+      case "edit_multiview_image": {
+        normalizeStringField(b, "prompt");
+        if (b.prompt) validatePromptLength(b.prompt, "prompt");
+        normalizeStringField(b, "model");
+        normalizeStringField(b, "template_id");
+        normalizeSharedGenerationFields(b);
+        if (b.reference_image) b.reference_image = normalizeFileRef(b.reference_image, "png");
+        if (b.reference_images) b.reference_images = normalizeFileRefList(b.reference_images, "png");
+        if (b.files) b.files = normalizeFileRefList(b.files, "png");
+        if (b.orthographic_projection !== undefined) {
+          b.orthographic_projection = normalizeBoolean(b.orthographic_projection, false);
+        }
+        if (!b.original_task_id && (!b.reference_images?.length && !b.files?.length && !b.reference_image)) {
+          throw new Error("original_task_id or reference images required for edit_multiview_image");
+        }
         break;
       }
 
@@ -352,8 +587,8 @@ class TaskService {
       case "stylize_model": {
         if (!b["original_model_task_id"] || !b["style"])
           throw new Error("original_model_task_id and style required");
-        if (!VALID_STYLES.has(b["style"]))
-          throw new Error(`Invalid style "${b["style"]}". Valid: ${[...VALID_STYLES].join(", ")}`);
+        if (!VALID_STYLIZE_STYLES.has(b["style"]))
+          throw new Error(`Invalid style "${b["style"]}". Valid: ${[...VALID_STYLIZE_STYLES].join(", ")}`);
         break;
       }
 
@@ -367,11 +602,7 @@ class TaskService {
 
       case "texture_model":
         if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
-        // FIX: "standard" is valid, don't coerce to "detailed"
-        if (!["standard", "detailed"].includes(b["texture_quality"])) {
-          b["texture_quality"] = "detailed";
-        }
-        if (!b["pbr"]) delete b["pbr"];
+        normalizeTextureModelBody(b);
         break;
 
       case "animate_prerigcheck":
@@ -393,21 +624,21 @@ class TaskService {
       case "text_to_image": {
         const p = b["prompt"];
         if (!p?.trim()) throw new Error("prompt required for text_to_image");
-        if (p.length > 1000) throw new Error("prompt max 1000 characters");
+        validatePromptLength(p, "prompt");
         break;
       }
 
       case "import_model":
         if (!b["file"])
           throw new Error("file required for import_model");
+        if (!b["file"].object && !b["file"].file_token && !b["file"].url)
+          throw new Error("file.object, file.file_token, or file.url required for import_model");
         break;
 
       case "texture_edit":
         b["type"] = "texture_model";
         if (!b["original_model_task_id"]) throw new Error("original_model_task_id required");
-        if (!["standard", "detailed"].includes(b["texture_quality"])) {
-          b["texture_quality"] = "standard";
-        }
+        normalizeTextureModelBody(b);
         delete b["creativity_strength"];
         break;
     }
@@ -423,7 +654,16 @@ class TaskService {
     if (task.status === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
       console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
     }
-    const { modelUrl, chosenSource, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task, outputHints);
+    const {
+      modelUrl,
+      chosenSource,
+      rigCheckResult,
+      rigType,
+      topology,
+      rawOutput,
+      previewImageUrl,
+      previewImageUrls,
+    } = extractModelUrl(task, outputHints);
     if (DEBUG_TRIPO && task.status === "success") {
       console.log("[TaskService] output selection:", JSON.stringify({
         taskId: task.task_id ?? null,
@@ -439,10 +679,19 @@ class TaskService {
       status: task.status,
       progress: task.progress ?? 0,
       modelUrl,
+      tripoTraceId: task._traceId ?? null,
       chosenSource,
       rigCheckResult,
       rigType,
       topology,
+      previewImageUrl,
+      previewImageUrls,
+      consumedCredit: task.consumed_credit ?? rawOutput?.consumed_credit ?? null,
+      originalTaskId:
+        task.input?.original_task_id ??
+        task.input?.original_model_task_id ??
+        task.input?.draft_model_task_id ??
+        null,
       rawOutput,
       errorMessage,
       errorCode,

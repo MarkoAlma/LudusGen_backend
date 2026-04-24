@@ -11,6 +11,7 @@ import rateLimit from "express-rate-limit";
 import {
   createTask,
   getTask,
+  streamTask,
   cancelTask,
   acknowledgeTask,
   listTasks,
@@ -46,23 +47,31 @@ import {
 
 import {
   uploadAsset,
+  importUploadedAsset,
 } from "../controllers/assetController.js";
+import {
+  getUploadStsTarget,
+} from "../controllers/uploadController.js";
+import {
+  TRIPO_IMAGE_UPLOAD_MAX_BYTES,
+  TRIPO_MODEL_IMPORT_MAX_BYTES,
+} from "../config/tripo.config.js";
 
 /* ─── Middleware ──────────────────────────────────────────────────────── */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 20 * 1024 * 1024 },
+  limits:  { fileSize: TRIPO_IMAGE_UPLOAD_MAX_BYTES },
 });
 
-/** Asset upload multer — larger files (GLB/FBX/OBJ, max 50MB) */
+/** Asset upload multer - GLB/FBX/OBJ/STL, max 150MB */
 const assetUpload = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 50 * 1024 * 1024 },
+  limits:  { fileSize: TRIPO_MODEL_IMPORT_MAX_BYTES },
   fileFilter: (req, file, cb) => {
     const ext = file.originalname.split(".").pop()?.toLowerCase();
-    const allowed = new Set(["glb", "fbx", "obj"]);
+    const allowed = new Set(["glb", "fbx", "obj", "stl"]);
     if (allowed.has(ext)) cb(null, true);
-    else cb(new Error(`Unsupported file type: ${ext}. Allowed: glb, fbx, obj`));
+    else cb(new Error(`Unsupported file type: ${ext}. Allowed: glb, fbx, obj, stl`));
   },
 });
 
@@ -94,15 +103,18 @@ export function createTripoRouter(verifyAuth) {
 
   /** Upload image → image_token */
   router.post("/tripo/upload", verifyAuth, upload.single("file"), uploadFile);
+  router.post("/tripo/upload/sts-target", verifyAuth, getUploadStsTarget);
 
   /** Upload 3D asset (GLB/FBX/OBJ) → import_model task */
   router.post("/tripo/assets/upload", verifyAuth, assetUpload.single("file"), uploadAsset);
+  router.post("/tripo/assets/import", verifyAuth, importUploadedAsset);
 
   /** Create any Tripo task */
   router.post("/tripo/task", verifyAuth, genLimiter, createTask);
 
   /** Poll a single task */
   router.get("/tripo/task/:taskId", verifyAuth, getTask);
+  router.get("/tripo/task/:taskId/stream", verifyAuth, streamTask);
 
   /** Cancel a running/queued task */
   router.post("/tripo/task/:taskId/cancel", verifyAuth, cancelTask);

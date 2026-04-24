@@ -7,7 +7,7 @@ import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
 import { deductCredits, refundCredits, linkTaskIdToTransaction } from "../services/creditService.js";
 import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskMeta } from "../services/taskRecoveryService.js";
-import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS } from "../config/tripo.config.js";
+import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS, TRIPO_IMAGE_UPLOAD_MAX_BYTES } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
 
@@ -41,8 +41,55 @@ function logDebug(label, payload) {
   }
 }
 
+function errorPayload(err, message = err.message) {
+  return {
+    success: false,
+    message,
+    ...(err.traceId && { tripoTraceId: err.traceId }),
+    ...(err.code && { tripoCode: err.code }),
+    ...(err.suggestion && { tripoSuggestion: err.suggestion }),
+  };
+}
+
 function uniqueDocs(docs) {
   return Array.from(new Map(docs.filter(Boolean).map(d => [d.ref.path, d])).values());
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function toMillis(value) {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.getTime();
+  if (typeof value?.toMillis === "function") {
+    try {
+      const millis = value.toMillis();
+      return Number.isFinite(millis) ? millis : null;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+function getHistoryExpiryMillis(data) {
+  if (!data || typeof data !== "object") return null;
+  const explicitExpiry = toMillis(data.expiresAt);
+  if (explicitExpiry != null) return explicitExpiry;
+
+  const createdAt = toMillis(data.createdAt);
+  if (createdAt != null) return createdAt + HISTORY_TTL_MS;
+
+  const ts = toMillis(data.ts);
+  if (ts != null) return ts + HISTORY_TTL_MS;
+
+  return null;
 }
 
 async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
@@ -116,16 +163,17 @@ export async function createTask(req, res) {
     
     // Normalize image inputs
     if (type === "image_to_model") {
-      const tokens = (body.images && Array.isArray(body.images)) ? body.images 
+      const tokens = (body.images && Array.isArray(body.images)) ? body.images
                    : (body.batch_images && Array.isArray(body.batch_images)) ? body.batch_images
                    : [];
+      const onlyStringTokens = tokens.length > 0 && tokens.every((item) => typeof item === "string");
 
-      if (tokens.length === 1) {
+      if (onlyStringTokens && tokens.length === 1) {
         // Normalize single image task
         body.file = { type: "jpg", file_token: tokens[0] };
         delete body.images;
         delete body.batch_images;
-      } else if (tokens.length > 1) {
+      } else if (onlyStringTokens && tokens.length > 1) {
         // Keep tokens for later splitting in this controller
         body.batch_images = tokens;
         delete body.images;
@@ -437,7 +485,10 @@ export async function createTask(req, res) {
         const { batch_images, ...common } = body;
         const items = batch_images.map(token => ({
           jobType: "single",
-          taskBody: { ...common, file: { type: "jpg", file_token: token } },
+          taskBody: {
+            ...common,
+            file: typeof token === "string" ? { type: "jpg", file_token: token } : token,
+          },
           userId,
           callbackUrl: callback_url,
           idempotencyKey: uuid(),
@@ -460,7 +511,10 @@ export async function createTask(req, res) {
         const { batch_images, ...common } = body;
         const taskIds = [];
         for (const token of batch_images) {
-          const subBody = { ...common, file: { type: "jpg", file_token: token } };
+          const subBody = {
+            ...common,
+            file: typeof token === "string" ? { type: "jpg", file_token: token } : token,
+          };
           const taskId = await taskService.create(subBody, {
             callbackUrl: callback_url,
             idempotencyKey: uuid(),
@@ -541,7 +595,7 @@ export async function createTask(req, res) {
       userMessage = "Ez a modell nem finomítható. A Refine csak textúra nélkül generált (draft) modelleknél működik. Generálj új modellt textúra nélkül, majd alkalmazd rá a Refine-t.";
     }
 
-    res.status(400).json({ success: false, message: userMessage });
+    res.status(400).json(errorPayload(err, userMessage));
   }
 }
 
@@ -576,7 +630,56 @@ export async function getTask(req, res) {
     res.json({ success: true, ...taskData });
   } catch (err) {
     console.error("[TaskController] getTask error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json(errorPayload(err));
+  }
+}
+
+export async function streamTask(req, res) {
+  const taskId = req.params.taskId;
+  if (!taskId) {
+    res.status(400).json({ success: false, message: "taskId required" });
+    return;
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  let closed = false;
+  req.on("close", () => {
+    closed = true;
+  });
+
+  const send = (event, payload) => {
+    if (closed) return;
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  send("connected", { success: true, taskId, ts: Date.now() });
+
+  try {
+    while (!closed) {
+      const taskMeta = getRegisteredTaskMeta(taskId);
+      const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
+      const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
+      const result = await taskService.get(taskId, {
+        preferBaseModel: preferDraftOutput,
+        preferPbrModel: preferTexturedOutput,
+      });
+      const { success: _ignored, ...taskData } = result;
+      send("status", { success: true, ...taskData, ts: Date.now() });
+
+      if (["success", "failed", "cancelled"].includes(result.status)) break;
+      await delay(2_500);
+    }
+  } catch (err) {
+    send("error", errorPayload(err));
+  } finally {
+    if (!closed) {
+      res.end();
+    }
   }
 }
 
@@ -641,6 +744,11 @@ export async function uploadFile(req, res) {
   const file = req.file;
   if (!file) { res.status(400).json({ success: false, message: "File missing" }); return; }
 
+  if (file.size > TRIPO_IMAGE_UPLOAD_MAX_BYTES) {
+    res.status(400).json({ success: false, message: `File too large. Maximum size: ${TRIPO_IMAGE_UPLOAD_MAX_BYTES / (1024 * 1024)}MB` });
+    return;
+  }
+
   const allowed = ["image/jpeg", "image/png", "image/webp"];
   if (!allowed.includes(file.mimetype)) {
     res.status(400).json({ success: false, message: "Only JPG/PNG/WEBP allowed" });
@@ -655,7 +763,7 @@ export async function uploadFile(req, res) {
     res.json({ success: true, imageToken });
   } catch (err) {
     console.error("[TaskController] upload error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json(errorPayload(err));
   }
 }
 
@@ -1099,10 +1207,6 @@ export async function clearHistory(req, res) {
  * DELETE /api/tripo/history/expired
  * Deletes tripo_history items older than HISTORY_TTL_MS for the authenticated user.
  *
- * Requires a composite Firestore index on (userId ASC, createdAt ASC).
- * Create it in Firestore console or firestore.indexes.json:
- *   collection: "tripo_history", fields: [userId ASC, createdAt ASC]
- *
  * To run this daily without Cloud Functions, add a cron job that calls:
  *   curl -X DELETE https://<host>/api/tripo/history/expired \
  *        -H "Authorization: Bearer <service-account-token>"
@@ -1114,20 +1218,24 @@ export async function cleanupExpiredHistory(req, res) {
 
   try {
     const db = admin.firestore();
-    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - HISTORY_TTL_MS);
+    const now = Date.now();
 
-    // Composite index on (userId, createdAt) required for this server-side filter
+    // Query only by userId so cleanup works without a composite Firestore index.
     const snap = await db.collection(HISTORY_COLLECTION)
       .where("userId", "==", uid)
-      .where("createdAt", "<", cutoff)
       .get();
 
-    if (snap.empty) {
+    const expiredDocs = snap.docs.filter((doc) => {
+      const expiresAt = getHistoryExpiryMillis(doc.data());
+      return expiresAt != null && expiresAt <= now;
+    });
+
+    if (expiredDocs.length === 0) {
       res.json({ success: true, deleted: 0, message: "Nothing to clean up" });
       return;
     }
 
-    const cleanup = await deleteHistoryDocsWithStorage(snap.docs, "expired_ttl");
+    const cleanup = await deleteHistoryDocsWithStorage(expiredDocs, "expired_ttl");
 
     console.log(`[HistoryController] cleaned up ${cleanup.deleted} expired items for user ${uid}`);
     res.json({ success: true, ...cleanup });

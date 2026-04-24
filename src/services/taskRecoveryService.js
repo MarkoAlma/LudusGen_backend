@@ -30,6 +30,10 @@ const TYPE_TO_MODE = {
   text_to_model: "generate",
   image_to_model: "generate",
   multiview_to_model: "generate",
+  import_model: "upload",
+  generate_image: "image",
+  generate_multiview_image: "multiview_image",
+  edit_multiview_image: "multiview_image",
   refine_model: "refine",
   stylize_model: "stylize",
   texture_model: "texture",
@@ -42,6 +46,47 @@ const TYPE_TO_MODE = {
 };
 
 /* ─── Register a task for background tracking ─────────────────────────── */
+function inferTaskTypeFromHistory(data = {}) {
+  const explicitType = data?.params?.type;
+  if (explicitType) return explicitType;
+  if (data?.source === "upload" || data?.mode === "upload") return "import_model";
+  return null;
+}
+
+async function restorePendingHistoryTasks() {
+  const db = admin.firestore();
+  const snap = await db.collection(HISTORY_COLLECTION)
+    .where("status", "==", "pending")
+    .limit(200)
+    .get();
+
+  let restored = 0;
+  for (const doc of snap.docs) {
+    const data = doc.data() ?? {};
+    const taskId = data.taskId;
+    const userId = data.userId;
+    const type = inferTaskTypeFromHistory(data);
+    if (!taskId || !userId || !type || pendingTasks.has(taskId)) continue;
+
+    registerTask(
+      taskId,
+      userId,
+      type,
+      data?.params?.model_version ?? null,
+      data?.prompt ?? null,
+      {
+        texture: data?.params?.texture === true,
+        pbr: data?.params?.pbr === true,
+      },
+    );
+    restored += 1;
+  }
+
+  if (restored > 0) {
+    console.log(`[TaskRecovery] Restored ${restored} pending history task(s) from Firestore`);
+  }
+}
+
 export function registerTask(taskId, userId, type, modelVersion, prompt = null, extra = {}) {
   if (!taskId || !userId) return;
   const meta = {
@@ -76,6 +121,9 @@ export function startTaskRecovery() {
   if (pollerInterval) return; // already running
 
   console.log("[TaskRecovery] Background task recovery started");
+  restorePendingHistoryTasks().catch((err) => {
+    console.error("[TaskRecovery] Failed to restore pending history tasks:", err.message);
+  });
 
   pollerInterval = setInterval(async () => {
     if (pendingTasks.size === 0) return;
@@ -158,7 +206,7 @@ async function saveToHistory(entry, taskData) {
   }
   const prefersTexturedOutput = entry.type === "texture_model" || entry.texture === true || entry.pbr === true;
   const prefersDraftOutput = !prefersTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(entry.type);
-  const { modelUrl, chosenSource } = extractModelUrl(
+  const { modelUrl, chosenSource, previewImageUrl } = extractModelUrl(
     { output: out, type: entry.type },
     { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput },
   );
@@ -177,17 +225,14 @@ async function saveToHistory(entry, taskData) {
     return;
   }
 
-  // Check if history entry already exists (idempotency)
+  // Reuse pending history rows when they already exist for this task
   const existing = await db.collection(HISTORY_COLLECTION)
     .where("taskId", "==", entry.taskId)
     .where("userId", "==", entry.userId)
     .limit(1)
     .get();
-
-  if (!existing.empty) {
-    console.log(`[TaskRecovery] History already exists for task ${entry.taskId}`);
-    return;
-  }
+  const existingDoc = existing.docs[0] ?? null;
+  const existingData = existingDoc?.data() ?? null;
 
   const mode = TYPE_TO_MODE[entry.type] ?? "generate";
   const now = Date.now();
@@ -198,23 +243,30 @@ async function saveToHistory(entry, taskData) {
     const url = urlsToSave[i];
     if (!url) continue;
     const stableDocId = urlsToSave.length > 1 ? `tripo_${entry.taskId}_${i}` : `tripo_${entry.taskId}`;
-    await db.collection(HISTORY_COLLECTION).doc(stableDocId).set({
+    const targetRef = i === 0 && existingDoc
+      ? existingDoc.ref
+      : db.collection(HISTORY_COLLECTION).doc(stableDocId);
+    await targetRef.set({
       userId: entry.userId,
-      prompt: entry.prompt ?? taskData.prompt ?? entry.type,
+      prompt: entry.prompt ?? existingData?.prompt ?? taskData.prompt ?? entry.type,
       status: "succeeded",
       model_url: url,
-      source: "tripo",
+      source: existingData?.source ?? (entry.type === "import_model" ? "upload" : "tripo"),
       mode,
       taskId: entry.taskId,
       ...(urlsToSave.length > 1 && { animationIndex: i }),
       params: {
+        ...(existingData?.params ?? {}),
         model_version: entry.modelVersion,
         mode,
         type: entry.type,
         texture: !!entry.texture,
         pbr: !!entry.pbr,
         chosen_source: chosenSource,
+        consumed_credit: taskData.consumed_credit ?? out.consumed_credit ?? null,
+        preview_image_url: previewImageUrl ?? null,
         originalModelTaskId: taskInput.original_model_task_id ?? taskInput.original_model_id ?? null,
+        originalTaskId: taskInput.original_task_id ?? null,
         draftModelTaskId: taskInput.draft_model_task_id ?? null,
         rig_type: out.rig_type ?? out.topology ?? null,
         topology: out.topology ?? null,
