@@ -2294,17 +2294,48 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 // ════════════════════════════════════════════════════
 // 3.  TTS  —  POST /api/generate-tts
 // ════════════════════════════════════════════════════
-router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res) => {
+router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsReferenceAudioUpload, async (req, res) => {
+    let ttsSseStarted = false;
+    const startTtsSse = () => {
+        if (ttsSseStarted) return;
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        ttsSseStarted = true;
+    };
+    const emitTtsSse = (data) => {
+        if (res.writableEnded || res.destroyed) return;
+        startTtsSse();
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
+    };
+
     try {
-        const { model = 'tts-1', provider = 'openai', text, voice = 'nova', speed = 1.0, format = 'mp3', jobId } = req.body;
+        const {
+            model = 'tts-1',
+            provider = 'openai',
+            text,
+            voice = 'nova',
+            speed = 1.0,
+            format = 'mp3',
+            jobId,
+            mode = 'custom_voice',
+            lang = 'en-us',
+            sample_rate = 24000,
+            ref_text = '',
+            instruct = '',
+        } = req.body;
         const controller = new AbortController();
         registerJob(jobId, controller, 600000);
 
         if (!text?.trim()) return res.status(400).json({ success: false, message: 'Hiányzó szöveg' });
-        if (text.length > 4096) return res.status(400).json({ success: false, message: 'Max 4096 karakter' });
+        if (provider !== 'deapi' && text.length > 4096) return res.status(400).json({ success: false, message: 'Max 4096 karakter' });
 
-        const safeSpeed = Math.min(Math.max(0.25, speed), 4.0);
-        const safeFormat = ['mp3', 'opus', 'aac', 'flac'].includes(format) ? format : 'mp3';
+        const parsedSpeed = Number(speed);
+        const safeSpeed = Number.isFinite(parsedSpeed) ? Math.min(Math.max(0.25, parsedSpeed), 4.0) : 1.0;
+        const safeFormat = ['mp3', 'opus', 'aac', 'flac'].includes(String(format || '').trim()) ? String(format).trim() : 'mp3';
         let audioUrl = '';
 
         if (provider === 'openai') {
@@ -2344,7 +2375,166 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
 
             const wavBuffer = pcmToWav(audioBuffer, 22050, 1, 16);
             audioUrl = `data:audio/wav;base64,${wavBuffer.toString('base64')}`;
-            await logUsage(req.userId, 'tts', { provider: 'nvidia-riva', model: 'magpie-tts-multilingual', chars: text.length });
+        }
+
+        else if (provider === 'deapi') {
+            if (!process.env.DEAPI_API_KEY) return res.status(500).json({ success: false, message: 'DEAPI_API_KEY nincs beallitva' });
+
+            const selectedDeapiTtsModel = findLocalDeapiTtsModel(model);
+            if (!selectedDeapiTtsModel) {
+                return res.status(400).json({ success: false, message: `Ismeretlen deAPI TTS modell slug: ${model}` });
+            }
+
+            const defaults = selectedDeapiTtsModel.info?.defaults || {};
+            const modelLimits = selectedDeapiTtsModel.info?.limits || {};
+            const allowedModes = selectedDeapiTtsModel.info?.modes || ['custom_voice'];
+            const safeMode = DEAPI_TTS_MODES.includes(String(mode || '').trim()) ? String(mode).trim() : 'custom_voice';
+            const safeVoice = String(voice || defaults.voice || '').trim();
+            const safeLang = normalizeDeapiTtsLanguage(selectedDeapiTtsModel.slug, lang, defaults.lang || 'en-us');
+            const safeDeapiFormat = DEAPI_TTS_FORMATS.includes(String(format || '').trim()) ? String(format).trim() : (defaults.format || 'mp3');
+            const minTextLength = Number(modelLimits.min_text ?? 0);
+            const maxTextLength = Number(modelLimits.max_text ?? 4096);
+            const minSpeed = Number(modelLimits.min_speed ?? 0.25);
+            const maxSpeed = Number(modelLimits.max_speed ?? 4);
+            const safeDeapiSpeed = Number.isFinite(parsedSpeed)
+                ? Math.min(Math.max(parsedSpeed, minSpeed), maxSpeed)
+                : Number(defaults.speed || 1);
+            const parsedSampleRate = Number(sample_rate);
+            const allowedSampleRates = Array.isArray(modelLimits.available_ratios) && modelLimits.available_ratios.length > 0
+                ? modelLimits.available_ratios.map(Number).filter(Number.isFinite)
+                : DEAPI_TTS_SAMPLE_RATES;
+            const safeSampleRate = allowedSampleRates.includes(parsedSampleRate)
+                ? parsedSampleRate
+                : Number(defaults.sample_rate || 24000);
+            const safeRefText = String(ref_text || '').trim();
+            const safeInstruct = String(instruct || '').trim();
+            const referenceAudioFile = req.file || null;
+
+            if (Number.isFinite(minTextLength) && text.trim().length < minTextLength) {
+                return res.status(400).json({ success: false, message: `${selectedDeapiTtsModel.name} minimum ${minTextLength} karakteres szoveget ker` });
+            }
+            if (Number.isFinite(maxTextLength) && text.trim().length > maxTextLength) {
+                return res.status(400).json({ success: false, message: `${selectedDeapiTtsModel.name} maximum ${maxTextLength} karakteres szoveget fogad` });
+            }
+
+            if (!allowedModes.includes(safeMode)) {
+                return res.status(400).json({
+                    success: false,
+                    message: safeMode === 'voice_clone'
+                        ? `${selectedDeapiTtsModel.name} nem tamogat referencia audio klonozast. Ehhez valaszd a Qwen3 TTS sima/VoiceClone valtozatot.`
+                        : `${selectedDeapiTtsModel.name} nem tamogatja ezt a TTS modot.`,
+                });
+            }
+            if (safeMode === 'custom_voice' && !safeVoice) {
+                return res.status(400).json({ success: false, message: 'Custom voice modban kotelezo a voice mezot megadni' });
+            }
+            if (safeMode === 'voice_clone') {
+                if (!referenceAudioFile) {
+                    return res.status(400).json({ success: false, message: 'Voice clone modban kotelezo a referencia audio' });
+                }
+                if (!isSupportedDeapiReferenceAudioFile(referenceAudioFile)) {
+                    return res.status(400).json({ success: false, message: 'A referencia audio csak MP3, WAV, FLAC, OGG vagy M4A lehet' });
+                }
+            }
+            if (safeMode === 'voice_design' && !safeInstruct) {
+                return res.status(400).json({ success: false, message: 'Voice design modban kotelezo a hang leirasa' });
+            }
+
+            const submissionPayload = {
+                text: text.trim(),
+                model: selectedDeapiTtsModel.slug,
+                mode: safeMode,
+                lang: safeLang,
+                speed: safeDeapiSpeed,
+                format: safeDeapiFormat,
+                sample_rate: safeSampleRate,
+            };
+
+            if (safeMode === 'custom_voice') {
+                submissionPayload.voice = safeVoice;
+            }
+            if (safeMode === 'voice_clone' && safeRefText) {
+                submissionPayload.ref_text = safeRefText;
+            }
+            if (safeInstruct && safeMode === 'voice_design') {
+                submissionPayload.instruct = safeInstruct;
+            }
+
+            const deapiStartedAt = Date.now();
+            emitTtsSse({ type: 'status', status: 'SUBMITTING', progress: 4, elapsed: 0 });
+            const submission = await submitDeapiTextToAudio(
+                submissionPayload,
+                controller.signal,
+                safeMode === 'voice_clone' ? referenceAudioFile : null
+            );
+            const requestId = submission?.data?.request_id;
+            if (!requestId) {
+                throw new Error('A deAPI nem adott vissza request_id-t');
+            }
+
+            emitTtsSse({ type: 'status', status: 'QUEUED', progress: 8, elapsed: 0, requestId });
+            const result = await pollDeapiResult(requestId, controller.signal, (event) => {
+                emitTtsSse({
+                    type: 'status',
+                    status: String(event.status || 'processing').toUpperCase(),
+                    progress: event.progress,
+                    elapsed: event.elapsed,
+                    requestId: event.requestId,
+                    predicted: Boolean(event.predicted),
+                });
+            }, { label: 'A deAPI TTS', estimatedDuration: 90 });
+
+            audioUrl = extractDeapiAudioUrl(result);
+            if (!audioUrl) {
+                throw new Error('A deAPI nem adott vissza letoltheto audio URL-t');
+            }
+
+            const deapiElapsed = Math.round((Date.now() - deapiStartedAt) / 1000);
+            emitTtsSse({ type: 'status', status: 'FINALIZING', progress: 96, elapsed: deapiElapsed, requestId });
+
+            const archiveItem = await persistGeneratedAudio(req.userId, audioUrl, {
+                type: 'tts',
+                text: text.trim(),
+                provider: 'deapi',
+                model: selectedDeapiTtsModel.slug,
+                ttsMode: safeMode,
+                voice: safeMode === 'custom_voice' ? safeVoice : null,
+                lang: safeLang,
+                speed: safeDeapiSpeed,
+                instruct: safeMode === 'voice_design' ? safeInstruct : null,
+                hasReferenceAudio: safeMode === 'voice_clone',
+                fileFormat: safeDeapiFormat,
+                sampleRate: safeSampleRate,
+                requestId,
+                stream: false,
+                outputFormat: 'url',
+            });
+
+            await logUsage(req.userId, 'tts', {
+                provider: 'deapi',
+                task: 'txt2audio',
+                model: selectedDeapiTtsModel.slug,
+                mode: safeMode,
+                chars: text.length,
+                audioId: archiveItem?.id || null,
+                requestId,
+            });
+
+            unregisterJob(jobId);
+            emitTtsSse({
+                type: 'done',
+                success: true,
+                audioUrl: archiveItem ? null : audioUrl,
+                audioId: archiveItem?.id || null,
+                historyItem: archiveItem,
+                fileFormat: safeDeapiFormat,
+                sampleRate: safeSampleRate,
+                outputFormat: 'url',
+                stream: false,
+                elapsed: deapiElapsed,
+                requestId,
+            });
+            return res.end();
         }
 
         else if (provider === 'elevenlabs') {
@@ -2365,15 +2555,53 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
             return res.status(400).json({ success: false, message: `Ismeretlen TTS provider: ${provider}` });
         }
 
-        await logUsage(req.userId, 'tts', { provider, model, chars: text.length });
+        const archiveItem = await persistGeneratedAudio(req.userId, audioUrl, {
+            type: 'tts',
+            text: text.trim(),
+            provider,
+            model: provider === 'nvidia-riva' ? 'magpie-tts-multilingual' : model,
+            voice,
+            fileFormat: provider === 'nvidia-riva' ? 'wav' : provider === 'elevenlabs' ? 'mp3' : safeFormat,
+            sampleRate: provider === 'nvidia-riva' ? 22050 : null,
+            stream: false,
+        });
+
+        await logUsage(req.userId, 'tts', {
+            provider,
+            model: provider === 'nvidia-riva' ? 'magpie-tts-multilingual' : model,
+            chars: text.length,
+            audioId: archiveItem?.id || null,
+        });
         unregisterJob(jobId);
-        return res.json({ success: true, audioUrl });
+        return res.json({
+            success: true,
+            audioUrl: archiveItem ? null : audioUrl,
+            audioId: archiveItem?.id || null,
+            historyItem: archiveItem,
+        });
 
     } catch (err) {
         unregisterJob(req.body.jobId);
-        if (err.name === 'AbortError' || err.message === 'AbortError') return res.status(499).json({ success: false, message: 'Folyamat megszakítva (User/Timeout)' });
-        console.error('❌ TTS hiba:', err);
-        return res.status(500).json({ success: false, message: err.message || 'TTS hiba' });
+        const clientMessage = err.name === 'AbortError' || err.message === 'AbortError'
+            ? 'Folyamat megszakitva (User/Timeout)'
+            : err.message || 'TTS hiba';
+        if (ttsSseStarted) {
+            emitTtsSse({ type: 'error', message: clientMessage });
+            return res.end();
+        }
+        if (res.headersSent) return;
+        if (err.response || err.status || err.isAxiosError) {
+            console.error('TTS hiba:', {
+                status: err.status || err.response?.status || null,
+                code: err.code || null,
+                message: err.response?.data?.message || err.message || 'Unknown error',
+                deapiRateLimit: Boolean(isDeapiRateLimitError(err) || err.deapiRateLimit),
+            });
+            return res.status(err.status || err.response?.status || 500).json({ success: false, message: clientMessage });
+        }
+        if (err.name === 'AbortError' || err.message === 'AbortError') return res.status(499).json({ success: false, message: clientMessage });
+        console.error('TTS hiba:', err);
+        return res.status(500).json({ success: false, message: clientMessage });
     }
 });
 
@@ -2500,6 +2728,252 @@ function getDeapiClient() {
     });
 }
 
+const DEAPI_ALLOWED_TXT2MUSIC_MODELS = [
+    { slug: 'AceStep_1_5_XL_Turbo_INT8', name: 'Ace Step 1.5 XL Turbo INT8', info: { defaults: {}, limits: {} } },
+    { slug: 'AceStep_1_5_Base', name: 'Ace Step 1.5 Base', info: { defaults: {}, limits: {} } },
+];
+
+const DEAPI_ALLOWED_TXT2AUDIO_MODELS = [
+    {
+        slug: 'Kokoro',
+        name: 'Kokoro',
+        info: {
+            defaults: { mode: 'custom_voice', voice: 'af_alloy', lang: 'en-us', speed: 1, format: 'mp3', sample_rate: 24000 },
+            limits: { min_text: 3, max_text: 10001, min_speed: 0.5, max_speed: 2, available_ratios: [24000] },
+            modes: ['custom_voice'],
+        },
+    },
+    {
+        slug: 'Chatterbox',
+        name: 'Chatterbox',
+        info: {
+            defaults: { mode: 'custom_voice', voice: 'default', lang: 'en', speed: 1, format: 'mp3', sample_rate: 24000 },
+            limits: { min_text: 10, max_text: 2000, min_speed: 1, max_speed: 1, available_ratios: [24000] },
+            modes: ['custom_voice'],
+            features: { supports_voice_clone: false, supports_custom_voice: true, supports_voice_design: false },
+        },
+    },
+    {
+        slug: 'Qwen3_TTS_12Hz_1_7B_Base',
+        name: 'Qwen3 TTS VoiceClone',
+        info: {
+            defaults: { mode: 'voice_clone', voice: 'default', lang: 'English', speed: 1, format: 'mp3', sample_rate: 24000 },
+            limits: { min_text: 10, max_text: 5000, min_speed: 1, max_speed: 1, available_ratios: [24000], min_ref_audio_duration: 5, max_ref_audio_duration: 15 },
+            modes: ['voice_clone'],
+            features: { supports_voice_clone: true, supports_custom_voice: false, supports_voice_design: false },
+        },
+    },
+    {
+        slug: 'Qwen3_TTS_12Hz_1_7B_VoiceDesign',
+        name: 'Qwen3 TTS VoiceDesign',
+        info: {
+            defaults: { mode: 'voice_design', voice: 'default', lang: 'English', speed: 1, format: 'mp3', sample_rate: 24000 },
+            limits: { min_text: 10, max_text: 5000, min_speed: 1, max_speed: 1, available_ratios: [24000] },
+            modes: ['voice_design'],
+            features: { supports_voice_clone: false, supports_custom_voice: false, supports_voice_design: true },
+        },
+    },
+    {
+        slug: 'Qwen3_TTS_12Hz_1_7B_CustomVoice',
+        name: 'Qwen3 TTS CustomVoice',
+        info: {
+            defaults: { mode: 'custom_voice', voice: 'Vivian', lang: 'English', speed: 1, format: 'mp3', sample_rate: 24000 },
+            limits: { min_text: 10, max_text: 5000, min_speed: 1, max_speed: 1, available_ratios: [24000] },
+            modes: ['custom_voice'],
+            features: { supports_voice_clone: false, supports_custom_voice: true, supports_voice_design: false },
+        },
+    },
+];
+
+const DEAPI_TTS_MODES = ['custom_voice', 'voice_clone', 'voice_design'];
+const DEAPI_TTS_FORMATS = ['mp3', 'wav', 'flac'];
+const DEAPI_TTS_SAMPLE_RATES = [16000, 22050, 24000, 44100, 48000];
+
+function normalizeDeapiModelSlug(slug = '') {
+    return String(slug || '').trim().toLowerCase();
+}
+
+function getLocalDeapiMusicModels() {
+    return DEAPI_ALLOWED_TXT2MUSIC_MODELS.map((model) => ({
+        ...model,
+        info: {
+            defaults: model.info?.defaults || {},
+            limits: model.info?.limits || {},
+        },
+    }));
+}
+
+function findLocalDeapiMusicModel(slug = '') {
+    const normalizedSlug = normalizeDeapiModelSlug(slug);
+    return getLocalDeapiMusicModels().find((model) => normalizeDeapiModelSlug(model.slug) === normalizedSlug) || null;
+}
+
+function getLocalDeapiTtsModels() {
+    return DEAPI_ALLOWED_TXT2AUDIO_MODELS.map((model) => ({
+        ...model,
+        info: {
+            defaults: model.info?.defaults || {},
+            limits: model.info?.limits || {},
+            modes: model.info?.modes || ['custom_voice'],
+            features: model.info?.features || {},
+        },
+    }));
+}
+
+function findLocalDeapiTtsModel(slug = '') {
+    const normalizedSlug = normalizeDeapiModelSlug(slug);
+    return getLocalDeapiTtsModels().find((model) => normalizeDeapiModelSlug(model.slug) === normalizedSlug) || null;
+}
+
+function normalizeDeapiTtsLanguage(modelSlug, lang, fallback = 'en-us') {
+    const normalizedModel = normalizeDeapiModelSlug(modelSlug);
+    const raw = String(lang || fallback || '').trim().toLowerCase();
+    if (!raw) return fallback;
+
+    if (normalizedModel.includes('qwen3')) {
+        const qwenLanguageMap = {
+            en: 'English',
+            'en-us': 'English',
+            'en-gb': 'English',
+            english: 'English',
+            zh: 'Chinese',
+            chinese: 'Chinese',
+            ja: 'Japanese',
+            japanese: 'Japanese',
+            ko: 'Korean',
+            korean: 'Korean',
+            de: 'German',
+            german: 'German',
+            fr: 'French',
+            french: 'French',
+            ru: 'Russian',
+            russian: 'Russian',
+            pt: 'Portuguese',
+            portuguese: 'Portuguese',
+            es: 'Spanish',
+            spanish: 'Spanish',
+            it: 'Italian',
+            italian: 'Italian',
+        };
+        return qwenLanguageMap[raw] || fallback;
+    }
+
+    if (normalizedModel.includes('chatterbox')) {
+        if (raw === 'en-us' || raw === 'en-gb') return 'en';
+        return raw.split('-')[0] || fallback;
+    }
+
+    if (normalizedModel.includes('kokoro') && raw === 'en') {
+        return 'en-us';
+    }
+
+    return raw;
+}
+
+function getDeapiRateLimitDetails(err) {
+    const headers = err.response?.headers || {};
+    const retryAfterSeconds = Number(headers['retry-after']);
+    const resetSeconds = Number(headers['x-ratelimit-reset']);
+    const dailyLimit = headers['x-ratelimit-daily-limit'] || headers['x-ratelimit-limit'] || null;
+    const dailyRemaining = headers['x-ratelimit-daily-remaining'] || headers['x-ratelimit-remaining'] || null;
+
+    return {
+        retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : null,
+        resetAt: Number.isFinite(resetSeconds) ? new Date(resetSeconds * 1000) : null,
+        dailyLimit,
+        dailyRemaining,
+    };
+}
+
+function isDeapiRateLimitError(err) {
+    return err?.deapiRateLimit || err?.response?.status === 429;
+}
+
+function buildDeapiRateLimitMessage(err) {
+    const details = getDeapiRateLimitDetails(err);
+    const parts = ['deAPI rate limit hiba.'];
+
+    if (details.dailyLimit) {
+        parts.push(`Napi limit: ${details.dailyLimit}, maradek: ${details.dailyRemaining ?? '0'}.`);
+    }
+    if (details.retryAfterSeconds !== null) {
+        const minutes = Math.ceil(details.retryAfterSeconds / 60);
+        parts.push(`Probald ujra kb. ${minutes} perc mulva.`);
+    }
+    if (details.resetAt) {
+        parts.push(`Reset UTC: ${details.resetAt.toISOString()}.`);
+    }
+
+    return parts.join(' ');
+}
+
+function flattenDeapiValidationErrors(errors) {
+    if (!errors) return [];
+
+    if (Array.isArray(errors)) {
+        return errors
+            .map((item) => typeof item === 'string' ? item : JSON.stringify(item))
+            .filter(Boolean);
+    }
+
+    if (typeof errors === 'object') {
+        return Object.entries(errors).flatMap(([field, value]) => {
+            if (Array.isArray(value)) {
+                return value.map((message) => `${field}: ${message}`);
+            }
+            if (typeof value === 'string') {
+                return [`${field}: ${value}`];
+            }
+            return [`${field}: ${JSON.stringify(value)}`];
+        });
+    }
+
+    return [String(errors)];
+}
+
+function buildDeapiValidationMessage(err) {
+    const data = err.response?.data || {};
+    const status = err.response?.status || err.status || 500;
+    const parts = [`deAPI hiba (${status}).`];
+
+    if (data.message) {
+        parts.push(String(data.message));
+    } else if (err.message && !/^Request failed with status code/i.test(err.message)) {
+        parts.push(err.message);
+    }
+
+    const validationErrors = flattenDeapiValidationErrors(data.errors);
+    if (validationErrors.length > 0) {
+        parts.push(validationErrors.slice(0, 4).join(' | '));
+    }
+
+    return parts.join(' ');
+}
+
+function normalizeDeapiError(err) {
+    if (isDeapiRateLimitError(err)) {
+        const wrapped = new Error(buildDeapiRateLimitMessage(err));
+        wrapped.status = 429;
+        wrapped.deapiRateLimit = true;
+        wrapped.response = err.response;
+        return wrapped;
+    }
+
+    if (!err?.response) return err;
+
+    const wrapped = new Error(buildDeapiValidationMessage(err));
+    wrapped.status = err.response?.status;
+    wrapped.response = err.response;
+    wrapped.isAxiosError = err.isAxiosError;
+    return wrapped;
+}
+
+function getPredictedDeapiProgress(elapsedSeconds, estimatedSeconds = 180) {
+    const ratio = Math.max(0, Math.min(1, elapsedSeconds / Math.max(30, estimatedSeconds)));
+    const eased = 1 - Math.pow(1 - ratio, 2);
+    return Math.max(8, Math.min(95, Math.round(8 + eased * 87)));
+}
+
 function normalizeDeapiMusicNumber(value, { min, max, fallback, integer = false } = {}) {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return fallback;
@@ -2510,6 +2984,240 @@ function normalizeDeapiMusicNumber(value, { min, max, fallback, integer = false 
 function getDeapiNumericLimit(limits, key, fallback = null) {
     const parsed = Number(limits?.[key]);
     return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function isPrivateIpAddress(address = '') {
+    const value = String(address || '').trim().toLowerCase();
+    if (!value) return true;
+    if (value === 'localhost' || value === '::1' || value === '0.0.0.0') return true;
+    if (value.startsWith('127.') || value.startsWith('10.') || value.startsWith('169.254.')) return true;
+    if (value.startsWith('192.168.')) return true;
+    const secondOctet = Number(value.split('.')[1]);
+    if (value.startsWith('172.') && Number.isFinite(secondOctet) && secondOctet >= 16 && secondOctet <= 31) return true;
+    if (value.startsWith('fc') || value.startsWith('fd') || value.startsWith('fe80:')) return true;
+    return false;
+}
+
+async function assertSafeExternalAudioUrl(rawUrl) {
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(String(rawUrl || ''));
+    } catch {
+        throw new Error('Érvénytelen audio URL');
+    }
+
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('Csak HTTP/HTTPS audio URL tölthető le');
+    }
+
+    const hostname = parsedUrl.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname.endsWith('.local')) {
+        throw new Error('Belső hálózati audio URL nem tölthető le');
+    }
+
+    const addresses = await dns.promises.lookup(hostname, { all: true });
+    if (!addresses.length || addresses.some((entry) => isPrivateIpAddress(entry.address))) {
+        throw new Error('Belső hálózati audio URL nem tölthető le');
+    }
+
+    return parsedUrl.toString();
+}
+
+function sanitizeAudioDownloadFilename(filename = 'neural_audio.mp3') {
+    const cleaned = String(filename || 'neural_audio.mp3')
+        .replace(/[\\/:*?"<>|]+/g, '-')
+        .replace(/\s+/g, '_')
+        .slice(0, 120)
+        .trim();
+    return cleaned || 'neural_audio.mp3';
+}
+
+const AUDIO_ARCHIVE_MAX_BYTES = 100 * 1024 * 1024;
+const AUDIO_EXTENSION_BY_MIME = {
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/wave': 'wav',
+    'audio/flac': 'flac',
+    'audio/x-flac': 'flac',
+    'audio/aac': 'aac',
+    'audio/ogg': 'ogg',
+    'audio/opus': 'opus',
+    'audio/pcm': 'pcm',
+};
+const AUDIO_MIME_BY_EXTENSION = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    flac: 'audio/flac',
+    aac: 'audio/aac',
+    ogg: 'audio/ogg',
+    opus: 'audio/ogg',
+    pcm: 'audio/pcm',
+};
+
+function normalizeAudioContentType(contentType = '') {
+    return String(contentType || '').split(';')[0].trim().toLowerCase();
+}
+
+function getAudioContentTypeFromExtension(format = 'mp3') {
+    return AUDIO_MIME_BY_EXTENSION[String(format || '').toLowerCase()] || getMiniMaxMusicMimeType(format);
+}
+
+function getAudioExtensionFromContentType(contentType = '') {
+    return AUDIO_EXTENSION_BY_MIME[normalizeAudioContentType(contentType)] || null;
+}
+
+function getAudioExtensionFromUrl(audioUrl = '') {
+    try {
+        const parsedUrl = new URL(audioUrl);
+        const match = parsedUrl.pathname.match(/\.([a-z0-9]+)$/i);
+        return match?.[1]?.toLowerCase() || null;
+    } catch {
+        return null;
+    }
+}
+
+function getTimestampMillis(value) {
+    if (!value) return Date.now();
+    if (typeof value === 'number') return value;
+    if (value instanceof Date) return value.getTime();
+    if (typeof value.toMillis === 'function') return value.toMillis();
+    if (typeof value.toDate === 'function') return value.toDate().getTime();
+    if (typeof value.seconds === 'number') return value.seconds * 1000;
+    if (typeof value._seconds === 'number') return value._seconds * 1000;
+    return Date.now();
+}
+
+async function readAudioSourceAsBuffer(audioSource, preferredFormat = 'mp3') {
+    const source = String(audioSource || '').trim();
+    if (!source) throw new Error('Hiányzó audio forrás');
+
+    if (source.startsWith('data:')) {
+        const match = source.match(/^data:([^;,]+)(?:;[^,]*)?,(.*)$/);
+        if (!match) throw new Error('Érvénytelen data audio URL');
+        const normalizedContentType = normalizeAudioContentType(match[1]);
+        const contentType = normalizedContentType.startsWith('audio/')
+            ? normalizedContentType
+            : getAudioContentTypeFromExtension(preferredFormat);
+        const buffer = Buffer.from(match[2], 'base64');
+        if (buffer.length > AUDIO_ARCHIVE_MAX_BYTES) throw new Error('Az audio túl nagy a mentéshez');
+        return {
+            buffer,
+            contentType,
+            fileFormat: getAudioExtensionFromContentType(contentType) || preferredFormat || 'mp3',
+        };
+    }
+
+    const safeAudioUrl = await assertSafeExternalAudioUrl(source);
+    const upstream = await axios.get(safeAudioUrl, {
+        responseType: 'arraybuffer',
+        timeout: 180000,
+        maxRedirects: 3,
+        maxContentLength: AUDIO_ARCHIVE_MAX_BYTES,
+        httpsAgent,
+        headers: {
+            Accept: 'audio/*,application/octet-stream,*/*;q=0.8',
+        },
+    });
+
+    const buffer = Buffer.from(upstream.data);
+    if (buffer.length > AUDIO_ARCHIVE_MAX_BYTES) throw new Error('Az audio túl nagy a mentéshez');
+
+    const normalizedContentType = normalizeAudioContentType(upstream.headers['content-type']);
+    const contentType = normalizedContentType.startsWith('audio/')
+        ? normalizedContentType
+        : getAudioContentTypeFromExtension(preferredFormat);
+    return {
+        buffer,
+        contentType,
+        fileFormat: getAudioExtensionFromContentType(contentType) || getAudioExtensionFromUrl(safeAudioUrl) || preferredFormat || 'mp3',
+    };
+}
+
+async function persistGeneratedAudio(userId, audioSource, metadata = {}) {
+    try {
+        if (!process.env.B2_BUCKET_NAME || !process.env.B2_ENDPOINT || !process.env.B2_KEY_ID || !process.env.B2_APP_KEY) {
+            console.warn('[AudioArchive] B2 nincs teljesen beállítva, archív mentés kihagyva');
+            return null;
+        }
+
+        const preferredFormat = String(metadata.fileFormat || metadata.format || 'mp3').toLowerCase();
+        const { buffer, contentType, fileFormat } = await readAudioSourceAsBuffer(audioSource, preferredFormat);
+        const timestamp = Date.now();
+        const rand = Math.random().toString(36).slice(2, 8);
+        const safeFormat = String(fileFormat || preferredFormat || 'mp3').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'mp3';
+        const b2Key = `users/${userId}/audio/${timestamp}_${rand}.${safeFormat}`;
+
+        await uploadMediaToB2(buffer, b2Key, contentType);
+
+        const docPayload = {
+            ...metadata,
+            userId,
+            b2_key: b2Key,
+            fileFormat: safeFormat,
+            contentType,
+            fileSize: buffer.length,
+            storage: 'b2',
+            createdAtMs: timestamp,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+        delete docPayload.audioUrl;
+
+        const docRef = await admin.firestore().collection('generated_audio').add(docPayload);
+        return {
+            id: docRef.id,
+            audioId: docRef.id,
+            ...docPayload,
+            createdAtMs: timestamp,
+        };
+    } catch (err) {
+        console.error('[AudioArchive] Mentés sikertelen:', err.message);
+        return null;
+    }
+}
+
+function serializeGeneratedAudioDoc(doc) {
+    const data = doc.data() || {};
+    const createdAtMs = data.createdAtMs || getTimestampMillis(data.createdAt);
+    const { b2_key, userId, ...publicData } = data;
+    return {
+        id: doc.id,
+        audioId: doc.id,
+        ...publicData,
+        storage: 'b2',
+        secureAudio: true,
+        createdAtMs,
+    };
+}
+
+async function loadLegacyAudioHistory(userId) {
+    try {
+        const userDocRef = admin.firestore().collection('audio_generations').doc(userId);
+        const collections = await userDocRef.listCollections();
+        const snapshots = await Promise.all(collections.map((collectionRef) =>
+            collectionRef.orderBy('createdAt', 'desc').limit(30).get().catch(() => null)
+        ));
+
+        return snapshots
+            .filter(Boolean)
+            .flatMap((snap) => snap.docs.map((doc) => {
+                const data = doc.data() || {};
+                const createdAtMs = getTimestampMillis(data.createdAt);
+                return {
+                    id: `legacy-${doc.ref.parent.id}-${doc.id}`,
+                    legacyId: doc.id,
+                    legacyModelId: doc.ref.parent.id,
+                    ...data,
+                    storage: 'legacy',
+                    secureAudio: false,
+                    createdAtMs,
+                };
+            }));
+    } catch (err) {
+        console.warn('[AudioArchive] Legacy lista sikertelen:', err.message);
+        return [];
+    }
 }
 
 function isSupportedDeapiReferenceAudioFile(file) {
@@ -2543,6 +3251,90 @@ function handleDeapiReferenceAudioUpload(req, res, next) {
     });
 }
 
+function handleDeapiTtsReferenceAudioUpload(req, res, next) {
+    deapiReferenceAudioUpload.single('ref_audio')(req, res, (err) => {
+        if (!err) return next();
+        if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({ success: false, message: 'A referencia audio merete legfeljebb 10 MB lehet' });
+        }
+        return res.status(400).json({ success: false, message: err.message || 'Referencia audio feltoltesi hiba' });
+    });
+}
+
+async function fetchDeapiMusicModels() {
+    return getLocalDeapiMusicModels();
+}
+
+async function fetchDeapiTtsModels() {
+    return getLocalDeapiTtsModels();
+}
+
+async function submitDeapiTextToMusic(payload, signal, referenceAudioFile = null) {
+    const client = getDeapiClient();
+    const form = new FormData();
+
+    Object.entries(payload).forEach(([key, value]) => {
+        if (value === undefined || value === null || value === '') return;
+        form.append(key, String(value));
+    });
+
+    if (referenceAudioFile?.buffer) {
+        form.append('reference_audio', referenceAudioFile.buffer, {
+            filename: referenceAudioFile.originalname || 'reference-audio',
+            contentType: referenceAudioFile.mimetype || 'application/octet-stream',
+            knownLength: referenceAudioFile.size,
+        });
+    }
+
+    try {
+        const response = await client.post('/api/v1/client/txt2music', form, {
+            headers: {
+                ...form.getHeaders(),
+                Accept: 'application/json',
+                Authorization: `Bearer ${process.env.DEAPI_API_KEY}`,
+            },
+            signal,
+        });
+
+        return response.data;
+    } catch (err) {
+        throw normalizeDeapiError(err);
+    }
+}
+
+async function submitDeapiTextToAudio(payload, signal, referenceAudioFile = null) {
+    const client = getDeapiClient();
+    const form = new FormData();
+
+    Object.entries(payload).forEach(([key, value]) => {
+        if (value === undefined || value === null || value === '') return;
+        form.append(key, String(value));
+    });
+
+    if (referenceAudioFile?.buffer) {
+        form.append('ref_audio', referenceAudioFile.buffer, {
+            filename: referenceAudioFile.originalname || 'reference-audio',
+            contentType: referenceAudioFile.mimetype || 'application/octet-stream',
+            knownLength: referenceAudioFile.size,
+        });
+    }
+
+    try {
+        const response = await client.post('/api/v1/client/txt2audio', form, {
+            headers: {
+                ...form.getHeaders(),
+                Accept: 'application/json',
+                Authorization: `Bearer ${process.env.DEAPI_API_KEY}`,
+            },
+            signal,
+        });
+
+        return response.data;
+    } catch (err) {
+        throw normalizeDeapiError(err);
+    }
+}
+
 async function waitForAbortableDelay(ms, signal) {
     if (!signal) {
         await new Promise((resolve) => setTimeout(resolve, ms));
@@ -2572,64 +3364,80 @@ async function waitForAbortableDelay(ms, signal) {
     });
 }
 
-async function fetchDeapiMusicModels() {
-    const client = getDeapiClient();
-    const response = await client.get('/api/v1/client/models', {
-        params: { 'filter[inference_types]': 'txt2music' },
-    });
+function extractDeapiAudioUrl(result = {}) {
+    const candidates = [
+        result.result_url,
+        result.audio_url,
+        result.audioUrl,
+        result.output_url,
+        result.file_url,
+        result.url,
+        result.result,
+        result.data?.result_url,
+        result.data?.audio_url,
+        result.data?.audioUrl,
+        result.data?.url,
+        result.data?.result,
+    ];
 
-    return Array.isArray(response.data?.data) ? response.data.data : [];
-}
-
-async function submitDeapiTextToMusic(payload, signal, referenceAudioFile = null) {
-    const client = getDeapiClient();
-    const form = new FormData();
-
-    Object.entries(payload).forEach(([key, value]) => {
-        if (value === undefined || value === null || value === '') return;
-        form.append(key, String(value));
-    });
-
-    if (referenceAudioFile?.buffer) {
-        form.append('reference_audio', referenceAudioFile.buffer, {
-            filename: referenceAudioFile.originalname || 'reference-audio',
-            contentType: referenceAudioFile.mimetype || 'application/octet-stream',
-            knownLength: referenceAudioFile.size,
-        });
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+        if (Array.isArray(candidate)) {
+            const nested = extractDeapiAudioUrl({ result: candidate[0] });
+            if (nested) return nested;
+        }
+        if (candidate && typeof candidate === 'object') {
+            const nested = extractDeapiAudioUrl(candidate);
+            if (nested) return nested;
+        }
     }
 
-    const response = await client.post('/api/v1/client/txt2music', form, {
-        headers: {
-            ...form.getHeaders(),
-            Accept: 'application/json',
-            Authorization: `Bearer ${process.env.DEAPI_API_KEY}`,
-        },
-        signal,
-    });
-
-    return response.data;
+    return '';
 }
 
-async function pollDeapiResult(requestId, signal) {
+async function pollDeapiResult(requestId, signal, onStatus = null, options = {}) {
     const client = getDeapiClient();
     const startedAt = Date.now();
+    const estimatedDuration = Math.max(30, Number(options.estimatedDuration || 180));
+    const label = options.label || 'deAPI feladat';
+    const pollIntervalMs = 15000;
+    const maxPolls = Math.max(1, Math.round(Number(process.env.DEAPI_MAX_STATUS_POLLS || 13)));
 
-    while (Date.now() - startedAt < 600000) {
-        const response = await client.get(`/api/v1/client/request-status/${requestId}`, { signal });
+    for (let pollCount = 0; pollCount < maxPolls; pollCount += 1) {
+        await waitForAbortableDelay(pollIntervalMs, signal);
+
+        let response;
+        try {
+            response = await client.get(`/api/v1/client/request-status/${requestId}`, { signal });
+        } catch (err) {
+            throw normalizeDeapiError(err);
+        }
+
         const data = response.data?.data || {};
         const status = String(data.status || '').toLowerCase();
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        const upstreamProgress = Number(data.progress ?? data.percentage ?? data.percent);
+        const progress = Number.isFinite(upstreamProgress)
+            ? Math.max(8, Math.min(Math.round(upstreamProgress), 96))
+            : getPredictedDeapiProgress(elapsed, estimatedDuration);
 
-        if (status === 'done' || ((!status || status === 'completed') && (data.result_url || data.result))) {
+        onStatus?.({
+            status: status || 'processing',
+            progress,
+            elapsed,
+            requestId,
+            predicted: !Number.isFinite(upstreamProgress),
+        });
+
+        if (status === 'done' || ((!status || status === 'completed') && extractDeapiAudioUrl(data))) {
             return data;
         }
         if (['error', 'failed', 'cancelled', 'canceled'].includes(status)) {
-            throw new Error(data.error || response.data?.message || 'A deAPI zenegenerálás hibával leállt');
+            throw new Error(data.error || response.data?.message || `${label} hibaval leallt`);
         }
-
-        await waitForAbortableDelay(3000, signal);
     }
 
-    throw new Error('A deAPI zenegenerálás időtúllépés miatt nem fejeződött be');
+    throw new Error(`${label} ${maxPolls} status polling utan sem keszult el. A napi request-status limit vedelme miatt leallitottuk a varakozast.`);
 }
 
 router.get('/deapi/music-models', verifyFirebaseToken, audioLimiter, async (req, res) => {
@@ -2646,6 +3454,8 @@ router.get('/deapi/music-models', verifyFirebaseToken, audioLimiter, async (req,
                 slug: model.slug,
                 defaults: model.info?.defaults || {},
                 limits: model.info?.limits || {},
+                modes: model.info?.modes || ['custom_voice'],
+                features: model.info?.features || {},
             })),
         });
     } catch (err) {
@@ -2657,7 +3467,135 @@ router.get('/deapi/music-models', verifyFirebaseToken, audioLimiter, async (req,
     }
 });
 
+router.get('/deapi/tts-models', verifyFirebaseToken, audioLimiter, async (req, res) => {
+    try {
+        if (!process.env.DEAPI_API_KEY) {
+            return res.status(500).json({ success: false, message: 'DEAPI_API_KEY nincs beallitva' });
+        }
+
+        const models = await fetchDeapiTtsModels();
+        return res.json({
+            success: true,
+            models: models.map((model) => ({
+                name: model.name || model.slug,
+                slug: model.slug,
+                defaults: model.info?.defaults || {},
+                limits: model.info?.limits || {},
+            })),
+        });
+    } catch (err) {
+        console.error('deAPI TTS model lista hiba:', err.response?.data || err.message || err);
+        return res.status(err.response?.status || 500).json({
+            success: false,
+            message: err.response?.data?.message || err.message || 'A deAPI TTS modelllista nem toltheto be',
+        });
+    }
+});
+
+router.post('/audio/download', verifyFirebaseToken, audioLimiter, async (req, res) => {
+    try {
+        const safeAudioUrl = await assertSafeExternalAudioUrl(req.body?.audioUrl);
+        const filename = sanitizeAudioDownloadFilename(req.body?.filename);
+
+        const upstream = await axios.get(safeAudioUrl, {
+            responseType: 'stream',
+            timeout: 120000,
+            maxRedirects: 3,
+            httpsAgent,
+            headers: {
+                Accept: 'audio/*,application/octet-stream,*/*;q=0.8',
+            },
+        });
+
+        const contentType = upstream.headers['content-type'] || 'application/octet-stream';
+        const contentLength = upstream.headers['content-length'];
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Cache-Control', 'private, no-store');
+        if (contentLength) res.setHeader('Content-Length', contentLength);
+        upstream.data.pipe(res);
+    } catch (err) {
+        console.error('❌ audio download proxy hiba:', err.response?.data || err.message || err);
+        if (!res.headersSent) {
+            res.status(400).json({
+                success: false,
+                message: err.response?.data?.message || err.message || 'Az audio letöltése nem sikerült',
+            });
+        }
+    }
+});
+
+router.get('/audio/history', verifyFirebaseToken, audioLimiter, async (req, res) => {
+    try {
+        const userId = req.userId;
+        const snap = await admin.firestore()
+            .collection('generated_audio')
+            .where('userId', '==', userId)
+            .get();
+
+        const storedItems = snap.docs.map(serializeGeneratedAudioDoc);
+        const legacyItems = await loadLegacyAudioHistory(userId);
+        const items = [...storedItems, ...legacyItems]
+            .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
+            .slice(0, 100);
+
+        return res.json({ success: true, items });
+    } catch (err) {
+        console.error('[AudioArchive] Lista hiba:', err);
+        return res.status(500).json({ success: false, message: 'Audio archívum lekérdezése sikertelen' });
+    }
+});
+
+router.get('/audio/history/:id/file', verifyFirebaseToken, audioLimiter, async (req, res) => {
+    try {
+        const docRef = admin.firestore().collection('generated_audio').doc(req.params.id);
+        const doc = await docRef.get();
+        if (!doc.exists) return res.status(404).json({ success: false, message: 'Audio nem található' });
+
+        const data = doc.data() || {};
+        if (data.userId !== req.userId) {
+            return res.status(403).json({ success: false, message: 'Nincs jogosultság' });
+        }
+        if (!data.b2_key || !String(data.b2_key).startsWith(`users/${req.userId}/audio/`)) {
+            return res.status(403).json({ success: false, message: 'Érvénytelen audio kulcs' });
+        }
+
+        const result = await b2.send(new GetObjectCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            Key: data.b2_key,
+        }));
+
+        res.setHeader('Content-Type', data.contentType || 'audio/mpeg');
+        res.setHeader('Content-Disposition', `inline; filename="${sanitizeAudioDownloadFilename(`ludusgen_audio_${doc.id}.${data.fileFormat || 'mp3'}`)}"`);
+        res.setHeader('Cache-Control', 'private, max-age=3600');
+        if (result.ContentLength) res.setHeader('Content-Length', result.ContentLength);
+        result.Body.pipe(res);
+    } catch (err) {
+        console.error('[AudioArchive] Stream hiba:', err);
+        if (!res.headersSent) {
+            res.status(500).json({ success: false, message: 'Audio stream sikertelen' });
+        }
+    }
+});
+
 router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiReferenceAudioUpload, async (req, res) => {
+    let musicSseStarted = false;
+    const startMusicSse = () => {
+        if (musicSseStarted) return;
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        musicSseStarted = true;
+    };
+    const emitMusicSse = (data) => {
+        if (res.writableEnded || res.destroyed) return;
+        startMusicSse();
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
+    };
+
     try {
         const {
             apiId,
@@ -2675,12 +3613,12 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
             inference_steps = 8,
             guidance_scale = 7,
             seed = -1,
-            format = 'flac',
+            format = 'mp3',
             bpm = null,
             keyscale = null,
             timesignature = null,
             vocal_language = null,
-            webhook_url = null,
+            lyrics_mode = null,
             jobId,
         } = req.body;
         const controller = new AbortController();
@@ -2718,8 +3656,7 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
                 return res.status(400).json({ success: false, message: 'A deAPI lyrics mezĹ‘ nem lehet ĂĽres. Auto-lyrics mĂłdban elĹ‘bb generĂˇlni kell dalszĂ¶veget.' });
             }
 
-            const availableModels = await fetchDeapiMusicModels();
-            const selectedDeapiModel = availableModels.find((item) => item.slug === safeModel);
+            const selectedDeapiModel = findLocalDeapiMusicModel(safeModel);
             if (!selectedDeapiModel) {
                 return res.status(400).json({ success: false, message: `Ismeretlen deAPI modell slug: ${safeModel}` });
             }
@@ -2773,15 +3710,13 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
             const safeKeyscale = String(keyscale || '').trim() || null;
             const safeTimeSignature = timesignature === null || timesignature === '' ? null : normalizeDeapiMusicNumber(timesignature, { min: 2, max: 6, fallback: null, integer: true });
             const safeVocalLanguage = 'unknown';
-            const safeWebhookUrl = String(webhook_url || '').trim() || null;
+            const safeLyricsMode = ['instrumental', 'auto-lyrics', 'lyrics'].includes(String(lyrics_mode || '').trim())
+                ? String(lyrics_mode).trim()
+                : safeLyrics === '[Instrumental]' ? 'instrumental' : 'lyrics';
 
             if (safeTimeSignature !== null && ![2, 3, 4, 6].includes(safeTimeSignature)) {
                 return res.status(400).json({ success: false, message: 'A deAPI timesignature csak 2, 3, 4 vagy 6 lehet' });
             }
-            if (safeWebhookUrl && !/^https:\/\//i.test(safeWebhookUrl)) {
-                return res.status(400).json({ success: false, message: 'A deAPI webhook_url csak HTTPS URL lehet' });
-            }
-
             const submissionPayload = {
                 caption: safeCaption,
                 model: safeModel,
@@ -2795,20 +3730,60 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
                 keyscale: safeKeyscale,
                 timesignature: safeTimeSignature,
                 vocal_language: safeVocalLanguage,
-                webhook_url: safeWebhookUrl,
             };
 
+            const deapiStartedAt = Date.now();
+            emitMusicSse({ type: 'status', status: 'SUBMITTING', progress: 4, elapsed: 0 });
             const submission = await submitDeapiTextToMusic(submissionPayload, controller.signal, referenceAudioFile);
             const requestId = submission?.data?.request_id;
             if (!requestId) {
                 throw new Error('A deAPI nem adott vissza request_id-t');
             }
 
-            const result = await pollDeapiResult(requestId, controller.signal);
-            const audioUrl = result?.result_url || result?.result || '';
+            emitMusicSse({ type: 'status', status: 'QUEUED', progress: 8, elapsed: 0, requestId });
+            const result = await pollDeapiResult(requestId, controller.signal, (event) => {
+                emitMusicSse({
+                    type: 'status',
+                    status: String(event.status || 'processing').toUpperCase(),
+                    progress: event.progress,
+                    elapsed: event.elapsed,
+                    requestId: event.requestId,
+                    predicted: Boolean(event.predicted),
+                });
+            });
+
+            const audioUrl = extractDeapiAudioUrl(result);
             if (!audioUrl) {
-                throw new Error('A deAPI nem adott vissza letölthető audio URL-t');
+                throw new Error('A deAPI nem adott vissza letoltheto audio URL-t');
             }
+            const deapiElapsed = Math.round((Date.now() - deapiStartedAt) / 1000);
+            emitMusicSse({ type: 'status', status: 'FINALIZING', progress: 96, elapsed: deapiElapsed, requestId });
+
+            const archiveItem = await persistGeneratedAudio(req.userId, audioUrl, {
+                type: 'music',
+                prompt: safeCaption,
+                caption: safeCaption,
+                lyrics: safeLyrics,
+                lyricsMode: safeLyricsMode,
+                instrumental: safeLyricsMode === 'instrumental',
+                autoLyrics: safeLyricsMode === 'auto-lyrics',
+                provider: 'deapi',
+                modelId: apiId,
+                deapiModel: safeModel,
+                duration: safeDuration,
+                inferenceSteps: safeInferenceSteps,
+                guidanceScale: safeGuidanceScale,
+                seed: safeSeed,
+                fileFormat: safeFormat,
+                bpm: safeBpm,
+                keyscale: safeKeyscale,
+                timesignature: safeTimeSignature,
+                vocalLanguage: safeVocalLanguage,
+                hasReferenceAudio: Boolean(referenceAudioFile),
+                requestId,
+                stream: false,
+                outputFormat: 'url',
+            });
 
             await logUsage(req.userId, 'music', {
                 provider: 'deapi',
@@ -2823,18 +3798,24 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
                 keyscale: safeKeyscale,
                 timesignature: safeTimeSignature,
                 vocal_language: safeVocalLanguage,
-                hasWebhook: Boolean(safeWebhookUrl),
+                hasWebhook: false,
                 hasReferenceAudio: Boolean(referenceAudioFile),
+                audioId: archiveItem?.id || null,
             });
             unregisterJob(jobId);
-            return res.json({
+            emitMusicSse({
+                type: 'done',
                 success: true,
-                audioUrl,
+                audioUrl: archiveItem ? null : audioUrl,
+                audioId: archiveItem?.id || null,
+                historyItem: archiveItem,
                 fileFormat: safeFormat,
                 outputFormat: 'url',
                 requestId,
                 stream: false,
+                elapsed: deapiElapsed,
             });
+            return res.end();
         }
 
         const safePrompt = String(prompt || '').trim();
@@ -2898,6 +3879,22 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
         const audioUrl = normalizeMiniMaxMusicAudio(rawAudio, safeFileFormat);
         if (!audioUrl) throw new Error('Nem érkezett vissza lejátszható audio a MiniMax API-tól');
 
+        const archiveItem = await persistGeneratedAudio(req.userId, audioUrl, {
+            type: 'music',
+            prompt: safePrompt || safeLyrics.slice(0, 160),
+            lyrics: safeLyrics,
+            lyricsOptimizer: safeLyricsOptimizer,
+            instrumental: safeInstrumental,
+            provider: 'minimax',
+            modelId: apiId,
+            model: apiId,
+            stream: safeStream,
+            outputFormat: safeOutputFormat,
+            sampleRate: result?.extra_info?.music_sample_rate || safeSampleRate,
+            bitrate: result?.extra_info?.bitrate || safeBitrate,
+            fileFormat: safeFileFormat,
+        });
+
         await logUsage(req.userId, 'music', {
             provider: 'minimax',
             model: apiId,
@@ -2909,11 +3906,14 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
             hasLyrics: Boolean(safeLyrics),
             lyricsOptimizer: safeLyricsOptimizer,
             instrumental: safeInstrumental,
+            audioId: archiveItem?.id || null,
         });
         unregisterJob(jobId);
         return res.json({
             success: true,
-            audioUrl,
+            audioUrl: archiveItem ? null : audioUrl,
+            audioId: archiveItem?.id || null,
+            historyItem: archiveItem,
             fileFormat: safeFileFormat,
             outputFormat: safeOutputFormat,
             sampleRate: result?.extra_info?.music_sample_rate || safeSampleRate,
@@ -2923,6 +3923,26 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
 
     } catch (err) {
         unregisterJob(req.body.jobId);
+        const clientMessage = isDeapiRateLimitError(err)
+            ? (err.message || buildDeapiRateLimitMessage(err))
+            : err.message || 'Zenegeneralasi hiba';
+        if (musicSseStarted) {
+            const message = err.name === 'AbortError'
+                ? 'Folyamat megszakitva (User/Timeout)'
+                : clientMessage;
+            emitMusicSse({ type: 'error', message });
+            return res.end();
+        }
+        if (res.headersSent) return;
+        if (err.response || err.status || err.isAxiosError) {
+            console.error('Music gen hiba:', {
+                status: err.status || err.response?.status || null,
+                code: err.code || null,
+                message: err.response?.data?.message || err.message || 'Unknown error',
+                deapiRateLimit: Boolean(isDeapiRateLimitError(err)),
+            });
+            return res.status(err.status || err.response?.status || 500).json({ success: false, message: clientMessage });
+        }
         if (err.name === 'AbortError') return res.status(408).json({ success: false, message: 'Folyamat megszakítva (User/Timeout)' });
         console.error('❌ Music gen hiba:', err);
         return res.status(500).json({ success: false, message: err.message || 'Zenegenerálási hiba' });
