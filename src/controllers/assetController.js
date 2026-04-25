@@ -79,7 +79,6 @@ export async function uploadAsset(req, res) {
     const taskId = await taskService.create({
       type: "import_model",
       file: {
-        type: ext,
         object: {
           bucket: uploadedObject.bucket,
           key: uploadedObject.key,
@@ -147,6 +146,7 @@ export async function importUploadedAsset(req, res) {
   const inputFile = req.body?.file;
   const normalizedObject = inputFile?.object;
   const fileType = String(inputFile?.type || "").trim().toLowerCase();
+  const fileSize = Number(req.body?.fileSize ?? inputFile?.fileSize ?? 0);
 
   if (!normalizedObject?.bucket || !normalizedObject?.key || !fileType) {
     res.status(400).json({
@@ -155,12 +155,19 @@ export async function importUploadedAsset(req, res) {
     });
     return;
   }
+  if (!ALLOWED_EXTENSIONS.has(fileType)) {
+    res.status(400).json({ success: false, message: `Unsupported file type. Allowed: ${[...ALLOWED_EXTENSIONS].join(", ")}` });
+    return;
+  }
+  if (Number.isFinite(fileSize) && fileSize > MAX_FILE_SIZE) {
+    res.status(400).json({ success: false, message: `File too large. Maximum size: ${MAX_FILE_SIZE / (1024 * 1024)}MB` });
+    return;
+  }
 
   try {
     const taskId = await taskService.create({
       type: "import_model",
       file: {
-        type: fileType,
         object: {
           bucket: normalizedObject.bucket,
           key: normalizedObject.key,
@@ -185,6 +192,7 @@ export async function importUploadedAsset(req, res) {
         model_version: null,
         mode: "upload",
         filename: req.body?.filename || null,
+        fileSize: Number.isFinite(fileSize) && fileSize > 0 ? fileSize : null,
         fileType,
         uploadObject: {
           bucket: normalizedObject.bucket,

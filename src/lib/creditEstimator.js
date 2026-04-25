@@ -96,9 +96,12 @@ export function estimateCost(req) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function estimateTextureCost(req) {
-  const isHD     = req.texture_quality === "HD";
+  const textureQuality = String(req.texture_quality ?? "").toLowerCase();
+  const isHD     = textureQuality === "hd" || textureQuality === "detailed";
   const base     = isHD ? (CREDIT_COSTS["texture_model:HD"] ?? 20) : (CREDIT_COSTS.texture_model ?? 10);
-  const styleRef = req.style_reference ? (CREDIT_COSTS["addon:texture_style_ref"] ?? 5) : 0;
+  const styleRef = req.style_reference || req.texture_prompt?.style_image
+    ? (CREDIT_COSTS["addon:texture_style_ref"] ?? 5)
+    : 0;
   const breakdown = { base, ...(styleRef && { style_reference: styleRef }) };
   return { total: base + styleRef, breakdown };
 }

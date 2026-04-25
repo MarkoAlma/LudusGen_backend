@@ -26,8 +26,8 @@ export function extractModelUrl(task, opts = {}) {
   if (shouldPreferTextured) {
     orderedOutputs = [
       { key: "pbr_model", value: out.pbr_model },
-      { key: "model", value: out.model },
       { key: "textured_model", value: out.textured_model },
+      { key: "model", value: out.model },
       { key: "model_url", value: out.model_url },
       { key: "base_model", value: out.base_model },
       { key: "rigged_model", value: out.rigged_model },

@@ -21,6 +21,9 @@ import { validateFaceLimit } from "../lib/enginePresets.js";
 import crypto from "crypto";
 
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
+const DETAILED_TEXTURE_MODEL_VERSION = "v3.0-20250812";
+const VALID_TEXTURE_QUALITIES = new Set(["standard", "detailed"]);
+const VALID_TEXTURE_ALIGNMENTS = new Set(["original_image", "geometry"]);
 
 function trimString(value) {
   return typeof value === "string" ? value.trim() : value;
@@ -94,6 +97,16 @@ function normalizeFileRefList(list, fallbackType = "png") {
   return list.map((item) => normalizeFileRef(item, fallbackType));
 }
 
+function normalizeTexturePromptFileRef(input) {
+  const ref = normalizeFileRef(input, "jpg");
+  return ref;
+}
+
+function normalizeTexturePromptFileRefList(list) {
+  if (!Array.isArray(list)) return [];
+  return list.map((item) => normalizeTexturePromptFileRef(item));
+}
+
 function normalizeSharedGenerationFields(body) {
   normalizeOptionalEnum(body, "compress", VALID_COMPRESS_TYPES);
   normalizeOptionalEnum(body, "orientation", VALID_IMAGE_ORIENTATIONS);
@@ -111,8 +124,47 @@ function normalizeTexturePrompt(body) {
   if (body.file && !prompt.image) prompt.image = body.file;
   if (body.files && !prompt.images) prompt.images = body.files;
 
+  if (prompt.text !== undefined) {
+    prompt.text = trimString(prompt.text);
+    if (!prompt.text) delete prompt.text;
+  }
   if (prompt.text) validatePromptLength(prompt.text, "texture_prompt.text");
-  if (Array.isArray(prompt.images) && prompt.images.length === 0) delete prompt.images;
+
+  if (prompt.text && prompt.image && !prompt.style_image) {
+    prompt.style_image = prompt.image;
+    delete prompt.image;
+  }
+  const hasText = Boolean(prompt.text);
+  const hasImage = Boolean(prompt.image);
+  const hasImages = Array.isArray(prompt.images) && prompt.images.some(Boolean);
+  if ([hasText, hasImage, hasImages].filter(Boolean).length > 1) {
+    throw new Error("texture_prompt must include only one of text, image, or images");
+  }
+
+  if (prompt.image) prompt.image = normalizeTexturePromptFileRef(prompt.image);
+  if (prompt.style_image) prompt.style_image = normalizeTexturePromptFileRef(prompt.style_image);
+  if (Array.isArray(prompt.images)) {
+    if (prompt.images.length === 0) {
+      delete prompt.images;
+    } else {
+      if (prompt.images.length !== 4) {
+        throw new Error("texture_prompt.images must contain exactly 4 views in order: front, left, back, right");
+      }
+      prompt.images = prompt.images.map((item, index) => {
+        try {
+          return normalizeTexturePromptFileRef(item);
+        } catch (err) {
+          throw new Error(`texture_prompt.images[${index}] ${err.message}`);
+        }
+      });
+      if (!prompt.images[0]) {
+        throw new Error("texture_prompt.images[0] front view is required");
+      }
+      if (prompt.images.filter(Boolean).length < 2) {
+        throw new Error("texture_prompt.images requires at least two uploaded views");
+      }
+    }
+  }
 
   delete body.prompt;
   delete body.negative_prompt;
@@ -126,16 +178,32 @@ function normalizeTexturePrompt(body) {
 function normalizeTextureModelBody(body) {
   normalizeTexturePrompt(body);
 
-  const mv = body.model_version ?? DEFAULT_MODEL;
+  const qualityInput = String(body.texture_quality ?? "standard").trim();
+  body.texture_quality = qualityInput === "HD" ? "detailed" : qualityInput;
+  if (!VALID_TEXTURE_QUALITIES.has(body.texture_quality)) {
+    body.texture_quality = "standard";
+  }
+
+  const mv = body.model_version ?? (body.texture_quality === "detailed" ? DETAILED_TEXTURE_MODEL_VERSION : DEFAULT_MODEL);
   if (!VALID_TEXTURE_MODEL_VERSIONS.has(mv)) {
     throw new Error(`Invalid texture model_version "${mv}". Valid: ${[...VALID_TEXTURE_MODEL_VERSIONS].join(", ")}`);
   }
+  if (body.texture_quality === "detailed" && mv !== DETAILED_TEXTURE_MODEL_VERSION) {
+    throw new Error(`texture_quality "detailed" requires model_version "${DETAILED_TEXTURE_MODEL_VERSION}"`);
+  }
   body.model_version = mv;
 
-  if (!["standard", "detailed"].includes(body.texture_quality)) {
-    body.texture_quality = "standard";
+  if (body.texture !== undefined) {
+    body.texture = normalizeBoolean(body.texture, true);
   }
-  if (!body.pbr) delete body.pbr;
+  if (body.pbr !== undefined) {
+    body.pbr = normalizeBoolean(body.pbr, true);
+  }
+  if (body.texture_quality === "standard" && body.texture === false && body.pbr === false) {
+    throw new Error('texture_quality "standard" cannot be used with texture=false and pbr=false');
+  }
+
+  normalizeOptionalEnum(body, "texture_alignment", VALID_TEXTURE_ALIGNMENTS);
 
   if (body.compress !== undefined) {
     const compress = String(body.compress ?? "").trim();
@@ -156,6 +224,8 @@ function normalizeTextureModelBody(body) {
 
   if (body.bake === undefined) delete body.bake;
   else body.bake = body.bake === true || body.bake === "true";
+
+  delete body._sourceName;
 }
 
 function extractTaskError(task = {}) {
@@ -633,6 +703,11 @@ class TaskService {
           throw new Error("file required for import_model");
         if (!b["file"].object && !b["file"].file_token && !b["file"].url)
           throw new Error("file.object, file.file_token, or file.url required for import_model");
+        if (b["file"].object) {
+          const { bucket, key } = b["file"].object;
+          if (!bucket || !key) throw new Error("file.object.bucket and file.object.key required for import_model");
+          b["file"] = { object: { bucket, key } };
+        }
         break;
 
       case "texture_edit":

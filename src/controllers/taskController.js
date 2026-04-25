@@ -17,6 +17,7 @@ const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
 const HISTORY_COLLECTION = "tripo_history";
 const REFINE_DIRECT_SOURCE_TYPES = new Set(["text_to_model", "image_to_model", "multiview_to_model"]);
 const REFINE_UPSTREAM_SOURCE_TYPES = new Set(["texture_model", "convert_model", "smart_low_poly", "stylize_model", "mesh_segmentation", "mesh_completion"]);
+const TEXTURE_DIRECT_SOURCE_TYPES = new Set(["text_to_model", "image_to_model", "multiview_to_model", "texture_model", "import_model"]);
 
 function getHistoryModelVersion(data) {
   return data?.params?.model_version ||
@@ -146,6 +147,8 @@ export async function createTask(req, res) {
   const userId = req.user?.uid;
   let estimatedCost = 0;
   let creditsDeducted = false;
+  let tempTxId = null;
+  let tripoTaskCreated = false;
 
   try {
     let body = { type, ...rest };
@@ -189,10 +192,7 @@ export async function createTask(req, res) {
           sourceTask?.input?.original_model_id ??
           sourceTask?.input?.original_model_task_id ??
           null;
-        if (
-          upstreamId &&
-          (sourceType === "convert_model" || sourceType === "smart_low_poly")
-        ) {
+        if (upstreamId && sourceType && !TEXTURE_DIRECT_SOURCE_TYPES.has(sourceType)) {
           console.log(`[TaskController][texture-source] Rewriting texture source ${body.original_model_task_id} (${sourceType}) -> ${upstreamId}`);
           body.original_model_task_id = upstreamId;
         }
@@ -279,12 +279,12 @@ export async function createTask(req, res) {
     }
 
     // Estimate credit cost for this task
+    taskService.validate(body);
     const estimateResult = estimateCost(body);
     estimatedCost = estimateResult.total;
     console.log(`[TaskController][create] type=${body.type} model=${body.model_version} base_cost=${estimateResult.breakdown.base} tex_addon=${estimateResult.breakdown.texture || 0} total_cost=${estimatedCost}`);
     console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"} cost=${estimatedCost}`);
 
-    let tempTxId = null;
     if (estimatedCost > 0 && userId) {
       tempTxId = `pending_${type}_${Date.now()}`;
       try {
@@ -519,6 +519,7 @@ export async function createTask(req, res) {
             callbackUrl: callback_url,
             idempotencyKey: uuid(),
           });
+          tripoTaskCreated = true;
           
           if (userId && tempTxId) {
             linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
@@ -539,6 +540,7 @@ export async function createTask(req, res) {
           callbackUrl: callback_url,
           idempotencyKey: idempotency_key,
         });
+        tripoTaskCreated = true;
 
         // Link real taskId to credit transaction for refunds
         if (userId && tempTxId) {
@@ -568,16 +570,21 @@ export async function createTask(req, res) {
       error: err.message,
     });
 
+    const refundDeductedCredits = async (reason) => {
+      if (!userId || estimatedCost <= 0 || !creditsDeducted || !tempTxId || tripoTaskCreated) return;
+      try {
+        await refundCredits(userId, estimatedCost, tempTxId, reason);
+        creditsDeducted = false;
+      } catch (refundErr) {
+        console.error(`[TaskController] Refund error (${reason}):`, refundErr.message);
+      }
+    };
+
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
       if (userId && estimatedCost > 0 && creditsDeducted) {
         console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
-        try {
-          await refundCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, "tripo_403_insufficient_credit");
-          creditsDeducted = false;
-        } catch (refundErr) {
-          console.error(`[TaskController] Refund error:`, refundErr.message);
-        }
+        await refundDeductedCredits("tripo_403_insufficient_credit");
       }
     }
 
@@ -585,15 +592,20 @@ export async function createTask(req, res) {
     let userMessage = err.message;
     if (type === "refine_model" && err.message?.includes("1004")) {
       if (userId && estimatedCost > 0 && creditsDeducted) {
-        try {
-          await refundCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, "refine_no_draft_output");
-          creditsDeducted = false;
-        } catch (refundErr) {
-          console.error(`[TaskController] Refund error (refine 1004):`, refundErr.message);
-        }
+        await refundDeductedCredits("refine_no_draft_output");
       }
       userMessage = "Ez a modell nem finomítható. A Refine csak textúra nélkül generált (draft) modelleknél működik. Generálj új modellt textúra nélkül, majd alkalmazd rá a Refine-t.";
     }
+
+    if (type === "texture_model" && err.message?.startsWith("Invalid texture model_version")) {
+      userMessage = "Ez a texture modellverzio jelenleg nem tamogatott. Valassz V3.0, V2.5 vagy V2.0 texture modellt, majd probald ujra.";
+    } else if (type === "texture_model" && err.message?.includes('texture_quality "detailed" requires')) {
+      userMessage = "A 4K/detailed texture csak V3.0 texture modellel futtathato. Kapcsold V3.0-ra, majd probald ujra.";
+    } else if (type === "texture_model" && err.code === 1004) {
+      userMessage = "A Tripo nem fogadta el a texture pass parametereit. Ellenorizd a texture targetet es a referencia kepet, majd probald ujra.";
+    }
+
+    await refundDeductedCredits(type === "texture_model" ? "texture_model_create_failed" : "tripo_create_failed");
 
     res.status(400).json(errorPayload(err, userMessage));
   }
