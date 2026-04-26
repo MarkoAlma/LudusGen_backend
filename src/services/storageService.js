@@ -75,6 +75,53 @@ class StorageService {
   }
 
   /**
+   * Generate a signed download URL with attachment headers.
+   * @param {string} key
+   * @param {string} filename
+   * @param {number} [expiresIn]
+   */
+  async getSignedDownloadUrl(key, filename, expiresIn) {
+    try {
+      const command = new GetObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        ResponseContentDisposition: `attachment; filename="${String(filename || key.split("/").pop()).replace(/"/g, "")}"`,
+      });
+      return await getSignedUrl(this.client, command, { expiresIn: expiresIn || this.ttl });
+    } catch (err) {
+      console.error(`[StorageService] Download URL failed for ${key}:`, err.message);
+      return null;
+    }
+  }
+
+  /**
+   * Read a B2 object into memory.
+   * @param {string} key
+   * @returns {Promise<Buffer>}
+   */
+  async getFileBuffer(key) {
+    try {
+      const data = await this.client.send(new GetObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+      }));
+
+      if (data.Body?.transformToByteArray) {
+        return Buffer.from(await data.Body.transformToByteArray());
+      }
+
+      const chunks = [];
+      for await (const chunk of data.Body) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return Buffer.concat(chunks);
+    } catch (err) {
+      console.error(`[StorageService] Read failed for ${key}:`, err.message);
+      throw err;
+    }
+  }
+
+  /**
    * Delete an object from B2.
    * @param {string} key
    */

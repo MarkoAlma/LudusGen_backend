@@ -81,6 +81,7 @@ function toMillis(value) {
 
 function getHistoryExpiryMillis(data) {
   if (!data || typeof data !== "object") return null;
+  if (data.marketplaceLocked === true || data.marketplaceAssetId) return null;
   const explicitExpiry = toMillis(data.expiresAt);
   if (explicitExpiry != null) return explicitExpiry;
 
@@ -1238,6 +1239,7 @@ export async function cleanupExpiredHistory(req, res) {
       .get();
 
     const expiredDocs = snap.docs.filter((doc) => {
+      if (doc.data()?.marketplaceLocked === true || doc.data()?.marketplaceAssetId) return false;
       const expiresAt = getHistoryExpiryMillis(doc.data());
       return expiresAt != null && expiresAt <= now;
     });

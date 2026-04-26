@@ -12,6 +12,7 @@ import { v2 as cloudinary } from "cloudinary";
 
 import aiRoutes from './ai-routes.js';
 import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
+import { createMarketplaceRouter } from './src/routes/marketplace.routes.js';
 import { createTripoRouter } from './src/routes/tripo.routes.js';
 import { startTaskRecovery, stopTaskRecovery } from './src/services/taskRecoveryService.js';
 
@@ -34,6 +35,7 @@ app.use("/api/tripo/webhook", express.raw({
 
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/api', aiRoutes);     // Add routes after middlewares
+app.use('/api', createMarketplaceRouter(verifyFirebaseToken));
 
 // ==================== CLOUDINARY CONFIG ====================
 

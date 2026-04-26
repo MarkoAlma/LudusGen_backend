@@ -2576,7 +2576,25 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, async (req, res)
         }
 
         await logUsage(req.userId, 'tts', { provider, model, chars: text.length });
-        return res.json({ success: true, audioUrl });
+        const savedAudio = await persistAudioToHistory(req.userId, audioUrl, {
+            type: 'tts',
+            title: text.trim().slice(0, 80) || 'Text to speech',
+            prompt: text.trim(),
+            provider,
+            model,
+            fileFormat: provider === 'nvidia-riva' ? 'wav' : safeFormat,
+        }).catch((err) => {
+            console.warn('[AudioHistory] TTS persist failed:', err.message);
+            return null;
+        });
+        return res.json({
+            success: true,
+            audioUrl,
+            audioId: savedAudio?.id || null,
+            fileFormat: savedAudio?.fileFormat || (provider === 'nvidia-riva' ? 'wav' : safeFormat),
+            outputFormat: savedAudio ? 'history' : 'data',
+            audio: savedAudio,
+        });
 
     } catch (err) {
         console.error('❌ TTS hiba:', err);
@@ -2611,7 +2629,26 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, async (req, re
 
         if (!audioUrl) throw new Error('Nem érkezett audio URL');
         await logUsage(req.userId, 'music', { apiId, duration: safeDuration });
-        return res.json({ success: true, audioUrl });
+        const savedAudio = await persistAudioToHistory(req.userId, audioUrl, {
+            type: 'music',
+            title: prompt.trim().slice(0, 80) || 'Generated music',
+            prompt: fullPrompt,
+            provider: 'fal.ai',
+            model: apiId,
+            duration: safeDuration,
+            fileFormat: 'mp3',
+        }).catch((err) => {
+            console.warn('[AudioHistory] Music persist failed:', err.message);
+            return null;
+        });
+        return res.json({
+            success: true,
+            audioUrl,
+            audioId: savedAudio?.id || null,
+            fileFormat: savedAudio?.fileFormat || 'mp3',
+            outputFormat: savedAudio ? 'history' : 'url',
+            audio: savedAudio,
+        });
 
     } catch (err) {
         console.error('❌ Music gen hiba:', err);
@@ -2839,6 +2876,172 @@ async function deleteFromB2(key) {
         return false;
     }
 }
+
+const AUDIO_MIME_EXT = {
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/ogg': 'ogg',
+    'audio/aac': 'aac',
+    'audio/flac': 'flac',
+    'audio/mp4': 'm4a',
+};
+
+function safeAudioName(name = 'ludusgen_audio') {
+    return String(name || 'ludusgen_audio')
+        .replace(/[^\w.\-]+/g, '_')
+        .replace(/_+/g, '_')
+        .slice(0, 120);
+}
+
+function parseDataAudioUrl(audioUrl) {
+    const match = String(audioUrl || '').match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/);
+    if (!match) return null;
+    const contentType = match[1] || 'audio/mpeg';
+    return {
+        buffer: Buffer.from(match[2], 'base64'),
+        contentType,
+    };
+}
+
+function audioExtFrom(contentType, fallback = 'mp3') {
+    const clean = String(contentType || '').split(';')[0].trim().toLowerCase();
+    return AUDIO_MIME_EXT[clean] || fallback;
+}
+
+async function loadAudioBuffer(audioUrl, req = null) {
+    const dataAudio = parseDataAudioUrl(audioUrl);
+    if (dataAudio) return dataAudio;
+
+    let targetUrl = String(audioUrl || '');
+    if (targetUrl.startsWith('/api/')) {
+        const host = req?.get?.('host') || `localhost:${process.env.PORT || 3001}`;
+        targetUrl = `${req?.protocol || 'http'}://${host}${targetUrl}`;
+    }
+    if (!/^https?:\/\//.test(targetUrl)) {
+        throw new Error('Nem tamogatott audio URL');
+    }
+
+    const response = await axios.get(targetUrl, {
+        responseType: 'arraybuffer',
+        timeout: 90_000,
+        headers: {
+            ...(req?.headers?.authorization ? { Authorization: req.headers.authorization } : {}),
+            'User-Agent': 'LudusGen-AudioHistory/1.0',
+        },
+    });
+    return {
+        buffer: Buffer.from(response.data),
+        contentType: response.headers['content-type'] || 'audio/mpeg',
+    };
+}
+
+async function persistAudioToHistory(userId, audioUrl, metadata = {}) {
+    if (!userId || !audioUrl) return null;
+
+    const { buffer, contentType } = await loadAudioBuffer(audioUrl);
+    const fileFormat = String(metadata.fileFormat || audioExtFrom(contentType)).replace(/^\./, '').toLowerCase();
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const fileName = `${safeAudioName(metadata.title || metadata.type || 'ludusgen_audio')}_${id}.${fileFormat}`;
+    const storageKey = `users/${userId}/audio/${fileName}`;
+
+    await uploadMediaToB2(buffer, storageKey, contentType);
+
+    const docRef = await admin.firestore().collection('audio_history').add({
+        userId,
+        type: metadata.type || 'audio',
+        title: metadata.title || 'LudusGen audio',
+        prompt: metadata.prompt || '',
+        provider: metadata.provider || '',
+        model: metadata.model || '',
+        duration: metadata.duration || null,
+        storageKey,
+        fileName,
+        fileFormat,
+        contentType,
+        size: buffer.length,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        ts: Date.now(),
+    });
+
+    return {
+        id: docRef.id,
+        storageKey,
+        fileName,
+        fileFormat,
+        contentType,
+        size: buffer.length,
+    };
+}
+
+async function streamAudioB2Key(key, filename, contentType, res, disposition = 'inline') {
+    const cmd = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key });
+    const data = await b2.send(cmd);
+    res.setHeader('Content-Type', contentType || 'audio/mpeg');
+    res.setHeader('Content-Disposition', `${disposition}; filename="${safeAudioName(filename || key.split('/').pop())}"`);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    data.Body.pipe(res);
+}
+
+router.get('/audio/history', verifyFirebaseToken, async (req, res) => {
+    try {
+        const snap = await admin.firestore()
+            .collection('audio_history')
+            .where('userId', '==', req.userId)
+            .orderBy('createdAt', 'desc')
+            .limit(100)
+            .get();
+
+        const items = await Promise.all(snap.docs.map(async (doc) => {
+            const data = doc.data();
+            const fileUrl = data.storageKey
+                ? await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.storageKey }), { expiresIn: 3600 })
+                : null;
+            return {
+                id: doc.id,
+                ...data,
+                fileUrl,
+                audioUrl: fileUrl,
+                createdAt: data.createdAt?.toDate?.() || new Date(data.ts || Date.now()),
+            };
+        }));
+
+        res.json({ success: true, items });
+    } catch (err) {
+        console.error('[AudioHistory] list error:', err);
+        res.status(500).json({ success: false, message: 'Audio archivum betoltese sikertelen' });
+    }
+});
+
+router.get('/audio/history/:audioId/file', verifyFirebaseToken, async (req, res) => {
+    try {
+        const doc = await admin.firestore().collection('audio_history').doc(req.params.audioId).get();
+        if (!doc.exists) return res.status(404).json({ success: false, message: 'Audio nem talalhato' });
+        const data = doc.data();
+        if (data.userId !== req.userId) return res.status(403).json({ success: false, message: 'Nincs jogosultsag' });
+        if (!data.storageKey) return res.status(404).json({ success: false, message: 'Audio fajl nem talalhato' });
+        await streamAudioB2Key(data.storageKey, data.fileName || `${doc.id}.${data.fileFormat || 'mp3'}`, data.contentType || 'audio/mpeg', res, 'inline');
+    } catch (err) {
+        console.error('[AudioHistory] file error:', err);
+        if (!res.headersSent) res.status(500).json({ success: false, message: 'Audio fajl betoltese sikertelen' });
+    }
+});
+
+router.post('/audio/download', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { audioUrl, filename = 'ludusgen_audio.mp3' } = req.body || {};
+        if (!audioUrl) return res.status(400).json({ success: false, message: 'Hianyzo audio URL' });
+        const { buffer, contentType } = await loadAudioBuffer(audioUrl, req);
+        res.setHeader('Content-Type', contentType || 'audio/mpeg');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeAudioName(filename)}"`);
+        res.setHeader('Cache-Control', 'private, max-age=60');
+        res.send(buffer);
+    } catch (err) {
+        console.error('[AudioDownload] error:', err);
+        res.status(500).json({ success: false, message: err.message || 'Audio letoltes sikertelen' });
+    }
+});
 
 router.get('/trellis/model/:filename', verifyFirebaseToken, async (req, res) => {
     const key = `trellis/${req.params.filename}`;
