@@ -1,10 +1,14 @@
 // src/config/tripo.config.js
 
 export const TRIPO_BASE_URL  = "https://api.tripo3d.ai/v2/openapi";
-export const DEFAULT_MODEL   = "P1-20260311";
+export const DEFAULT_MODEL   = "v2.5-20250123";
 export const DEFAULT_TIMEOUT = 30_000;
 export const MAX_POLL_MS     = 600_000;
 export const POLL_INTERVAL   = 4_000;
+export const TRIPO_PROMPT_MAX_LENGTH = 1024;
+export const TRIPO_NEGATIVE_PROMPT_MAX_LENGTH = 255;
+export const TRIPO_IMAGE_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+export const TRIPO_MODEL_IMPORT_MAX_BYTES = 150 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VALID SETS
@@ -52,9 +56,32 @@ export const VALID_ANIMATIONS = new Set([
   "wave_goodbye_01", "wave_goodbye_02",
 ]);
 
-export const VALID_STYLES = new Set([
+export const VALID_GENERATION_STYLES = new Set([
+  "person:person2cartoon",
+  "animal:venom",
+  "object:clay",
+  "object:steampunk",
+  "object:christmas",
+  "object:barbie",
+  "gold",
+  "ancient_bronze",
+]);
+
+export const VALID_STYLIZE_STYLES = new Set([
   "lego", "voxel", "voronoi", "minecraft",
 ]);
+
+export const VALID_STYLES = VALID_STYLIZE_STYLES;
+
+export const VALID_TEXTURE_MODEL_VERSIONS = new Set([
+  "v3.0-20250812",
+  "v2.5-20250123",
+  "v2.0-20240919",
+]);
+
+export const VALID_COMPRESS_TYPES = new Set(["", "geometry"]);
+export const VALID_IMAGE_ORIENTATIONS = new Set(["", "default", "portrait", "landscape", "square"]);
+export const VALID_MULTIVIEW_IMAGE_MODES = new Set(["", "concept", "orthographic", "character", "product"]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RETRY CONFIG
@@ -153,6 +180,9 @@ export const CREDIT_COSTS = {
 
   import_model:                0,
   text_to_image:               5,
+  generate_image:              5,
+  generate_multiview_image:   10,
+  edit_multiview_image:       10,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

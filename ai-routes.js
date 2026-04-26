@@ -1,6 +1,6 @@
 import express from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
+import OpenAI, { toFile } from 'openai';
 import { fal } from '@fal-ai/client';
 import admin from 'firebase-admin';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
@@ -28,6 +28,8 @@ import {
     SUMMARY_TRIGGER_COUNT,
     trimToContextLimit,
 } from './src/lib/contextBuilder.js';
+import { storageService } from './src/services/storageService.js';
+import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
 
 import { registerJob, unregisterJob, activeJobs } from './src/lib/jobRegistry.js';
 
@@ -123,28 +125,6 @@ REQUIRED_KEYS.forEach((key) => {
 });
 
 const activeStreams = new Map();
-
-// ── Firebase Auth middleware ──────────────────────────────────────────────────
-const verifyFirebaseToken = async (req, res, next) => {
-    try {
-        const token = req.headers.authorization?.split('Bearer ')[1];
-        if (!token) return res.status(401).json({ success: false, message: 'Nincs autentikációs token' });
-
-        const decoded = await admin.auth().verifyIdToken(token);
-        const user = await admin.auth().getUser(decoded.uid);
-
-        if (!user.emailVerified) {
-            return res.status(403).json({ success: false, message: 'Email nincs megerősítve' });
-        }
-
-        req.userId = decoded.uid;
-        req.userEmail = decoded.email;
-        req.user = { uid: decoded.uid, email: decoded.email };
-        next();
-    } catch {
-        return res.status(401).json({ success: false, message: 'Érvénytelen token' });
-    }
-};
 
 // ── Job Registry for Cancellation & Timeouts (Moved to src/lib/jobRegistry.js) ──
 
@@ -1805,6 +1785,360 @@ function snapToKontextResolution(origW, origH) {
     return { w: best[0], h: best[1] };
 }
 
+function parseImageDataUrl(dataUrl, fieldName) {
+    if (typeof dataUrl !== 'string') {
+        throw new Error(`${fieldName} must be a data URL`);
+    }
+    const match = /^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=]+)$/i.exec(dataUrl);
+    if (!match) {
+        throw new Error(`${fieldName} must be a base64 PNG, JPG, or WebP data URL`);
+    }
+    const mime = match[1].toLowerCase().replace('image/jpg', 'image/jpeg');
+    const buffer = Buffer.from(match[2], 'base64');
+    if (!buffer.length) {
+        throw new Error(`${fieldName} is empty`);
+    }
+    return { mime, buffer };
+}
+
+function clampTextureEditDimension(value, fallback = 1024) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return Math.max(512, Math.min(2048, Math.round(n / 16) * 16));
+}
+
+function getOpenAITextureEditSize(model, width, height) {
+    if (String(model || '').startsWith('gpt-image-2')) {
+        return `${width}x${height}`;
+    }
+    if (Math.abs(width - height) <= 16) return '1024x1024';
+    return width > height ? '1536x1024' : '1024x1536';
+}
+
+async function getSelectionAlphaFromMask(maskPng, width, height) {
+    const { data } = await sharp(maskPng)
+        .resize(width, height, { fit: 'fill', kernel: 'nearest' })
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+    const alpha = Buffer.alloc(width * height);
+    for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+        const selected = 255 - data[i + 3];
+        alpha[p] = selected > 8 ? 255 : 0;
+    }
+    return alpha;
+}
+
+async function createTexturePaintGuide(basePng, selectionAlpha, width, height) {
+    const overlay = Buffer.alloc(width * height * 4);
+    for (let p = 0, i = 0; p < selectionAlpha.length; p += 1, i += 4) {
+        overlay[i] = 139;
+        overlay[i + 1] = 92;
+        overlay[i + 2] = 246;
+        overlay[i + 3] = selectionAlpha[p] ? 190 : 0;
+    }
+    const overlayPng = await sharp(overlay, { raw: { width, height, channels: 4 } })
+        .png({ compressionLevel: 6 })
+        .toBuffer();
+
+    return sharp(basePng)
+        .resize(width, height, { fit: 'fill', kernel: 'lanczos3' })
+        .composite([{ input: overlayPng, blend: 'over' }])
+        .png({ compressionLevel: 6 })
+        .toBuffer();
+}
+
+async function blendEditedTextureIntoSelection(basePng, editedPng, selectionAlpha, width, height) {
+    const base = await sharp(basePng)
+        .resize(width, height, { fit: 'fill', kernel: 'lanczos3' })
+        .ensureAlpha()
+        .raw()
+        .toBuffer();
+    const edited = await sharp(editedPng)
+        .resize(width, height, { fit: 'fill', kernel: 'lanczos3' })
+        .ensureAlpha()
+        .raw()
+        .toBuffer();
+
+    const out = Buffer.alloc(base.length);
+    for (let p = 0, i = 0; p < selectionAlpha.length; p += 1, i += 4) {
+        const a = selectionAlpha[p] / 255;
+        const inv = 1 - a;
+        out[i] = Math.round(base[i] * inv + edited[i] * a);
+        out[i + 1] = Math.round(base[i + 1] * inv + edited[i + 1] * a);
+        out[i + 2] = Math.round(base[i + 2] * inv + edited[i + 2] * a);
+        out[i + 3] = base[i + 3];
+    }
+
+    return sharp(out, { raw: { width, height, channels: 4 } })
+        .png({ compressionLevel: 6 })
+        .toBuffer();
+}
+
+async function uploadModelScopeTextureInput(buffer, req, label, tempB2Keys) {
+    const filename = `texture_paint_${Date.now()}_${label}_${req.userId.slice(0, 8)}.png`;
+    const tempKey = `temp_edit/${filename}`;
+    tempB2Keys.push(tempKey);
+
+    await b2.send(new PutObjectCommand({
+        Bucket: process.env.B2_BUCKET_NAME,
+        Key: tempKey,
+        Body: buffer,
+        ContentType: 'image/png',
+    }));
+
+    return getSignedUrl(
+        b2,
+        new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: tempKey }),
+        { expiresIn: 600 },
+    );
+}
+
+async function runModelScopeTexturePaintEdit({ req, basePng, maskPng, cleanPrompt, width, height }) {
+    if (!process.env.MODELSCOPE_API_KEY) {
+        throw new Error('MODELSCOPE_API_KEY nincs beállítva.');
+    }
+
+    const tempB2Keys = [];
+    const cleanup = async () => {
+        for (const key of tempB2Keys) {
+            try { await b2.send(new DeleteObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key })); } catch { }
+        }
+    };
+
+    try {
+        const selectionAlpha = await getSelectionAlphaFromMask(maskPng, width, height);
+        if (!selectionAlpha.some((value) => value > 0)) {
+            throw new Error('A festési maszk üres.');
+        }
+
+        const guidePng = await createTexturePaintGuide(basePng, selectionAlpha, width, height);
+        const guideUrl = await uploadModelScopeTextureInput(guidePng, req, 'guide', tempB2Keys);
+        const apiId = process.env.MODELSCOPE_TEXTURE_EDIT_MODEL || 'Qwen/Qwen-Image-Edit-2511';
+        const texturePrompt = [
+            'This is a UV texture map for a 3D model.',
+            'The purple painted guide marks show the exact area to replace.',
+            'Edit only those purple marked pixels according to the instruction.',
+            'Return a clean UV texture map without purple guide paint, borders, labels, new UV islands, or global restyling.',
+            'Keep every unmarked area visually unchanged.',
+            `Instruction: ${cleanPrompt}`,
+        ].join(' ');
+
+        const genResp = await fetch('https://api-inference.modelscope.ai/v1/images/generations', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${process.env.MODELSCOPE_API_KEY}`,
+                'Content-Type': 'application/json',
+                'X-ModelScope-Async-Mode': 'true',
+            },
+            body: JSON.stringify({
+                model: apiId,
+                prompt: texturePrompt,
+                steps: 28,
+                guidance: 4.5,
+                image_url: [guideUrl],
+            }),
+            signal: AbortSignal.timeout(30000),
+        });
+
+        const genData = await genResp.json();
+        if (!genResp.ok) {
+            throw new Error(`ModelScope hiba: ${JSON.stringify(genData?.errors || genData).slice(0, 240)}`);
+        }
+
+        let outputUrl = genData.output_images?.[0] || null;
+        const taskId = genData.task_id || null;
+        if (!outputUrl && !taskId) {
+            throw new Error('ModelScope: ismeretlen válasz.');
+        }
+
+        if (!outputUrl) {
+            for (let i = 0; i < 150; i += 1) {
+                await new Promise((resolve) => setTimeout(resolve, i === 0 ? 2000 : 3000));
+                const pollResp = await fetch(`https://api-inference.modelscope.ai/v1/tasks/${taskId}`, {
+                    headers: {
+                        Authorization: `Bearer ${process.env.MODELSCOPE_API_KEY}`,
+                        'X-ModelScope-Task-Type': 'image_generation',
+                    },
+                    signal: AbortSignal.timeout(15000),
+                });
+                const pollData = await pollResp.json();
+                const status = pollData?.task_status;
+                if (status === 'SUCCEED') {
+                    outputUrl = pollData?.output_images?.[0] || null;
+                    break;
+                }
+                if (status === 'FAILED') {
+                    throw new Error('ModelScope texture edit sikertelen.');
+                }
+            }
+        }
+
+        if (!outputUrl) {
+            throw new Error('ModelScope texture edit időtúllépés.');
+        }
+
+        const editedResponse = await fetch(outputUrl, { signal: AbortSignal.timeout(60000) });
+        if (!editedResponse.ok) {
+            throw new Error(`ModelScope output letöltése sikertelen: ${editedResponse.status}`);
+        }
+        const editedBuffer = Buffer.from(await editedResponse.arrayBuffer());
+        const finalPng = await blendEditedTextureIntoSelection(basePng, editedBuffer, selectionAlpha, width, height);
+
+        await logUsage(req.userId, 'image', {
+            provider: 'modelscope',
+            apiId,
+            purpose: 'texture-paint-edit',
+            width,
+            height,
+        });
+
+        return {
+            image: `data:image/png;base64,${finalPng.toString('base64')}`,
+            model: apiId,
+            provider: 'modelscope',
+        };
+    } finally {
+        await cleanup();
+    }
+}
+
+router.post('/texture-paint-edit', verifyFirebaseToken, imageLimiter, async (req, res) => {
+    try {
+        const {
+            prompt,
+            base_texture,
+            mask_texture,
+            width: rawWidth,
+            height: rawHeight,
+        } = req.body || {};
+
+        const cleanPrompt = String(prompt || '').trim();
+        if (!cleanPrompt) {
+            return res.status(400).json({ success: false, message: 'Hiányzó texture edit prompt.' });
+        }
+        if (cleanPrompt.length > 1800) {
+            return res.status(400).json({ success: false, message: 'A texture edit prompt túl hosszú.' });
+        }
+
+        const base = parseImageDataUrl(base_texture, 'base_texture');
+        const mask = parseImageDataUrl(mask_texture, 'mask_texture');
+        const baseMeta = await sharp(base.buffer).metadata();
+        const targetWidth = clampTextureEditDimension(rawWidth || baseMeta.width || 1024);
+        const targetHeight = clampTextureEditDimension(rawHeight || baseMeta.height || 1024);
+
+        const basePng = await sharp(base.buffer)
+            .resize(targetWidth, targetHeight, { fit: 'fill', kernel: 'lanczos3' })
+            .ensureAlpha()
+            .png({ compressionLevel: 6 })
+            .toBuffer();
+
+        const maskPng = await sharp(mask.buffer)
+            .resize(targetWidth, targetHeight, { fit: 'fill', kernel: 'nearest' })
+            .ensureAlpha()
+            .png({ compressionLevel: 6 })
+            .toBuffer();
+
+        const provider = String(process.env.TEXTURE_PAINT_EDIT_PROVIDER || 'modelscope').toLowerCase();
+        if (provider !== 'openai') {
+            const result = await runModelScopeTexturePaintEdit({
+                req,
+                basePng,
+                maskPng,
+                cleanPrompt,
+                width: targetWidth,
+                height: targetHeight,
+            });
+            processImageAndUpload(req.userId, result.image, {
+                prompt: cleanPrompt,
+                modelId: result.model,
+                provider: 'modelscope-texture-paint',
+                aspect_ratio: `${targetWidth}:${targetHeight}`,
+                width: targetWidth,
+                height: targetHeight,
+            });
+            return res.json({
+                success: true,
+                image: result.image,
+                width: targetWidth,
+                height: targetHeight,
+                model: result.model,
+                provider: result.provider,
+            });
+        }
+
+        if (!process.env.OPENAI_API_KEY) {
+            return res.status(500).json({ success: false, message: 'OPENAI_API_KEY nincs beállítva.' });
+        }
+
+        const model = process.env.OPENAI_TEXTURE_EDIT_MODEL || 'gpt-image-2';
+        const texturePrompt = [
+            'Edit this UV texture map for a 3D model.',
+            'The transparent region of the mask is the user-painted area to edit.',
+            'Only modify that masked area. Preserve all opaque-mask pixels, UV islands, seams, colors, lighting, and texture details as much as possible.',
+            'Do not add borders, labels, frames, extra UV islands, or unrelated global style changes.',
+            `User instruction: ${cleanPrompt}`,
+        ].join(' ');
+
+        const editRequest = {
+            model,
+            image: await toFile(basePng, 'base-texture.png', { type: 'image/png' }),
+            mask: await toFile(maskPng, 'paint-mask.png', { type: 'image/png' }),
+            prompt: texturePrompt,
+            n: 1,
+            size: getOpenAITextureEditSize(model, targetWidth, targetHeight),
+            output_format: 'png',
+        };
+
+        if (!String(model).startsWith('gpt-image-2')) {
+            editRequest.quality = 'medium';
+            editRequest.input_fidelity = 'high';
+        }
+
+        const result = await openai.images.edit(editRequest);
+        const imageBase64 = result?.data?.[0]?.b64_json;
+        if (!imageBase64) {
+            throw new Error('Az OpenAI image edit nem adott vissza képet.');
+        }
+
+        const outputBuffer = Buffer.from(imageBase64, 'base64');
+        const restored = await sharp(outputBuffer)
+            .resize(targetWidth, targetHeight, { fit: 'fill', kernel: 'lanczos3' })
+            .png({ compressionLevel: 6 })
+            .toBuffer();
+
+        const image = `data:image/png;base64,${restored.toString('base64')}`;
+        await logUsage(req.userId, 'image', {
+            provider: 'openai',
+            apiId: model,
+            purpose: 'texture-paint-edit',
+            width: targetWidth,
+            height: targetHeight,
+        });
+        processImageAndUpload(req.userId, image, {
+            prompt: cleanPrompt,
+            modelId: model,
+            provider: 'openai-texture-paint',
+            aspect_ratio: `${targetWidth}:${targetHeight}`,
+            width: targetWidth,
+            height: targetHeight,
+        });
+
+        return res.json({
+            success: true,
+            image,
+            width: targetWidth,
+            height: targetHeight,
+            model,
+        });
+    } catch (error) {
+        console.error('[TexturePaintEdit] failed:', error?.response?.data || error?.message || error);
+        const message = error?.response?.data?.error?.message || error?.message || 'Texture paint edit sikertelen.';
+        return res.status(500).json({ success: false, message });
+    }
+});
+
 // ════════════════════════════════════════════════════
 // 2.  KÉPGENERÁLÁS  —  POST /api/generate-image
 // ════════════════════════════════════════════════════
@@ -2733,20 +3067,22 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
             return res.status(400).json({ success: false, message: `Ismeretlen TTS provider: ${provider}` });
         }
 
+        const archivedModel = provider === 'nvidia-riva' ? 'magpie-tts-multilingual' : model;
+        const archivedFileFormat = provider === 'nvidia-riva' ? 'wav' : provider === 'elevenlabs' ? 'mp3' : safeFormat;
         const archiveItem = await persistGeneratedAudio(req.userId, audioUrl, {
             type: 'tts',
             text: text.trim(),
             provider,
-            model: provider === 'nvidia-riva' ? 'magpie-tts-multilingual' : model,
+            model: archivedModel,
             voice,
-            fileFormat: provider === 'nvidia-riva' ? 'wav' : provider === 'elevenlabs' ? 'mp3' : safeFormat,
+            fileFormat: archivedFileFormat,
             sampleRate: provider === 'nvidia-riva' ? 22050 : null,
             stream: false,
         });
 
         await logUsage(req.userId, 'tts', {
             provider,
-            model: provider === 'nvidia-riva' ? 'magpie-tts-multilingual' : model,
+            model: archivedModel,
             chars: text.length,
             audioId: archiveItem?.id || null,
         });
@@ -2756,6 +3092,9 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
             audioUrl: archiveItem ? null : audioUrl,
             audioId: archiveItem?.id || null,
             historyItem: archiveItem,
+            fileFormat: archiveItem?.fileFormat || archivedFileFormat,
+            outputFormat: archiveItem ? 'history' : 'data',
+            audio: archiveItem,
         });
 
     } catch (err) {
@@ -4597,6 +4936,172 @@ async function deleteFromB2(key) {
     }
 }
 
+const AUDIO_MIME_EXT = {
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/ogg': 'ogg',
+    'audio/aac': 'aac',
+    'audio/flac': 'flac',
+    'audio/mp4': 'm4a',
+};
+
+function safeAudioName(name = 'ludusgen_audio') {
+    return String(name || 'ludusgen_audio')
+        .replace(/[^\w.\-]+/g, '_')
+        .replace(/_+/g, '_')
+        .slice(0, 120);
+}
+
+function parseDataAudioUrl(audioUrl) {
+    const match = String(audioUrl || '').match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/);
+    if (!match) return null;
+    const contentType = match[1] || 'audio/mpeg';
+    return {
+        buffer: Buffer.from(match[2], 'base64'),
+        contentType,
+    };
+}
+
+function audioExtFrom(contentType, fallback = 'mp3') {
+    const clean = String(contentType || '').split(';')[0].trim().toLowerCase();
+    return AUDIO_MIME_EXT[clean] || fallback;
+}
+
+async function loadAudioBuffer(audioUrl, req = null) {
+    const dataAudio = parseDataAudioUrl(audioUrl);
+    if (dataAudio) return dataAudio;
+
+    let targetUrl = String(audioUrl || '');
+    if (targetUrl.startsWith('/api/')) {
+        const host = req?.get?.('host') || `localhost:${process.env.PORT || 3001}`;
+        targetUrl = `${req?.protocol || 'http'}://${host}${targetUrl}`;
+    }
+    if (!/^https?:\/\//.test(targetUrl)) {
+        throw new Error('Nem tamogatott audio URL');
+    }
+
+    const response = await axios.get(targetUrl, {
+        responseType: 'arraybuffer',
+        timeout: 90_000,
+        headers: {
+            ...(req?.headers?.authorization ? { Authorization: req.headers.authorization } : {}),
+            'User-Agent': 'LudusGen-AudioHistory/1.0',
+        },
+    });
+    return {
+        buffer: Buffer.from(response.data),
+        contentType: response.headers['content-type'] || 'audio/mpeg',
+    };
+}
+
+async function persistAudioToHistory(userId, audioUrl, metadata = {}) {
+    if (!userId || !audioUrl) return null;
+
+    const { buffer, contentType } = await loadAudioBuffer(audioUrl);
+    const fileFormat = String(metadata.fileFormat || audioExtFrom(contentType)).replace(/^\./, '').toLowerCase();
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const fileName = `${safeAudioName(metadata.title || metadata.type || 'ludusgen_audio')}_${id}.${fileFormat}`;
+    const storageKey = `users/${userId}/audio/${fileName}`;
+
+    await uploadMediaToB2(buffer, storageKey, contentType);
+
+    const docRef = await admin.firestore().collection('audio_history').add({
+        userId,
+        type: metadata.type || 'audio',
+        title: metadata.title || 'LudusGen audio',
+        prompt: metadata.prompt || '',
+        provider: metadata.provider || '',
+        model: metadata.model || '',
+        duration: metadata.duration || null,
+        storageKey,
+        fileName,
+        fileFormat,
+        contentType,
+        size: buffer.length,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        ts: Date.now(),
+    });
+
+    return {
+        id: docRef.id,
+        storageKey,
+        fileName,
+        fileFormat,
+        contentType,
+        size: buffer.length,
+    };
+}
+
+async function streamAudioB2Key(key, filename, contentType, res, disposition = 'inline') {
+    const cmd = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key });
+    const data = await b2.send(cmd);
+    res.setHeader('Content-Type', contentType || 'audio/mpeg');
+    res.setHeader('Content-Disposition', `${disposition}; filename="${safeAudioName(filename || key.split('/').pop())}"`);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    data.Body.pipe(res);
+}
+
+router.get('/audio/history', verifyFirebaseToken, async (req, res) => {
+    try {
+        const snap = await admin.firestore()
+            .collection('audio_history')
+            .where('userId', '==', req.userId)
+            .orderBy('createdAt', 'desc')
+            .limit(100)
+            .get();
+
+        const items = await Promise.all(snap.docs.map(async (doc) => {
+            const data = doc.data();
+            const fileUrl = data.storageKey
+                ? await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.storageKey }), { expiresIn: 3600 })
+                : null;
+            return {
+                id: doc.id,
+                ...data,
+                fileUrl,
+                audioUrl: fileUrl,
+                createdAt: data.createdAt?.toDate?.() || new Date(data.ts || Date.now()),
+            };
+        }));
+
+        res.json({ success: true, items });
+    } catch (err) {
+        console.error('[AudioHistory] list error:', err);
+        res.status(500).json({ success: false, message: 'Audio archivum betoltese sikertelen' });
+    }
+});
+
+router.get('/audio/history/:audioId/file', verifyFirebaseToken, async (req, res) => {
+    try {
+        const doc = await admin.firestore().collection('audio_history').doc(req.params.audioId).get();
+        if (!doc.exists) return res.status(404).json({ success: false, message: 'Audio nem talalhato' });
+        const data = doc.data();
+        if (data.userId !== req.userId) return res.status(403).json({ success: false, message: 'Nincs jogosultsag' });
+        if (!data.storageKey) return res.status(404).json({ success: false, message: 'Audio fajl nem talalhato' });
+        await streamAudioB2Key(data.storageKey, data.fileName || `${doc.id}.${data.fileFormat || 'mp3'}`, data.contentType || 'audio/mpeg', res, 'inline');
+    } catch (err) {
+        console.error('[AudioHistory] file error:', err);
+        if (!res.headersSent) res.status(500).json({ success: false, message: 'Audio fajl betoltese sikertelen' });
+    }
+});
+
+router.post('/audio/download', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { audioUrl, filename = 'ludusgen_audio.mp3' } = req.body || {};
+        if (!audioUrl) return res.status(400).json({ success: false, message: 'Hianyzo audio URL' });
+        const { buffer, contentType } = await loadAudioBuffer(audioUrl, req);
+        res.setHeader('Content-Type', contentType || 'audio/mpeg');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeAudioName(filename)}"`);
+        res.setHeader('Cache-Control', 'private, max-age=60');
+        res.send(buffer);
+    } catch (err) {
+        console.error('[AudioDownload] error:', err);
+        res.status(500).json({ success: false, message: err.message || 'Audio letoltes sikertelen' });
+    }
+});
+
 router.get('/trellis/model/:filename', verifyFirebaseToken, async (req, res) => {
     const key = `trellis/${req.params.filename}`;
     try { await streamB2Key(key, req.params.filename, res); }
@@ -4714,9 +5219,11 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
         let glbUrl, b2Key = null;
 
         try {
-            b2Key = await uploadGlbToB2(base64Glb, filename);
+            const buffer = Buffer.from(base64Glb, 'base64');
+            b2Key = await storageService.uploadFile(buffer, `trellis/${filename}`, 'model/gltf-binary');
             glbUrl = `/api/trellis/model/${filename}`;
         } catch (b2Err) {
+            console.error('Trellis B2 upload failed:', b2Err.message);
             glbUrl = `data:model/gltf-binary;base64,${base64Glb}`;
         }
 

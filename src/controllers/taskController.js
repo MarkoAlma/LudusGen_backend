@@ -1,39 +1,298 @@
 // src/controllers/taskController.js
 import { taskService } from "../services/taskService.js";
 import { getTripoClient } from "../lib/tripoClient.js";
+import { storageService } from "../services/storageService.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
 import { deductCredits, refundCredits, linkTaskIdToTransaction } from "../services/creditService.js";
-import { registerTask as registerForRecovery, unregisterTask } from "../services/taskRecoveryService.js";
-import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS } from "../config/tripo.config.js";
+import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskMeta } from "../services/taskRecoveryService.js";
+import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS, TRIPO_IMAGE_UPLOAD_MAX_BYTES } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
 import { registerJob, unregisterJob } from "../lib/jobRegistry.js";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
-const HISTORY_COLLECTION = "trellis_history";
+const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
+// NOTE: existing docs with tripo_ prefixed IDs in 'trellis_history' need a one-time migration
+const HISTORY_COLLECTION = "tripo_history";
+const REFINE_DIRECT_SOURCE_TYPES = new Set(["text_to_model", "image_to_model", "multiview_to_model"]);
+const REFINE_UPSTREAM_SOURCE_TYPES = new Set(["texture_model", "convert_model", "smart_low_poly", "stylize_model", "mesh_segmentation", "mesh_completion"]);
+const TEXTURE_DIRECT_SOURCE_TYPES = new Set(["text_to_model", "image_to_model", "multiview_to_model", "texture_model", "import_model"]);
+
+function getHistoryModelVersion(data) {
+  return data?.params?.model_version ||
+    data?.params?.modelVersion ||
+    data?.model_version ||
+    data?.modelVersion ||
+    data?.modelVer ||
+    "";
+}
+
+function isRefineModelVersionSupported(version) {
+  if (!version) return true;
+  return String(version).toLowerCase().startsWith("v1.4");
+}
+
+function logDebug(label, payload) {
+  if (!DEBUG_TRIPO) return;
+  try {
+    console.log(label, JSON.stringify(payload, null, 2));
+  } catch {
+    console.log(label, payload);
+  }
+}
+
+function errorPayload(err, message = err.message) {
+  return {
+    success: false,
+    message,
+    ...(err.traceId && { tripoTraceId: err.traceId }),
+    ...(err.code && { tripoCode: err.code }),
+    ...(err.suggestion && { tripoSuggestion: err.suggestion }),
+  };
+}
+
+function uniqueDocs(docs) {
+  return Array.from(new Map(docs.filter(Boolean).map(d => [d.ref.path, d])).values());
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function toMillis(value) {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.getTime();
+  if (typeof value?.toMillis === "function") {
+    try {
+      const millis = value.toMillis();
+      return Number.isFinite(millis) ? millis : null;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+function getHistoryExpiryMillis(data) {
+  if (!data || typeof data !== "object") return null;
+  if (data.marketplaceLocked === true || data.marketplaceAssetId) return null;
+  const explicitExpiry = toMillis(data.expiresAt);
+  if (explicitExpiry != null) return explicitExpiry;
+
+  const createdAt = toMillis(data.createdAt);
+  if (createdAt != null) return createdAt + HISTORY_TTL_MS;
+
+  const ts = toMillis(data.ts);
+  if (ts != null) return ts + HISTORY_TTL_MS;
+
+  return null;
+}
+
+async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
+  const cleanDocs = uniqueDocs(docs);
+  if (cleanDocs.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0 };
+
+  const b2Keys = [...new Set(cleanDocs.map(doc => doc.data()?.b2_key).filter(Boolean))];
+  let b2Deleted = 0;
+  let b2Failed = 0;
+  for (const key of b2Keys) {
+    const ok = await storageService.deleteFile(key);
+    if (ok) b2Deleted += 1;
+    else b2Failed += 1;
+  }
+
+  let deleted = 0;
+  const db = admin.firestore();
+  for (let i = 0; i < cleanDocs.length; i += 500) {
+    const batch = db.batch();
+    const slice = cleanDocs.slice(i, i + 500);
+    slice.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+    deleted += slice.length;
+  }
+
+  console.log(`[HistoryController] cleanup reason=${reason} docs=${deleted} b2Deleted=${b2Deleted} b2Failed=${b2Failed}`);
+  return { deleted, b2Deleted, b2Failed };
+}
+
+async function deleteHistoryForDeadModel({ taskId, modelUrl, uid = null, reason = "dead_model" }) {
+  const db = admin.firestore();
+  const queries = [];
+
+  if (taskId) {
+    let q = db.collection(HISTORY_COLLECTION).where("taskId", "==", taskId);
+    if (uid) q = q.where("userId", "==", uid);
+    queries.push(q.get());
+  }
+
+  if (modelUrl) {
+    let q = db.collection(HISTORY_COLLECTION).where("model_url", "==", modelUrl);
+    if (uid) q = q.where("userId", "==", uid);
+    queries.push(q.get());
+  }
+
+  if (queries.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0 };
+  const snaps = await Promise.all(queries);
+  return deleteHistoryDocsWithStorage(snaps.flatMap(snap => snap.docs), reason);
+}
 
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
 export async function createTask(req, res) {
   const { type, callback_url, idempotency_key, ...rest } = req.body;
-  if (!type) { res.status(400).json({ success: false, message: "type field required" }); return; }
+  const userId = req.user?.uid;
+  const jobId = req.body.jobId;
+  const controller = new AbortController();
+  let estimatedCost = 0;
+  let creditsDeducted = false;
+  let tempTxId = null;
+  let tripoTaskCreated = false;
 
   try {
-    const body = { type, ...rest };
-    const userId = req.user?.uid;
-    const jobId = req.body.jobId;
-
-    const controller = new AbortController();
     if (jobId) {
       registerJob(jobId, controller, 1800000); // 30 min for 3D
     }
 
+    let body = { type, ...rest };
+
+    logDebug("[TaskController][create-debug] incoming req.body:", req.body);
+    if (type === "refine_model") {
+      logDebug("[TaskController][refine-debug] incoming request:", {
+        userId,
+        draft_model_task_id: body.draft_model_task_id ?? null,
+        original_model_task_id: body.original_model_task_id ?? null,
+        hasPrompt: typeof body.prompt === "string" && body.prompt.trim().length > 0,
+        hasNegativePrompt: typeof body.negative_prompt === "string" && body.negative_prompt.trim().length > 0,
+      });
+    }
+    
+    // Normalize image inputs
+    if (type === "image_to_model") {
+      const tokens = (body.images && Array.isArray(body.images)) ? body.images
+                   : (body.batch_images && Array.isArray(body.batch_images)) ? body.batch_images
+                   : [];
+      const onlyStringTokens = tokens.length > 0 && tokens.every((item) => typeof item === "string");
+
+      if (onlyStringTokens && tokens.length === 1) {
+        // Normalize single image task
+        body.file = { type: "jpg", file_token: tokens[0] };
+        delete body.images;
+        delete body.batch_images;
+      } else if (onlyStringTokens && tokens.length > 1) {
+        // Keep tokens for later splitting in this controller
+        body.batch_images = tokens;
+        delete body.images;
+      }
+    }
+    logDebug("[TaskController][create-debug] normalized body:", body);
+
+    if (type === "texture_model" && body.original_model_task_id) {
+      try {
+        const sourceTask = await getTripoClient().getTask(body.original_model_task_id);
+        const sourceType = sourceTask?.type ?? null;
+        const upstreamId =
+          sourceTask?.input?.original_model_id ??
+          sourceTask?.input?.original_model_task_id ??
+          null;
+        if (upstreamId && sourceType && !TEXTURE_DIRECT_SOURCE_TYPES.has(sourceType)) {
+          console.log(`[TaskController][texture-source] Rewriting texture source ${body.original_model_task_id} (${sourceType}) -> ${upstreamId}`);
+          body.original_model_task_id = upstreamId;
+        }
+      } catch (sourceErr) {
+        console.warn(`[TaskController][texture-source] Failed to inspect source task ${body.original_model_task_id}:`, sourceErr.message);
+      }
+    }
+
+    if (type === "refine_model" && userId) {
+      const parentTaskId = body.original_model_task_id || body.draft_model_task_id;
+      if (parentTaskId) {
+        const db = admin.firestore();
+        const snap = await db.collection(HISTORY_COLLECTION)
+          .where("taskId", "==", parentTaskId)
+          .limit(1)
+          .get();
+        if (!snap.empty) {
+          const parentData = snap.docs[0].data();
+          let effectiveParentData = parentData;
+          const histType = parentData.params?.type;
+          const upstreamTaskId =
+            parentData.params?.originalModelTaskId ||
+            parentData.params?.original_model_task_id ||
+            parentData.params?.draftModelTaskId ||
+            parentData.params?.draft_model_task_id ||
+            null;
+          const hasTexture = (
+            parentData.mode === "texture" ||
+            parentData.params?.mode === "texture" ||
+            parentData.params?.type === "texture_model" ||
+            parentData.params?.texture === true ||
+            parentData.params?.texture === "true" ||
+            parentData.params?.pbr === true ||
+            parentData.params?.pbr === "true"
+          );
+
+          logDebug("[TaskController][refine-debug] pre-credit parent resolved:", {
+            parentTaskId,
+            parentMode: parentData.mode ?? null,
+            parentType: histType ?? null,
+            upstreamTaskId,
+            hasTexture,
+          });
+
+          if (histType === "refine_model") {
+            return res.status(400).json({
+              success: false,
+              message: "A már refine-olt modelleket nem lehet újra refine-olni.",
+              code: "ALREADY_REFINED_SOURCE",
+            });
+          }
+
+          if (
+            upstreamTaskId &&
+            (hasTexture ||
+              REFINE_UPSTREAM_SOURCE_TYPES.has(histType) ||
+              (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType)))
+          ) {
+            body.draft_model_task_id = upstreamTaskId;
+            delete body.original_model_task_id;
+            const upstreamSnap = await db.collection(HISTORY_COLLECTION)
+              .where("taskId", "==", upstreamTaskId)
+              .limit(1)
+              .get();
+            if (!upstreamSnap.empty) effectiveParentData = upstreamSnap.docs[0].data();
+          } else if (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType)) {
+            return res.status(400).json({
+              success: false,
+              message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható. Forrástípus: ${histType}`,
+              code: "UNSUPPORTED_REFINE_SOURCE",
+            });
+          }
+
+          const sourceVersion = getHistoryModelVersion(effectiveParentData);
+          if (!isRefineModelVersionSupported(sourceVersion)) {
+            return res.status(400).json({
+              success: false,
+              message: `Refine csak Tripo v1.4 draft modellel működik. Ez a modell: ${sourceVersion}`,
+              code: "UNSUPPORTED_REFINE_MODEL_VERSION",
+            });
+          }
+        }
+      }
+    }
+
     // Estimate credit cost for this task
-    const { total: estimatedCost } = estimateCost(body);
+    taskService.validate(body);
+    const estimateResult = estimateCost(body);
+    estimatedCost = estimateResult.total;
+    console.log(`[TaskController][create] type=${body.type} model=${body.model_version} base_cost=${estimateResult.breakdown.base} tex_addon=${estimateResult.breakdown.texture || 0} total_cost=${estimatedCost}`);
     console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"} cost=${estimatedCost}`);
 
-    let tempTxId = null;
     if (estimatedCost > 0 && userId) {
       tempTxId = `pending_${type}_${Date.now()}`;
       try {
@@ -53,6 +312,7 @@ export async function createTask(req, res) {
 
       try {
         await deductCredits(userId, estimatedCost, tempTxId, type);
+        creditsDeducted = true;
       } catch (creditErr) {
         if (creditErr.code === "INSUFFICIENT_CREDITS") {
           return res.status(402).json({
@@ -106,13 +366,83 @@ export async function createTask(req, res) {
 
           // Refine source validation
           if (type === "refine_model") {
+            let effectiveParentData = parentData;
             const histType = parentData.params?.type;
-            const VALID_REFINE_SOURCES = new Set(["text_to_model", "image_to_model", "multiview_to_model"]);
-            if (histType && !VALID_REFINE_SOURCES.has(histType)) {
+            const upstreamTaskId =
+              parentData.params?.originalModelTaskId ||
+              parentData.params?.original_model_task_id ||
+              parentData.params?.draftModelTaskId ||
+              parentData.params?.draft_model_task_id ||
+              null;
+            const hasTexture = (
+              parentData.mode === "texture" ||
+              parentData.params?.mode === "texture" ||
+              parentData.params?.type === "texture_model" ||
+              parentData.params?.texture === true ||
+              parentData.params?.texture === "true" ||
+              parentData.params?.pbr === true ||
+              parentData.params?.pbr === "true"
+            );
+            logDebug("[TaskController][refine-debug] parent resolved:", {
+              parentTaskId,
+              parentMode: parentData.mode ?? null,
+              parentType: histType ?? null,
+              parentTexture: parentData.params?.texture ?? null,
+              parentPbr: parentData.params?.pbr ?? null,
+              upstreamTaskId,
+              hasTexture,
+            });
+            if (histType === "refine_model") {
+              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
+                await refundCredits(userId, estimatedCost, tempTxId, "already_refined_source");
+                creditsDeducted = false;
+              }
               return res.status(400).json({
                 success: false,
-                message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható (kivéve: ${histType}).`,
+                message: "A már refine-olt modelleket nem lehet újra refine-olni.",
+                code: "ALREADY_REFINED_SOURCE",
+              });
+            }
+            if (
+              upstreamTaskId &&
+              (hasTexture ||
+                REFINE_UPSTREAM_SOURCE_TYPES.has(histType) ||
+                (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType)))
+            ) {
+              logDebug("[TaskController][refine-debug] rewriting source:", {
+                from: parentTaskId,
+                histType: histType ?? "unknown",
+                to: upstreamTaskId,
+              });
+              body.draft_model_task_id = upstreamTaskId;
+              delete body.original_model_task_id;
+              const upstreamSnap = await db.collection(HISTORY_COLLECTION)
+                .where("taskId", "==", upstreamTaskId)
+                .limit(1)
+                .get();
+              if (!upstreamSnap.empty) effectiveParentData = upstreamSnap.docs[0].data();
+            }
+            if (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType) && !upstreamTaskId) {
+              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
+                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_source");
+                creditsDeducted = false;
+              }
+              return res.status(400).json({
+                success: false,
+                message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható. Forrástípus: ${histType}`,
                 code: "UNSUPPORTED_REFINE_SOURCE",
+              });
+            }
+            const sourceVersion = getHistoryModelVersion(effectiveParentData);
+            if (!isRefineModelVersionSupported(sourceVersion)) {
+              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
+                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_model_version");
+                creditsDeducted = false;
+              }
+              return res.status(400).json({
+                success: false,
+                message: `Refine csak Tripo v1.4 draft modellel működik. Ez a modell: ${sourceVersion}`,
+                code: "UNSUPPORTED_REFINE_MODEL_VERSION",
               });
             }
           }
@@ -126,6 +456,11 @@ export async function createTask(req, res) {
           } else if (body.animation && !body.animation.startsWith("preset:")) {
             body.animation = `preset:${defaultRigType}:${body.animation}`;
           }
+        } else if (type === "refine_model") {
+          logDebug("[TaskController][refine-debug] parent task was not found in history", {
+            parentTaskId,
+            userId,
+          });
         }
       } catch (err) {
         console.warn(`[TaskController] Parent metadata lookup failed:`, err.message);
@@ -143,81 +478,246 @@ export async function createTask(req, res) {
         animate_in_place: body.animate_in_place ?? false,
       });
     }
+    if (type === "refine_model") {
+      logDebug("[TaskController][refine-debug] validated body before taskService.create:", {
+        draft_model_task_id: body.draft_model_task_id ?? null,
+        original_model_task_id: body.original_model_task_id ?? null,
+        prompt: body.prompt ?? null,
+        negative_prompt: body.negative_prompt ?? null,
+      });
+    }
+    logDebug("[TaskController][create-debug] final body before create:", body);
 
     if (USE_QUEUE) {
-      const jobId = await enqueueTripoTask({
-        jobType: "single",
-        taskBody: body,
-        userId,
-        callbackUrl: callback_url,
-        idempotencyKey: idempotency_key ?? uuid(),
-      });
-      res.json({ success: true, queued: true, jobId });
+      if (body.batch_images && body.batch_images.length > 1) {
+        const { batch_images, ...common } = body;
+        const items = batch_images.map(token => ({
+          jobType: "single",
+          taskBody: {
+            ...common,
+            file: typeof token === "string" ? { type: "jpg", file_token: token } : token,
+          },
+          userId,
+          callbackUrl: callback_url,
+          idempotencyKey: uuid(),
+        }));
+        const jobIds = await enqueueBatch(items);
+        res.json({ success: true, queued: true, jobIds });
+      } else {
+        const jobId = await enqueueTripoTask({
+          jobType: "single",
+          taskBody: body,
+          userId,
+          callbackUrl: callback_url,
+          idempotencyKey: idempotency_key ?? uuid(),
+        });
+        res.json({ success: true, queued: true, jobId });
+      }
     } else {
-      const taskId = await taskService.create(body, {
-        callbackUrl: callback_url,
-        idempotencyKey: idempotency_key,
-        signal: controller.signal,
-      });
+      // Sequential/Direct execution
+      if (body.batch_images && body.batch_images.length > 1) {
+        const { batch_images, ...common } = body;
+        const taskIds = [];
+        for (const token of batch_images) {
+          const subBody = {
+            ...common,
+            file: typeof token === "string" ? { type: "jpg", file_token: token } : token,
+          };
+          const taskId = await taskService.create(subBody, {
+            callbackUrl: callback_url,
+            idempotencyKey: uuid(),
+            signal: controller.signal,
+          });
+          tripoTaskCreated = true;
+          
+          if (userId && tempTxId) {
+            linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
+              console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
+            );
+          }
+          if (userId) {
+            registerForRecovery(taskId, userId, subBody.type, subBody.model_version ?? DEFAULT_MODEL, inheritedPrompt, {
+              texture: subBody.texture === true,
+              pbr: subBody.pbr === true,
+            });
+          }
+          taskIds.push(taskId);
+        }
+        res.json({ success: true, taskIds });
+      } else {
+        const taskId = await taskService.create(body, {
+          callbackUrl: callback_url,
+          idempotencyKey: idempotency_key,
+          signal: controller.signal,
+        });
+        tripoTaskCreated = true;
 
-      // Link real taskId to credit transaction for refunds
-      if (userId && tempTxId) {
-        linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
-          console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
-        );
-      }
+        // Link real taskId to credit transaction for refunds
+        if (userId && tempTxId) {
+          linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
+            console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
+          );
+        }
 
-      // Register for background recovery with inherited prompt
-      if (userId) {
-        registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt);
+        // Register for background recovery with inherited prompt
+        if (userId) {
+          registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt, {
+            texture: body.texture === true,
+            pbr: body.pbr === true,
+          });
+        }
+        res.json({ success: true, taskId });
       }
-      unregisterJob(jobId);
-      res.json({ success: true, taskId });
     }
   } catch (err) {
-    unregisterJob(jobId);
     if (err.name === 'AbortError') {
       return res.status(499).json({ success: false, message: "Folyamat megszakítva" });
     }
     console.error(`[TaskController] create error:`, err.message);
+    logDebug("[TaskController][create-debug] error context:", {
+      type,
+      userId,
+      estimatedCost,
+      creditsDeducted,
+      requestBody: req.body,
+      error: err.message,
+    });
+
+    const refundDeductedCredits = async (reason) => {
+      if (!userId || estimatedCost <= 0 || !creditsDeducted || !tempTxId || tripoTaskCreated) return;
+      try {
+        await refundCredits(userId, estimatedCost, tempTxId, reason);
+        creditsDeducted = false;
+      } catch (refundErr) {
+        console.error(`[TaskController] Refund error (${reason}):`, refundErr.message);
+      }
+    };
 
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
-      console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
-      try {
-        await refundCredits(userId, estimatedCost, `pending_${type}_${Date.now()}`, "tripo_403_insufficient_credit");
-      } catch (refundErr) {
-        console.error(`[TaskController] Refund error:`, refundErr.message);
+      if (userId && estimatedCost > 0 && creditsDeducted) {
+        console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
+        await refundDeductedCredits("tripo_403_insufficient_credit");
       }
     }
 
-    res.status(400).json({ success: false, message: err.message });
+    // Tripo 1004 on refine_model = model has no draft output (was generated with texture, or wrong task type)
+    let userMessage = err.message;
+    if (type === "refine_model" && err.message?.includes("1004")) {
+      if (userId && estimatedCost > 0 && creditsDeducted) {
+        await refundDeductedCredits("refine_no_draft_output");
+      }
+      userMessage = "Ez a modell nem finomítható. A Refine csak textúra nélkül generált (draft) modelleknél működik. Generálj új modellt textúra nélkül, majd alkalmazd rá a Refine-t.";
+    }
+
+    if (type === "texture_model" && err.message?.startsWith("Invalid texture model_version")) {
+      userMessage = "Ez a texture modellverzio jelenleg nem tamogatott. Valassz V3.0, V2.5 vagy V2.0 texture modellt, majd probald ujra.";
+    } else if (type === "texture_model" && err.message?.includes('texture_quality "detailed" requires')) {
+      userMessage = "A 4K/detailed texture csak V3.0 texture modellel futtathato. Kapcsold V3.0-ra, majd probald ujra.";
+    } else if (type === "texture_model" && err.code === 1004) {
+      userMessage = "A Tripo nem fogadta el a texture pass parametereit. Ellenorizd a texture targetet es a referencia kepet, majd probald ujra.";
+    }
+
+    await refundDeductedCredits(type === "texture_model" ? "texture_model_create_failed" : "tripo_create_failed");
+
+    res.status(400).json(errorPayload(err, userMessage));
+  } finally {
+    unregisterJob(jobId);
   }
 }
 
 /* ─── Task: get status ────────────────────────────────────────────────── */
 export async function getTask(req, res) {
   try {
-    const result = await taskService.get(req.params.taskId);
+    const taskMeta = getRegisteredTaskMeta(req.params.taskId);
+    const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
+    const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
+    logDebug("[TaskController][getTask-debug] request:", {
+      taskId: req.params.taskId,
+      taskMeta,
+      preferTexturedOutput,
+      preferDraftOutput,
+    });
+    const result = await taskService.get(req.params.taskId, {
+      preferBaseModel: preferDraftOutput,
+      preferPbrModel: preferTexturedOutput,
+    });
+    logDebug("[TaskController][getTask-debug] result:", {
+      taskId: req.params.taskId,
+      status: result.status ?? null,
+      progress: result.progress ?? null,
+      modelUrl: result.modelUrl ?? null,
+      errorMessage: result.errorMessage ?? null,
+      errorCode: result.errorCode ?? null,
+      outputKeys: Object.keys(result.rawOutput ?? {}),
+      rawOutput: result.rawOutput ?? null,
+    });
     // FIX: result.success-t kivesszük, hogy ne írja felül a success: true-t
     const { success: _ignored, ...taskData } = result;
     res.json({ success: true, ...taskData });
   } catch (err) {
     console.error("[TaskController] getTask error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json(errorPayload(err));
+  }
+}
+
+export async function streamTask(req, res) {
+  const taskId = req.params.taskId;
+  if (!taskId) {
+    res.status(400).json({ success: false, message: "taskId required" });
+    return;
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  let closed = false;
+  req.on("close", () => {
+    closed = true;
+  });
+
+  const send = (event, payload) => {
+    if (closed) return;
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  send("connected", { success: true, taskId, ts: Date.now() });
+
+  try {
+    while (!closed) {
+      const taskMeta = getRegisteredTaskMeta(taskId);
+      const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
+      const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
+      const result = await taskService.get(taskId, {
+        preferBaseModel: preferDraftOutput,
+        preferPbrModel: preferTexturedOutput,
+      });
+      const { success: _ignored, ...taskData } = result;
+      send("status", { success: true, ...taskData, ts: Date.now() });
+
+      if (["success", "failed", "cancelled"].includes(result.status)) break;
+      await delay(2_500);
+    }
+  } catch (err) {
+    send("error", errorPayload(err));
+  } finally {
+    if (!closed) {
+      res.end();
+    }
   }
 }
 
 /* ─── Task: cancel ────────────────────────────────────────────────────── */
 export async function cancelTask(req, res) {
   try {
-    await taskService.cancel(req.params.taskId);
-    res.json({ success: true, cancelled: true });
+    const result = await taskService.cancel(req.params.taskId);
+    res.json({ success: true, cancelled: result.cancelled, message: result.message });
   } catch (err) {
     console.warn("[TaskController] cancelTask:", err.message);
-    // Már befejezett/failed task cancel kísérlete nem kritikus hiba
-    // A frontend kezeli, 200-at küldünk vissza hogy ne logoljon hibát
-    res.json({ success: false, message: err.message });
+    res.json({ success: false, cancelled: false, message: err.message });
   }
 }
 
@@ -271,6 +771,11 @@ export async function uploadFile(req, res) {
   const file = req.file;
   if (!file) { res.status(400).json({ success: false, message: "File missing" }); return; }
 
+  if (file.size > TRIPO_IMAGE_UPLOAD_MAX_BYTES) {
+    res.status(400).json({ success: false, message: `File too large. Maximum size: ${TRIPO_IMAGE_UPLOAD_MAX_BYTES / (1024 * 1024)}MB` });
+    return;
+  }
+
   const allowed = ["image/jpeg", "image/png", "image/webp"];
   if (!allowed.includes(file.mimetype)) {
     res.status(400).json({ success: false, message: "Only JPG/PNG/WEBP allowed" });
@@ -285,7 +790,7 @@ export async function uploadFile(req, res) {
     res.json({ success: true, imageToken });
   } catch (err) {
     console.error("[TaskController] upload error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json(errorPayload(err));
   }
 }
 
@@ -344,6 +849,12 @@ export async function modelProxy(req, res) {
     "assets.tripo3d.com",
     "data.tripo3d.com",
   ];
+  try {
+    const b2Host = process.env.B2_ENDPOINT ? new URL(process.env.B2_ENDPOINT).hostname : null;
+    if (b2Host) allowedHosts.push(b2Host);
+  } catch {
+    // Ignore malformed optional B2 endpoint; Tripo hosts are still enforced.
+  }
 
   // Inner helper to perform the actual fetch
   const performFetch = async (targetUrl) => {
@@ -394,7 +905,31 @@ export async function modelProxy(req, res) {
       MODEL_CACHE.delete(taskIdParam); // expired
     }
 
-    // ── Fetch from upstream ────────────────────────────────────────────
+    // ── Permanent Storage: Check B2 first ─────────────────────────────
+    if (taskIdParam) {
+      try {
+        const db = admin.firestore();
+        const snap = await db.collection(HISTORY_COLLECTION)
+          .where("taskId", "==", taskIdParam)
+          .limit(1)
+          .get();
+        
+        if (!snap.empty) {
+          const histData = snap.docs[0].data();
+          if (histData.b2_key) {
+            console.log(`[TaskController] modelProxy: found B2 key ${histData.b2_key} for task ${taskIdParam}`);
+            const b2Url = await storageService.getSignedUrl(histData.b2_key);
+            if (b2Url) {
+              url = b2Url; // Use B2 URL instead of Tripo URL
+            }
+          }
+        }
+      } catch (fsErr) {
+        console.warn(`[TaskController] modelProxy: B2 lookup failed:`, fsErr.message);
+      }
+    }
+
+    // ── Fetch from upstream (B2 or Tripo) ────────────────────────────
     let { error, upstream, message } = await performFetch(url);
 
     // If upstream returns 401/403/410/502, try to refresh URL via taskId
@@ -450,21 +985,10 @@ export async function modelProxy(req, res) {
                   .get();
 
                 const allDocs = [...taskSnap.docs, ...urlSnap.docs];
-                const uniqueDocs = Array.from(new Map(allDocs.map(d => [d.id, d])).values());
-
-                if (uniqueDocs.length > 0) {
-                  const batch = db.batch();
-                  uniqueDocs.forEach(doc => {
-                    batch.update(doc.ref, {
-                      status: "failed",
-                      error: "Task expired on Tripo platform (Source deleted)"
-                    });
-                  });
-                  await batch.commit();
-                  console.log(`[TaskController] Marked ${uniqueDocs.length} documents as failed for taskId ${taskId}`);
-                }
+                const cleanup = await deleteHistoryDocsWithStorage(allDocs, "model_proxy_source_missing");
+                if (cleanup.deleted > 0) console.log(`[TaskController] Deleted ${cleanup.deleted} dead history documents for taskId ${taskId}`);
               } catch (fsErr) {
-                console.warn(`[TaskController] Firestore batch update failed:`, fsErr.message);
+                console.warn(`[TaskController] Dead history cleanup failed:`, fsErr.message);
               }
             })();
 
@@ -477,6 +1001,18 @@ export async function modelProxy(req, res) {
 
     if (error) {
       const finalStatus = [401, 403, 404, 410].includes(error) ? error : 502;
+      if (taskIdParam && [404, 410].includes(finalStatus)) {
+        try {
+          await deleteHistoryForDeadModel({
+            taskId: taskIdParam,
+            modelUrl: req.query.url,
+            uid: req.user?.uid ?? null,
+            reason: `model_proxy_${finalStatus}`,
+          });
+        } catch (cleanupErr) {
+          console.warn(`[TaskController] modelProxy cleanup failed for ${taskIdParam}:`, cleanupErr.message);
+        }
+      }
       res.status(finalStatus).json({ success: false, message: message || `Upstream ${error}`, code: error === 410 ? "TASK_EXPIRED" : "UPSTREAM_ERROR" });
       return;
     }
@@ -579,8 +1115,7 @@ export async function batchGenerate(req, res) {
           ? { prompt: item }
           : { file: { type: "jpg", file_token: item } }),
         model_version: mv,
-        // FIX: csak true értéket küldünk, explicit false-t soha
-        ...(texture !== false && { texture: true }),
+        texture: texture === true,
         ...(pbr === true && { pbr: true }),
         texture_quality: texture_quality ?? "detailed",
       },
@@ -644,7 +1179,8 @@ export async function deleteHistoryItem(req, res) {
 
   try {
     const db = admin.firestore();
-    const ref = db.collection(HISTORY_COLLECTION).doc(id);
+    const collection = req.query.collection || HISTORY_COLLECTION;
+    const ref = db.collection(collection).doc(id);
     const doc = await ref.get();
 
     if (!doc.exists) {
@@ -656,9 +1192,9 @@ export async function deleteHistoryItem(req, res) {
       return;
     }
 
-    await ref.delete();
+    const cleanup = await deleteHistoryDocsWithStorage([doc], "single_delete");
     console.log(`[HistoryController] deleted item ${id} for user ${uid}`);
-    res.json({ success: true, id });
+    res.json({ success: true, id, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] deleteHistoryItem error:", err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -675,20 +1211,19 @@ export async function clearHistory(req, res) {
 
   const ALLOWED_SOURCES = ["tripo", "trellis", "upload"];
   const source = ALLOWED_SOURCES.includes(req.query.source) ? req.query.source : "tripo";
+  const collection = req.query.collection || HISTORY_COLLECTION;
 
   try {
     const db = admin.firestore();
-    const snap = await db.collection(HISTORY_COLLECTION)
+    const snap = await db.collection(collection)
       .where("userId", "==", uid)
       .where("source", "==", source)
       .get();
 
-    const batch = db.batch();
-    snap.docs.forEach(doc => batch.delete(doc.ref));
-    await batch.commit();
+    const cleanup = await deleteHistoryDocsWithStorage(snap.docs, `clear_${source}`);
 
     console.log(`[HistoryController] cleared ${snap.size} ${source} items for user ${uid}`);
-    res.json({ success: true, deleted: snap.size });
+    res.json({ success: true, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] clearHistory error:", err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -697,7 +1232,12 @@ export async function clearHistory(req, res) {
 
 /**
  * DELETE /api/tripo/history/expired
- * Deletes history items older than HISTORY_TTL_MS for the authenticated user.
+ * Deletes tripo_history items older than HISTORY_TTL_MS for the authenticated user.
+ *
+ * To run this daily without Cloud Functions, add a cron job that calls:
+ *   curl -X DELETE https://<host>/api/tripo/history/expired \
+ *        -H "Authorization: Bearer <service-account-token>"
+ * Or use a Cloud Scheduler job pointing at this endpoint with OIDC auth.
  */
 export async function cleanupExpiredHistory(req, res) {
   const uid = req.user?.uid;
@@ -705,51 +1245,28 @@ export async function cleanupExpiredHistory(req, res) {
 
   try {
     const db = admin.firestore();
-    const cutoffMs = Date.now() - HISTORY_TTL_MS;
+    const now = Date.now();
 
-    // Filter in memory to avoid needing a composite index
+    // Query only by userId so cleanup works without a composite Firestore index.
     const snap = await db.collection(HISTORY_COLLECTION)
       .where("userId", "==", uid)
       .get();
 
-    if (snap.empty) {
-      res.json({ success: true, deleted: 0, message: "Nothing to clean up" });
-      return;
-    }
-
-    const docsToDelete = snap.docs.filter(doc => {
-      const data = doc.data();
-      if (!data.createdAt) return false;
-      let createdMs = 0;
-      if (typeof data.createdAt.toMillis === "function") {
-        createdMs = data.createdAt.toMillis();
-      } else if (data.createdAt.seconds !== undefined) {
-        createdMs = data.createdAt.seconds * 1000;
-      } else if (data.createdAt instanceof Date) {
-        createdMs = data.createdAt.getTime();
-      } else {
-        createdMs = new Date(data.createdAt).getTime();
-      }
-      return createdMs && createdMs < cutoffMs;
+    const expiredDocs = snap.docs.filter((doc) => {
+      if (doc.data()?.marketplaceLocked === true || doc.data()?.marketplaceAssetId) return false;
+      const expiresAt = getHistoryExpiryMillis(doc.data());
+      return expiresAt != null && expiresAt <= now;
     });
 
-    if (docsToDelete.length === 0) {
+    if (expiredDocs.length === 0) {
       res.json({ success: true, deleted: 0, message: "Nothing to clean up" });
       return;
     }
 
-    // Firestore batch limit = 500
-    let deleted = 0;
-    for (let i = 0; i < docsToDelete.length; i += 500) {
-      const b = db.batch();
-      const chunk = docsToDelete.slice(i, i + 500);
-      chunk.forEach(doc => b.delete(doc.ref));
-      await b.commit();
-      deleted += chunk.length;
-    }
+    const cleanup = await deleteHistoryDocsWithStorage(expiredDocs, "expired_ttl");
 
-    console.log(`[HistoryController] cleaned up ${deleted} expired items for user ${uid}`);
-    res.json({ success: true, deleted });
+    console.log(`[HistoryController] cleaned up ${cleanup.deleted} expired items for user ${uid}`);
+    res.json({ success: true, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] cleanupExpiredHistory error:", err.message);
     res.status(500).json({ success: false, message: err.message });

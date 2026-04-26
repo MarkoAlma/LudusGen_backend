@@ -3,14 +3,15 @@
 // Unified Tripo API router.
 // Mounts on /api or wherever your app registers it.
 
-import { Router } from "express";
+import express, { Router } from "express";
 import multer from "multer";
-import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import rateLimit from "express-rate-limit";
 
 // Controllers
 import {
   createTask,
   getTask,
+  streamTask,
   cancelTask,
   acknowledgeTask,
   listTasks,
@@ -46,36 +47,39 @@ import {
 
 import {
   uploadAsset,
+  importUploadedAsset,
 } from "../controllers/assetController.js";
+import {
+  getUploadStsTarget,
+} from "../controllers/uploadController.js";
+import {
+  TRIPO_IMAGE_UPLOAD_MAX_BYTES,
+  TRIPO_MODEL_IMPORT_MAX_BYTES,
+} from "../config/tripo.config.js";
 
 /* ─── Middleware ──────────────────────────────────────────────────────── */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 20 * 1024 * 1024 },
+  limits:  { fileSize: TRIPO_IMAGE_UPLOAD_MAX_BYTES },
 });
 
-/** Asset upload multer — larger files (GLB/FBX/OBJ, max 50MB) */
+/** Asset upload multer - GLB/FBX/OBJ/STL, max 150MB */
 const assetUpload = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 50 * 1024 * 1024 },
+  limits:  { fileSize: TRIPO_MODEL_IMPORT_MAX_BYTES },
   fileFilter: (req, file, cb) => {
     const ext = file.originalname.split(".").pop()?.toLowerCase();
-    const allowed = new Set(["glb", "fbx", "obj"]);
+    const allowed = new Set(["glb", "fbx", "obj", "stl"]);
     if (allowed.has(ext)) cb(null, true);
-    else cb(new Error(`Unsupported file type: ${ext}. Allowed: glb, fbx, obj`));
+    else cb(new Error(`Unsupported file type: ${ext}. Allowed: glb, fbx, obj, stl`));
   },
 });
 
-/** Generation rate limiter — 30 req/min per user */
+/** Generation rate limiter — 30 req/min per authenticated user */
 const genLimiter = rateLimit({
   windowMs: 60_000,
   max: 30,
-  keyGenerator: (req) => {
-    if (req.user?.uid) {
-      return `user:${req.user.uid}`;
-    }
-    return ipKeyGenerator(req);
-  },
+  keyGenerator: (req) => `user:${req.user.uid}`,
   message: {
     success: false,
     message: "Rate limit exceeded. Max 30 generation requests per minute.",
@@ -99,15 +103,18 @@ export function createTripoRouter(verifyAuth) {
 
   /** Upload image → image_token */
   router.post("/tripo/upload", verifyAuth, upload.single("file"), uploadFile);
+  router.post("/tripo/upload/sts-target", verifyAuth, getUploadStsTarget);
 
   /** Upload 3D asset (GLB/FBX/OBJ) → import_model task */
   router.post("/tripo/assets/upload", verifyAuth, assetUpload.single("file"), uploadAsset);
+  router.post("/tripo/assets/import", verifyAuth, importUploadedAsset);
 
   /** Create any Tripo task */
   router.post("/tripo/task", verifyAuth, genLimiter, createTask);
 
   /** Poll a single task */
   router.get("/tripo/task/:taskId", verifyAuth, getTask);
+  router.get("/tripo/task/:taskId/stream", verifyAuth, streamTask);
 
   /** Cancel a running/queued task */
   router.post("/tripo/task/:taskId/cancel", verifyAuth, cancelTask);
@@ -129,12 +136,14 @@ export function createTripoRouter(verifyAuth) {
    * ════════════════════════════════════════════════════════════════════ */
 
   /**
-   * Tripo webhook receiver.
-   * NOTE: mount express.raw({ verify: captureRawBody }) BEFORE express.json()
-   * on this route in your app setup:
-   *   app.use("/api/tripo/webhook", express.raw({ type: "application/json", verify: (req, res, buf) => { req.rawBody = buf; } }))
+   * Tripo webhook receiver — express.raw captures the raw body for signature verification
+   * before express.json() in the app can parse and discard it.
    */
-  router.post("/tripo/webhook", handleWebhook);
+  router.post(
+    "/tripo/webhook",
+    express.raw({ type: "application/json", verify: (req, _res, buf) => { req.rawBody = buf; } }),
+    handleWebhook,
+  );
 
   /** Local test — POST { task_id, status } to simulate a webhook */
   router.post("/tripo/webhook/test", verifyAuth, testWebhook);

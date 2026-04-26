@@ -8,6 +8,9 @@ import {
   TRIPO_BASE_URL, DEFAULT_TIMEOUT, MAX_POLL_MS,
   POLL_INTERVAL, RETRY_CONFIG,
 } from "../config/tripo.config.js";
+import { extractModelUrl } from "../utils/tripoUtils.js";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 /* ─── helpers ─────────────────────────────────────────────────────────── */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -16,6 +19,62 @@ const jitter = ms => ms + Math.floor(Math.random() * RETRY_CONFIG.jitterMs);
 
 const backoffDelay = attempt =>
   jitter(Math.min(RETRY_CONFIG.baseDelayMs * 2 ** attempt, RETRY_CONFIG.maxDelayMs));
+
+function logDebug(label, payload) {
+  try {
+    console.log(label, JSON.stringify(payload, null, 2));
+  } catch {
+    console.log(label, payload);
+  }
+}
+
+function appendTrace(message, traceId) {
+  return traceId ? `${message} [Tripo trace: ${traceId}]` : message;
+}
+
+function tripoError(message, traceId, extra = {}) {
+  const err = new Error(appendTrace(message, traceId));
+  if (traceId) err.traceId = traceId;
+  Object.assign(err, extra);
+  return err;
+}
+
+function getTraceId(headers) {
+  return headers.get("X-Tripo-Trace-ID") || headers.get("x-tripo-trace-id") || null;
+}
+
+function parseJsonMaybe(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function formatFromFilename(filename = "") {
+  const ext = String(filename).split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "jpg") return "jpeg";
+  return ext;
+}
+
+function inferS3Region(s3Host = "") {
+  const match = String(s3Host).match(/s3[.-]([a-z0-9-]+)\./i);
+  return match?.[1] || "us-west-2";
+}
+
+function contentTypeForFormat(format, fallback = "application/octet-stream") {
+  const map = {
+    jpeg: "image/jpeg",
+    jpg: "image/jpeg",
+    png: "image/png",
+    webp: "image/webp",
+    glb: "model/gltf-binary",
+    obj: "text/plain",
+    fbx: "application/octet-stream",
+    stl: "model/stl",
+  };
+  return map[format] ?? fallback;
+}
 
 /* ─── TripoClient ─────────────────────────────────────────────────────── */
 export class TripoClient {
@@ -41,24 +100,39 @@ export class TripoClient {
 
     for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.timeoutMs);
 
-      // Link external signal if provided
-      if (options.signal) {
-          options.signal.addEventListener('abort', () => controller.abort());
+      const abortFromCaller = () => controller.abort();
+      if (options.signal?.aborted) {
+        abortFromCaller();
+      } else if (options.signal) {
+        options.signal.addEventListener("abort", abortFromCaller, { once: true });
       }
+      const cleanup = () => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener("abort", abortFromCaller);
+      };
 
       try {
         const res = await fetch(url, { ...options, headers, signal: controller.signal });
-        clearTimeout(timer);
+        cleanup();
+        const traceId = getTraceId(res.headers);
+        const method = options.method ?? "GET";
+        if (traceId) {
+          console.log(`[TripoClient] ${method} ${path} trace=${traceId}`);
+        }
 
         // 429 — rate limited
         if (res.status === 429) {
           const ra = res.headers.get("Retry-After");
           const delay = ra ? parseInt(ra, 10) * 1000 : backoffDelay(attempt);
-          console.warn(`[TripoClient] 429 rate limited, retry ${attempt + 1} in ${delay}ms`);
+          console.warn(`[TripoClient] 429 rate limited, retry ${attempt + 1} in ${delay}ms${traceId ? ` trace=${traceId}` : ""}`);
           await sleep(delay);
-          lastError = new Error("Rate limited (429)");
+          lastError = tripoError("Rate limited (429)", traceId, { status: 429 });
           continue;
         }
 
@@ -66,9 +140,9 @@ export class TripoClient {
         if (res.status >= 500 && RETRY_CONFIG.retryableStatuses.has(res.status)) {
           if (attempt < RETRY_CONFIG.maxRetries) {
             const delay = backoffDelay(attempt);
-            console.warn(`[TripoClient] ${res.status} server error, retry ${attempt + 1} in ${delay}ms`);
+            console.warn(`[TripoClient] ${res.status} server error, retry ${attempt + 1} in ${delay}ms${traceId ? ` trace=${traceId}` : ""}`);
             await sleep(delay);
-            lastError = new Error(`Server error (${res.status})`);
+            lastError = tripoError(`Server error (${res.status})`, traceId, { status: res.status });
             continue;
           }
         }
@@ -76,18 +150,35 @@ export class TripoClient {
         // Non-retryable HTTP error
         if (!res.ok) {
           const body = await res.text().catch(() => "");
-          throw new Error(`Tripo API error (${res.status}): ${body.slice(0, 300)}`);
+          const parsed = parseJsonMaybe(body);
+          const apiMessage = parsed?.message
+            ? `code=${parsed.code ?? res.status}: ${parsed.message}${parsed.suggestion ? ` (${parsed.suggestion})` : ""}`
+            : body.slice(0, 300);
+          throw tripoError(`Tripo API error (${res.status}): ${apiMessage}`, traceId, {
+            status: res.status,
+            code: parsed?.code,
+            suggestion: parsed?.suggestion,
+          });
         }
 
         const json = await res.json();
+        if (traceId) json._traceId = traceId;
         if (json.code !== 0) {
-          throw new Error(`Tripo API code=${json.code}: ${json.message ?? "unknown error"}`);
+          throw tripoError(`Tripo API code=${json.code}: ${json.message ?? "unknown error"}${json.suggestion ? ` (${json.suggestion})` : ""}`, traceId, {
+            code: json.code,
+            suggestion: json.suggestion,
+          });
         }
         return json;
 
       } catch (err) {
-        clearTimeout(timer);
+        cleanup();
         if (err.name === "AbortError") {
+          if (options.signal?.aborted && !timedOut) {
+            const abortErr = new Error("AbortError");
+            abortErr.name = "AbortError";
+            throw abortErr;
+          }
           lastError = new Error(`Request to ${path} timed out after ${this.timeoutMs}ms`);
           if (attempt < RETRY_CONFIG.maxRetries) { await sleep(backoffDelay(attempt)); continue; }
           throw lastError;
@@ -136,6 +227,7 @@ export class TripoClient {
     }
 
     const res = await this.post("/task", taskBody, idempotencyKey, opts.signal);
+    logDebug("[TripoClient] createTask response:", res);
     const taskId = res.data?.task_id;
     if (!taskId) throw new Error(`No task_id in response: ${JSON.stringify(res).slice(0, 200)}`);
     return taskId;
@@ -144,14 +236,14 @@ export class TripoClient {
   async getTask(taskId) {
     const res = await this.get(`/task/${taskId}`);
     if (!res.data) throw new Error(`No task data for ${taskId}`);
-    return res.data;
+    return { ...res.data, ...(res._traceId && { _traceId: res._traceId }) };
   }
 
   async cancelTask(taskId) {
     // Tripo API does not support task cancellation.
     // We only stop polling on the frontend side.
     console.log(`[TripoClient] cancel requested for ${taskId} — no-op (Tripo has no cancel endpoint)`);
-    return { success: true, cancelled: false };
+    return { success: true, cancelled: false, message: "Task cannot be cancelled after submission — it will continue running on Tripo servers until complete." };
   }
 
   async listTasks({ status, limit = 20, cursor } = {}) {
@@ -169,11 +261,86 @@ export class TripoClient {
     return res.data ?? { balance: 0, frozen: 0 };
   }
 
+  async getUploadStsToken(format) {
+    const normalizedFormat = format === "jpg" ? "jpeg" : format;
+    const res = await this.post("/upload/sts/token", { format: normalizedFormat });
+    if (!res.data?.resource_bucket || !res.data?.resource_uri) {
+      throw new Error(`No STS upload target in response: ${JSON.stringify(res).slice(0, 200)}`);
+    }
+    return res.data;
+  }
+
+  async uploadFileObject(buffer, filename, mimeType, format) {
+    const uploadFormat = format ?? formatFromFilename(filename);
+    if (!uploadFormat) throw new Error("Cannot determine Tripo upload format");
+    const sts = await this.getUploadStsToken(uploadFormat);
+    const region = inferS3Region(sts.s3_host);
+    const endpoint = sts.s3_host ? `https://${sts.s3_host}` : undefined;
+    const s3 = new S3Client({
+      region,
+      ...(endpoint && { endpoint }),
+      credentials: {
+        accessKeyId: sts.sts_ak,
+        secretAccessKey: sts.sts_sk,
+        sessionToken: sts.session_token,
+      },
+    });
+
+    await s3.send(new PutObjectCommand({
+      Bucket: sts.resource_bucket,
+      Key: sts.resource_uri,
+      Body: buffer,
+      ContentType: mimeType || contentTypeForFormat(uploadFormat),
+    }));
+
+    return {
+      bucket: sts.resource_bucket,
+      key: sts.resource_uri,
+      format: uploadFormat,
+      s3Host: sts.s3_host,
+    };
+  }
+
+  async createPresignedUploadTarget({ filename, mimeType, format, expiresIn = 900 } = {}) {
+    const uploadFormat = format ?? formatFromFilename(filename);
+    if (!uploadFormat) throw new Error("Cannot determine Tripo upload format");
+
+    const sts = await this.getUploadStsToken(uploadFormat);
+    const region = inferS3Region(sts.s3_host);
+    const endpoint = sts.s3_host ? `https://${sts.s3_host}` : undefined;
+    const s3 = new S3Client({
+      region,
+      ...(endpoint && { endpoint }),
+      credentials: {
+        accessKeyId: sts.sts_ak,
+        secretAccessKey: sts.sts_sk,
+        sessionToken: sts.session_token,
+      },
+    });
+
+    const contentType = mimeType || contentTypeForFormat(uploadFormat);
+    const command = new PutObjectCommand({
+      Bucket: sts.resource_bucket,
+      Key: sts.resource_uri,
+      ContentType: contentType,
+    });
+    const uploadUrl = await getSignedUrl(s3, command, { expiresIn });
+
+    return {
+      uploadUrl,
+      bucket: sts.resource_bucket,
+      key: sts.resource_uri,
+      format: uploadFormat,
+      contentType,
+      expiresIn,
+    };
+  }
+
   async uploadFile(buffer, filename, mimeType) {
     const { Blob } = await import("buffer");
     const form = new FormData();
     form.append("file", new Blob([buffer], { type: mimeType }), filename);
-    const res = await this.postForm("/upload", form);
+    const res = await this.postForm("/upload/sts", form);
     const token = res.data?.image_token;
     if (!token) throw new Error("No image_token in upload response");
     return token;
@@ -194,29 +361,25 @@ export class TripoClient {
       opts.onProgress?.(task.progress ?? 0, task.status);
 
       if (task.status === "success") {
-        const out = task.output ?? {};
+        const { modelUrl, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task);
         return {
           success: true,
           status: "success",
           progress: 100,
-          // FIX: converted_model, stylized_model, segmented_model, textured_model,
-          //        refined_model hozzáadva — history cardban megjelenik
-modelUrl: out.pbr_model ?? out.textured_model ?? out.model
-  ?? out.base_model ?? out.rigged_model
-  ?? (Array.isArray(out.animated_models) ? out.animated_models[0] : out.animated_model)
-            ?? out.converted_model ?? out.low_poly_model
-            ?? out.segmented_model
-            ?? out.stylized_model ?? out.refined_model ?? null,
-          outputFormat: out.format ?? null,
-          rigCheckResult: out.is_animatable ?? null,
-          rawOutput: out,
+          modelUrl,
+          tripoTraceId: task._traceId ?? null,
+          outputFormat: rawOutput.format ?? null,
+          rigCheckResult,
+          rigType,
+          topology,
+          rawOutput,
         };
       }
 
       if (task.status === "failed" || task.status === "cancelled") {
         return {
           success: false, status: task.status, progress: task.progress ?? 0,
-          modelUrl: null, rigCheckResult: null, rawOutput: null
+          modelUrl: null, tripoTraceId: task._traceId ?? null, rigCheckResult: null, rawOutput: null
         };
       }
 

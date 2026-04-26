@@ -29,7 +29,18 @@ export function estimateCost(req) {
   // smart_low_poly, stylize_model, refine_model, mesh_segmentation, etc.
   // These are stored in CREDIT_COSTS without a model_version suffix.
   if (CREDIT_COSTS[req.type] !== undefined) {
-    return { total: CREDIT_COSTS[req.type], breakdown: { [req.type]: CREDIT_COSTS[req.type] } };
+    let cost = CREDIT_COSTS[req.type];
+    const breakdown = { [req.type]: cost };
+
+    if (req.type === "convert_model" && req.smart_low_poly) {
+      cost = CREDIT_COSTS["smart_low_poly"] ?? 10;
+      breakdown.convert_model = cost;
+    } else if (req.type === "convert_model" && req.quad) {
+      cost = CREDIT_COSTS["convert_model:advanced"] ?? 10;
+      breakdown.convert_model = cost;
+    }
+
+    return { total: cost, breakdown };
   }
 
   const base = CREDIT_COSTS[key] ?? 10;
@@ -67,7 +78,16 @@ export function estimateCost(req) {
   if (quadAddon)   breakdown.quad              = quadAddon;
   if (styleAddon)  breakdown.style             = styleAddon;
 
-  const total = base + texAddon + ultraAddon + slpAddon + partsAddon + quadAddon + styleAddon;
+  const totalPerImage = base + texAddon + ultraAddon + slpAddon + partsAddon + quadAddon + styleAddon;
+  
+  // Handle batch images cost multiplier
+  const batchCount = (req.batch_images && Array.isArray(req.batch_images)) ? req.batch_images.length : 1;
+  const total = totalPerImage * batchCount;
+
+  if (batchCount > 1) {
+    breakdown.batch_multiplier = `x${batchCount}`;
+  }
+
   return { total, breakdown };
 }
 
@@ -76,9 +96,12 @@ export function estimateCost(req) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function estimateTextureCost(req) {
-  const isHD     = req.texture_quality === "HD";
+  const textureQuality = String(req.texture_quality ?? "").toLowerCase();
+  const isHD     = textureQuality === "hd" || textureQuality === "detailed";
   const base     = isHD ? (CREDIT_COSTS["texture_model:HD"] ?? 20) : (CREDIT_COSTS.texture_model ?? 10);
-  const styleRef = req.style_reference ? (CREDIT_COSTS["addon:texture_style_ref"] ?? 5) : 0;
+  const styleRef = req.style_reference || req.texture_prompt?.style_image
+    ? (CREDIT_COSTS["addon:texture_style_ref"] ?? 5)
+    : 0;
   const breakdown = { base, ...(styleRef && { style_reference: styleRef }) };
   return { total: base + styleRef, breakdown };
 }

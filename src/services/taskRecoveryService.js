@@ -11,22 +11,29 @@
 import { getTripoClient } from "../lib/tripoClient.js";
 import { refundCredits } from "./creditService.js";
 import admin from "firebase-admin";
+import { extractModelUrl } from "../utils/tripoUtils.js";
 
-const HISTORY_COLLECTION = "trellis_history";
+const HISTORY_COLLECTION = "tripo_history";
+const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
 const POLL_INTERVAL_MS = 5_000; // check every 5 seconds
 const MAX_POLL_MS = 600_000; // 10 minutes max per task
 const CLEANUP_INTERVAL_MS = 60_000; // cleanup completed tasks every minute
 
 const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-/** @type {Map<string, { taskId: string, userId: string, type: string, modelVersion: string, startedAt: number }>} */
+/** @type {Map<string, { taskId: string, userId: string, type: string, modelVersion: string, texture: boolean, pbr: boolean, startedAt: number }>} */
 const pendingTasks = new Map();
+const recentTaskMeta = new Map();
 
 /* ─── Type → mode mapping (same as webhookController) ─────────────────── */
 const TYPE_TO_MODE = {
   text_to_model: "generate",
   image_to_model: "generate",
   multiview_to_model: "generate",
+  import_model: "upload",
+  generate_image: "image",
+  generate_multiview_image: "multiview_image",
+  edit_multiview_image: "multiview_image",
   refine_model: "refine",
   stylize_model: "stylize",
   texture_model: "texture",
@@ -39,17 +46,66 @@ const TYPE_TO_MODE = {
 };
 
 /* ─── Register a task for background tracking ─────────────────────────── */
-export function registerTask(taskId, userId, type, modelVersion, prompt = null) {
+function inferTaskTypeFromHistory(data = {}) {
+  const explicitType = data?.params?.type;
+  if (explicitType) return explicitType;
+  if (data?.source === "upload" || data?.mode === "upload") return "import_model";
+  return null;
+}
+
+async function restorePendingHistoryTasks() {
+  const db = admin.firestore();
+  const snap = await db.collection(HISTORY_COLLECTION)
+    .where("status", "==", "pending")
+    .limit(200)
+    .get();
+
+  let restored = 0;
+  for (const doc of snap.docs) {
+    const data = doc.data() ?? {};
+    const taskId = data.taskId;
+    const userId = data.userId;
+    const type = inferTaskTypeFromHistory(data);
+    if (!taskId || !userId || !type || pendingTasks.has(taskId)) continue;
+
+    registerTask(
+      taskId,
+      userId,
+      type,
+      data?.params?.model_version ?? null,
+      data?.prompt ?? null,
+      {
+        texture: data?.params?.texture === true,
+        pbr: data?.params?.pbr === true,
+      },
+    );
+    restored += 1;
+  }
+
+  if (restored > 0) {
+    console.log(`[TaskRecovery] Restored ${restored} pending history task(s) from Firestore`);
+  }
+}
+
+export function registerTask(taskId, userId, type, modelVersion, prompt = null, extra = {}) {
   if (!taskId || !userId) return;
-  pendingTasks.set(taskId, {
+  const meta = {
     taskId,
     userId,
     type: type ?? "unknown",
     modelVersion: modelVersion ?? "unknown",
     prompt,
+    texture: extra.texture === true,
+    pbr: extra.pbr === true,
     startedAt: Date.now(),
-  });
+  };
+  pendingTasks.set(taskId, meta);
+  recentTaskMeta.set(taskId, meta);
   console.log(`[TaskRecovery] Registered task ${taskId} for user ${userId}${prompt ? ` (${prompt})` : ''}`);
+}
+
+export function getRegisteredTaskMeta(taskId) {
+  return pendingTasks.get(taskId) ?? recentTaskMeta.get(taskId) ?? null;
 }
 
 /* ─── Unregister a task (called when frontend successfully polls it) ──── */
@@ -65,6 +121,9 @@ export function startTaskRecovery() {
   if (pollerInterval) return; // already running
 
   console.log("[TaskRecovery] Background task recovery started");
+  restorePendingHistoryTasks().catch((err) => {
+    console.error("[TaskRecovery] Failed to restore pending history tasks:", err.message);
+  });
 
   pollerInterval = setInterval(async () => {
     if (pendingTasks.size === 0) return;
@@ -90,9 +149,7 @@ export function startTaskRecovery() {
         } else if (status === "failed" || status === "cancelled") {
           await handleFailedTask(entry, taskData);
           pendingTasks.delete(entry.taskId);
-        } else {
           // "queued" or "running" — keep polling
-          console.log(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) still ${status}...`);
         }
       } catch (err) {
         console.error(`[TaskRecovery] Poll error for task ${entry.taskId}:`, err.message);
@@ -107,6 +164,11 @@ export function startTaskRecovery() {
       if (now - entry.startedAt > MAX_POLL_MS) {
         console.log(`[TaskRecovery] Cleaning up timed-out task ${taskId}`);
         pendingTasks.delete(taskId);
+      }
+    }
+    for (const [taskId, entry] of recentTaskMeta) {
+      if (now - entry.startedAt > MAX_POLL_MS) {
+        recentTaskMeta.delete(taskId);
       }
     }
   }, CLEANUP_INTERVAL_MS);
@@ -142,49 +204,70 @@ async function saveToHistory(entry, taskData) {
   if (animatedModels && entry.type === "animate_retarget") {
     console.log(`[TaskRecovery] animate_retarget ${entry.taskId}: animated_models count=${animatedModels.length}`, animatedModels);
   }
-  const modelUrl = out.model ?? out.model_url ?? out.pbr_model ?? out.base_model
-    ?? out.rigged_model ?? (animatedModels ? animatedModels[0] : out.animated_model)
-    ?? out.converted_model ?? out.low_poly_model
-    ?? out.stylized_model ?? null;
+  const prefersTexturedOutput = entry.type === "texture_model" || entry.texture === true || entry.pbr === true;
+  const prefersDraftOutput = !prefersTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(entry.type);
+  const { modelUrl, chosenSource, previewImageUrl } = extractModelUrl(
+    { output: out, type: entry.type },
+    { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput },
+  );
+  if (DEBUG_TRIPO) console.log("[TaskRecovery] output selection:", JSON.stringify({
+    taskId: entry.taskId,
+    type: entry.type,
+    prefersDraftOutput,
+    prefersTexturedOutput,
+    chosenSource,
+    modelUrl,
+    availableOutputKeys: Object.keys(out),
+  }, null, 2));
 
   if (!modelUrl) {
     console.warn(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) succeeded but no model URL found in output:`, JSON.stringify(out));
     return;
   }
 
-  // Check if history entry already exists (idempotency)
+  // Reuse pending history rows when they already exist for this task
   const existing = await db.collection(HISTORY_COLLECTION)
     .where("taskId", "==", entry.taskId)
     .where("userId", "==", entry.userId)
     .limit(1)
     .get();
-
-  if (!existing.empty) {
-    console.log(`[TaskRecovery] History already exists for task ${entry.taskId}`);
-    return;
-  }
+  const existingDoc = existing.docs[0] ?? null;
+  const existingData = existingDoc?.data() ?? null;
 
   const mode = TYPE_TO_MODE[entry.type] ?? "generate";
   const now = Date.now();
+  const taskInput = taskData.input ?? taskData.request ?? {};
 
   const urlsToSave = animatedModels ?? [modelUrl];
   for (let i = 0; i < urlsToSave.length; i++) {
     const url = urlsToSave[i];
     if (!url) continue;
     const stableDocId = urlsToSave.length > 1 ? `tripo_${entry.taskId}_${i}` : `tripo_${entry.taskId}`;
-    await db.collection(HISTORY_COLLECTION).doc(stableDocId).set({
+    const targetRef = i === 0 && existingDoc
+      ? existingDoc.ref
+      : db.collection(HISTORY_COLLECTION).doc(stableDocId);
+    await targetRef.set({
       userId: entry.userId,
-      prompt: entry.prompt ?? taskData.prompt ?? entry.type,
+      prompt: entry.prompt ?? existingData?.prompt ?? taskData.prompt ?? entry.type,
       status: "succeeded",
       model_url: url,
-      source: "tripo",
+      source: existingData?.source ?? (entry.type === "import_model" ? "upload" : "tripo"),
       mode,
       taskId: entry.taskId,
       ...(urlsToSave.length > 1 && { animationIndex: i }),
       params: {
+        ...(existingData?.params ?? {}),
         model_version: entry.modelVersion,
         mode,
         type: entry.type,
+        texture: !!entry.texture,
+        pbr: !!entry.pbr,
+        chosen_source: chosenSource,
+        consumed_credit: taskData.consumed_credit ?? out.consumed_credit ?? null,
+        preview_image_url: previewImageUrl ?? null,
+        originalModelTaskId: taskInput.original_model_task_id ?? taskInput.original_model_id ?? null,
+        originalTaskId: taskInput.original_task_id ?? null,
+        draftModelTaskId: taskInput.draft_model_task_id ?? null,
         rig_type: out.rig_type ?? out.topology ?? null,
         topology: out.topology ?? null,
         is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,
@@ -203,7 +286,26 @@ async function saveToHistory(entry, taskData) {
 async function handleFailedTask(entry, taskData) {
   const taskId = entry.taskId;
   const userId = entry.userId;
-  console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. rawOutput:`, JSON.stringify(taskData.rawOutput ?? {}));
+  const out = taskData.output ?? taskData.rawOutput ?? {};
+  const taskError =
+    taskData.error_msg ??
+    taskData.error_message ??
+    taskData.error ??
+    taskData.message ??
+    taskData.reason ??
+    out.error_msg ??
+    out.error_message ??
+    out.error ??
+    out.message ??
+    out.reason ??
+    null;
+  const taskErrorCode =
+    taskData.error_code ??
+    taskData.code ??
+    out.error_code ??
+    out.code ??
+    null;
+  console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. error=${taskError ?? "unknown"} code=${taskErrorCode ?? "unknown"} rawOutput:`, JSON.stringify(taskData.rawOutput ?? taskData.output ?? {}));
 
   // Look up the charged amount from credit_history
   // NOTE: collectionGroup with multiple where() requires a composite index.
@@ -230,7 +332,7 @@ async function handleFailedTask(entry, taskData) {
   const data = debitDoc.data();
 
   // Check for NSFW/content policy — no refund
-  const errorMsg = (taskData.error ?? "").toLowerCase();
+  const errorMsg = String(taskError ?? "").toLowerCase();
   if (errorMsg.includes("nsfw") || errorMsg.includes("content policy") || errorMsg.includes("safety") || errorMsg.includes("moderat")) {
     console.log(`[TaskRecovery] No refund for task ${taskId}: NSFW/content policy violation`);
     return;

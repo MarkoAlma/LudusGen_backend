@@ -11,7 +11,7 @@ export const activeJobs = new Map();
  */
 export function registerJob(jobId, controller, timeoutMs = 600000) {
     if (!jobId) return;
-    
+
     // Clear any existing job with the same ID (unlikely but safe)
     unregisterJob(jobId);
 
