@@ -10,6 +10,7 @@ import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskM
 import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS, TRIPO_IMAGE_UPLOAD_MAX_BYTES } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
+import { registerJob, unregisterJob } from "../lib/jobRegistry.js";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -146,12 +147,18 @@ async function deleteHistoryForDeadModel({ taskId, modelUrl, uid = null, reason 
 export async function createTask(req, res) {
   const { type, callback_url, idempotency_key, ...rest } = req.body;
   const userId = req.user?.uid;
+  const jobId = req.body.jobId;
+  const controller = new AbortController();
   let estimatedCost = 0;
   let creditsDeducted = false;
   let tempTxId = null;
   let tripoTaskCreated = false;
 
   try {
+    if (jobId) {
+      registerJob(jobId, controller, 1800000); // 30 min for 3D
+    }
+
     let body = { type, ...rest };
 
     logDebug("[TaskController][create-debug] incoming req.body:", req.body);
@@ -519,6 +526,7 @@ export async function createTask(req, res) {
           const taskId = await taskService.create(subBody, {
             callbackUrl: callback_url,
             idempotencyKey: uuid(),
+            signal: controller.signal,
           });
           tripoTaskCreated = true;
           
@@ -540,6 +548,7 @@ export async function createTask(req, res) {
         const taskId = await taskService.create(body, {
           callbackUrl: callback_url,
           idempotencyKey: idempotency_key,
+          signal: controller.signal,
         });
         tripoTaskCreated = true;
 
@@ -561,6 +570,9 @@ export async function createTask(req, res) {
       }
     }
   } catch (err) {
+    if (err.name === 'AbortError') {
+      return res.status(499).json({ success: false, message: "Folyamat megszakítva" });
+    }
     console.error(`[TaskController] create error:`, err.message);
     logDebug("[TaskController][create-debug] error context:", {
       type,
@@ -609,6 +621,8 @@ export async function createTask(req, res) {
     await refundDeductedCredits(type === "texture_model" ? "texture_model_create_failed" : "tripo_create_failed");
 
     res.status(400).json(errorPayload(err, userMessage));
+  } finally {
+    unregisterJob(jobId);
   }
 }
 

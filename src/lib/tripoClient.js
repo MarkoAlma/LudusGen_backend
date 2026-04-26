@@ -100,11 +100,26 @@ export class TripoClient {
 
     for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.timeoutMs);
+
+      const abortFromCaller = () => controller.abort();
+      if (options.signal?.aborted) {
+        abortFromCaller();
+      } else if (options.signal) {
+        options.signal.addEventListener("abort", abortFromCaller, { once: true });
+      }
+      const cleanup = () => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener("abort", abortFromCaller);
+      };
 
       try {
         const res = await fetch(url, { ...options, headers, signal: controller.signal });
-        clearTimeout(timer);
+        cleanup();
         const traceId = getTraceId(res.headers);
         const method = options.method ?? "GET";
         if (traceId) {
@@ -157,8 +172,13 @@ export class TripoClient {
         return json;
 
       } catch (err) {
-        clearTimeout(timer);
+        cleanup();
         if (err.name === "AbortError") {
+          if (options.signal?.aborted && !timedOut) {
+            const abortErr = new Error("AbortError");
+            abortErr.name = "AbortError";
+            throw abortErr;
+          }
           lastError = new Error(`Request to ${path} timed out after ${this.timeoutMs}ms`);
           if (attempt < RETRY_CONFIG.maxRetries) { await sleep(backoffDelay(attempt)); continue; }
           throw lastError;
@@ -171,24 +191,24 @@ export class TripoClient {
   }
 
   /* ── Convenience wrappers ─────────────────────────────────────── */
-  get(path) {
-    return this.fetch(path, { method: "GET" });
+  get(path, signal) {
+    return this.fetch(path, { method: "GET", signal });
   }
 
-  post(path, body, idempotencyKey) {
+  post(path, body, idempotencyKey, signal) {
     return this.fetch(
       path,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal },
       idempotencyKey,
     );
   }
 
-  postForm(path, form) {
-    return this.fetch(path, { method: "POST", body: form });
+  postForm(path, form, signal) {
+    return this.fetch(path, { method: "POST", body: form, signal });
   }
 
   /* ── Task operations ──────────────────────────────────────────── */
-  async createTask(taskBody, idempotencyKey) {
+  async createTask(taskBody, idempotencyKey, opts = {}) {
     console.log("[TripoClient] createTask body:", JSON.stringify(taskBody, null, 2));
 
     // Extra logging for animate tasks to help debugging
@@ -206,7 +226,7 @@ export class TripoClient {
       });
     }
 
-    const res = await this.post("/task", taskBody, idempotencyKey);
+    const res = await this.post("/task", taskBody, idempotencyKey, opts.signal);
     logDebug("[TripoClient] createTask response:", res);
     const taskId = res.data?.task_id;
     if (!taskId) throw new Error(`No task_id in response: ${JSON.stringify(res).slice(0, 200)}`);
