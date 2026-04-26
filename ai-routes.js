@@ -105,6 +105,10 @@ const deapiReferenceAudioUpload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 10 * 1024 * 1024 },
 });
+const deapiImageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 },
+});
 const MINIMAX_MUSIC_SAMPLE_RATES = [16000, 24000, 32000, 44100];
 const MINIMAX_MUSIC_BITRATES = [32000, 64000, 128000, 256000];
 const MINIMAX_MUSIC_FORMATS = ['mp3', 'wav', 'pcm'];
@@ -2291,6 +2295,180 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
     }
 });
 
+router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImageUpload, async (req, res) => {
+    let upscaleSseStarted = false;
+    const startUpscaleSse = () => {
+        if (upscaleSseStarted) return;
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        upscaleSseStarted = true;
+    };
+    const emitUpscaleSse = (data) => {
+        if (res.writableEnded || res.destroyed) return;
+        startUpscaleSse();
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
+    };
+
+    const { jobId } = req.body || {};
+    const controller = new AbortController();
+    registerJob(jobId, controller, 600000);
+
+    try {
+        if (!process.env.DEAPI_API_KEY) {
+            return res.status(500).json({ success: false, message: 'DEAPI_API_KEY nincs beallitva' });
+        }
+
+        const imageFile = req.file || null;
+        if (!imageFile) {
+            return res.status(400).json({ success: false, message: 'Hianyzo kep' });
+        }
+        if (!isSupportedDeapiImageFile(imageFile)) {
+            return res.status(400).json({ success: false, message: 'Csak JPG, PNG, GIF, BMP vagy WebP kep toltheto fel' });
+        }
+
+        let inputMeta = {};
+        try {
+            inputMeta = await sharp(imageFile.buffer).metadata();
+        } catch {
+            return res.status(400).json({ success: false, message: 'A kep nem olvashato' });
+        }
+
+        const startedAt = Date.now();
+        emitUpscaleSse({ type: 'status', status: 'SUBMITTING', progress: 4, elapsed: 0 });
+
+        const submission = await submitDeapiImageUpscale(imageFile, controller.signal, DEAPI_IMAGE_UPSCALE_MODEL);
+        const requestId = submission?.data?.request_id;
+        if (!requestId) {
+            throw new Error('A deAPI nem adott vissza request_id-t');
+        }
+
+        emitUpscaleSse({ type: 'status', status: 'QUEUED', progress: 8, elapsed: 0, requestId });
+
+        const result = await pollDeapiResult(requestId, controller.signal, (event) => {
+            emitUpscaleSse({
+                type: 'status',
+                status: String(event.status || 'processing').toUpperCase(),
+                progress: event.progress,
+                elapsed: event.elapsed,
+                requestId: event.requestId,
+                predicted: Boolean(event.predicted),
+            });
+        }, {
+            label: 'A deAPI upscale',
+            estimatedDuration: 120,
+            isResultReady: (data) => Boolean(extractDeapiImageUrl(data)),
+        });
+
+        const imageUrl = extractDeapiImageUrl(result);
+        if (!imageUrl) {
+            throw new Error('A deAPI nem adott vissza letoltheto kep URL-t');
+        }
+
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        emitUpscaleSse({ type: 'status', status: 'FINALIZING', progress: 96, elapsed, requestId });
+
+        let width = inputMeta.width ? inputMeta.width * 4 : 4096;
+        let height = inputMeta.height ? inputMeta.height * 4 : 4096;
+        try {
+            const outputBuffer = imageUrl.startsWith('data:')
+                ? Buffer.from(imageUrl.split(',')[1] || '', 'base64')
+                : Buffer.from((await axios.get(imageUrl, {
+                    responseType: 'arraybuffer',
+                    timeout: 180000,
+                    maxContentLength: 80 * 1024 * 1024,
+                    httpsAgent,
+                    headers: { Accept: 'image/*,*/*;q=0.8' },
+                })).data);
+            const outputMeta = await sharp(outputBuffer).metadata();
+            width = outputMeta.width || width;
+            height = outputMeta.height || height;
+        } catch (err) {
+            console.warn('[Upscale] Output meret beolvasas kihagyva:', err.message);
+        }
+
+        const storedImage = await processImageAndUpload(req.userId, imageUrl, {
+            prompt: 'RealESRGAN x4 upscale',
+            modelId: DEAPI_IMAGE_UPSCALE_MODEL,
+            provider: 'deapi-upscale',
+            aspect_ratio: inputMeta.width && inputMeta.height ? `${inputMeta.width}:${inputMeta.height}` : 'upscale',
+            width,
+            height,
+            operation: 'upscale',
+            requestId,
+        });
+        const imageId = storedImage?.id || null;
+
+        let outputImage = {
+            url: imageUrl,
+            fullUrl: imageUrl,
+            downloadUrl: imageUrl,
+            width,
+            height,
+            requestId,
+            imageId,
+        };
+
+        if (storedImage?.fullKey) {
+            const filename = sanitizeImageDownloadFilename(`ludusgen_upscale_${imageId || Date.now()}.${storedImage.extension || 'png'}`);
+            const fullUrl = await getSignedUrl(b2, new GetObjectCommand({
+                Bucket: process.env.B2_BUCKET_NAME,
+                Key: storedImage.fullKey,
+            }), { expiresIn: 3600 });
+            const downloadUrl = await getSignedUrl(b2, new GetObjectCommand({
+                Bucket: process.env.B2_BUCKET_NAME,
+                Key: storedImage.fullKey,
+                ResponseContentDisposition: `attachment; filename="${filename}"`,
+            }), { expiresIn: 3600 });
+
+            outputImage = {
+                ...outputImage,
+                url: fullUrl,
+                fullUrl,
+                downloadUrl,
+                storage: 'b2',
+                fullKey: storedImage.fullKey,
+                thumbKey: storedImage.thumbKey,
+            };
+        }
+
+        await logUsage(req.userId, 'image-upscale', {
+            provider: 'deapi',
+            model: DEAPI_IMAGE_UPSCALE_MODEL,
+            requestId,
+            imageId,
+            width,
+            height,
+        });
+
+        unregisterJob(jobId);
+        emitUpscaleSse({
+            type: 'done',
+            success: true,
+            images: [outputImage],
+            requestId,
+            elapsed,
+        });
+        return res.end();
+    } catch (err) {
+        unregisterJob(jobId);
+        const message = err.name === 'AbortError' || err.message === 'AbortError'
+            ? 'Folyamat megszakitva (User/Timeout)'
+            : err.message || 'Upscale hiba';
+
+        if (upscaleSseStarted || res.headersSent) {
+            emitUpscaleSse({ type: 'error', message });
+            return res.end();
+        }
+
+        console.error('Upscale hiba:', err.response?.data || err.message || err);
+        return res.status(err.status || err.response?.status || 500).json({ success: false, message });
+    }
+});
+
 // ════════════════════════════════════════════════════
 // 3.  TTS  —  POST /api/generate-tts
 // ════════════════════════════════════════════════════
@@ -2788,6 +2966,7 @@ const DEAPI_ALLOWED_TXT2AUDIO_MODELS = [
 const DEAPI_TTS_MODES = ['custom_voice', 'voice_clone', 'voice_design'];
 const DEAPI_TTS_FORMATS = ['mp3', 'wav', 'flac'];
 const DEAPI_TTS_SAMPLE_RATES = [16000, 22050, 24000, 44100, 48000];
+const DEAPI_IMAGE_UPSCALE_MODEL = 'RealESRGAN_x4';
 
 function normalizeDeapiModelSlug(slug = '') {
     return String(slug || '').trim().toLowerCase();
@@ -3023,6 +3202,31 @@ async function assertSafeExternalAudioUrl(rawUrl) {
     return parsedUrl.toString();
 }
 
+async function assertSafeExternalImageUrl(rawUrl) {
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(String(rawUrl || ''));
+    } catch {
+        throw new Error('Ervenytelen kep URL');
+    }
+
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('Csak HTTP/HTTPS kep URL toltheto le');
+    }
+
+    const hostname = parsedUrl.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname.endsWith('.local')) {
+        throw new Error('Belso halozati kep URL nem toltheto le');
+    }
+
+    const addresses = await dns.promises.lookup(hostname, { all: true });
+    if (!addresses.length || addresses.some((entry) => isPrivateIpAddress(entry.address))) {
+        throw new Error('Belso halozati kep URL nem toltheto le');
+    }
+
+    return parsedUrl.toString();
+}
+
 function sanitizeAudioDownloadFilename(filename = 'neural_audio.mp3') {
     const cleaned = String(filename || 'neural_audio.mp3')
         .replace(/[\\/:*?"<>|]+/g, '-')
@@ -3030,6 +3234,15 @@ function sanitizeAudioDownloadFilename(filename = 'neural_audio.mp3') {
         .slice(0, 120)
         .trim();
     return cleaned || 'neural_audio.mp3';
+}
+
+function sanitizeImageDownloadFilename(filename = 'ludusgen_image.png') {
+    const cleaned = String(filename || 'ludusgen_image.png')
+        .replace(/[\\/:*?"<>|]+/g, '-')
+        .replace(/\s+/g, '_')
+        .slice(0, 120)
+        .trim();
+    return cleaned || 'ludusgen_image.png';
 }
 
 const AUDIO_ARCHIVE_MAX_BYTES = 100 * 1024 * 1024;
@@ -3241,6 +3454,23 @@ function isSupportedDeapiReferenceAudioFile(file) {
     return supportedMimeTypes.has(String(file.mimetype || '').toLowerCase()) || supportedExtensions.has(extension);
 }
 
+function isSupportedDeapiImageFile(file) {
+    if (!file) return false;
+
+    const supportedMimeTypes = new Set([
+        'image/jpeg',
+        'image/jpg',
+        'image/png',
+        'image/gif',
+        'image/bmp',
+        'image/webp',
+    ]);
+    const supportedExtensions = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']);
+    const extension = path.extname(file.originalname || '').toLowerCase();
+
+    return supportedMimeTypes.has(String(file.mimetype || '').toLowerCase()) || supportedExtensions.has(extension);
+}
+
 function handleDeapiReferenceAudioUpload(req, res, next) {
     deapiReferenceAudioUpload.single('reference_audio')(req, res, (err) => {
         if (!err) return next();
@@ -3258,6 +3488,16 @@ function handleDeapiTtsReferenceAudioUpload(req, res, next) {
             return res.status(400).json({ success: false, message: 'A referencia audio merete legfeljebb 10 MB lehet' });
         }
         return res.status(400).json({ success: false, message: err.message || 'Referencia audio feltoltesi hiba' });
+    });
+}
+
+function handleDeapiImageUpload(req, res, next) {
+    deapiImageUpload.single('image')(req, res, (err) => {
+        if (!err) return next();
+        if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({ success: false, message: 'A kep merete legfeljebb 10 MB lehet' });
+        }
+        return res.status(400).json({ success: false, message: err.message || 'Kep feltoltesi hiba' });
     });
 }
 
@@ -3335,6 +3575,33 @@ async function submitDeapiTextToAudio(payload, signal, referenceAudioFile = null
     }
 }
 
+async function submitDeapiImageUpscale(imageFile, signal, model = DEAPI_IMAGE_UPSCALE_MODEL) {
+    const client = getDeapiClient();
+    const form = new FormData();
+
+    form.append('image', imageFile.buffer, {
+        filename: imageFile.originalname || 'upscale-source.png',
+        contentType: imageFile.mimetype || 'image/png',
+        knownLength: imageFile.size,
+    });
+    form.append('model', model);
+
+    try {
+        const response = await client.post('/api/v1/client/img-upscale', form, {
+            headers: {
+                ...form.getHeaders(),
+                Accept: 'application/json',
+                Authorization: `Bearer ${process.env.DEAPI_API_KEY}`,
+            },
+            signal,
+        });
+
+        return response.data;
+    } catch (err) {
+        throw normalizeDeapiError(err);
+    }
+}
+
 async function waitForAbortableDelay(ms, signal) {
     if (!signal) {
         await new Promise((resolve) => setTimeout(resolve, ms));
@@ -3395,6 +3662,55 @@ function extractDeapiAudioUrl(result = {}) {
     return '';
 }
 
+function extractDeapiImageUrl(result = {}) {
+    const candidates = [
+        result.result_url,
+        result.image_url,
+        result.imageUrl,
+        result.output_url,
+        result.file_url,
+        result.url,
+        result.image,
+        result.result,
+        result.images,
+        result.output_images,
+        result.data?.result_url,
+        result.data?.image_url,
+        result.data?.imageUrl,
+        result.data?.output_url,
+        result.data?.file_url,
+        result.data?.url,
+        result.data?.image,
+        result.data?.result,
+        result.data?.images,
+        result.data?.output_images,
+    ];
+
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) {
+            const value = candidate.trim();
+            if (/^https?:\/\//i.test(value) || value.startsWith('data:image/')) return value;
+            if (/^[A-Za-z0-9+/=\s]+$/.test(value) && value.length > 100) {
+                return `data:image/png;base64,${value.replace(/\s+/g, '')}`;
+            }
+        }
+        if (Array.isArray(candidate)) {
+            for (const item of candidate) {
+                const nested = typeof item === 'string'
+                    ? extractDeapiImageUrl({ url: item })
+                    : extractDeapiImageUrl(item || {});
+                if (nested) return nested;
+            }
+        }
+        if (candidate && typeof candidate === 'object') {
+            const nested = extractDeapiImageUrl(candidate);
+            if (nested) return nested;
+        }
+    }
+
+    return '';
+}
+
 async function pollDeapiResult(requestId, signal, onStatus = null, options = {}) {
     const client = getDeapiClient();
     const startedAt = Date.now();
@@ -3429,7 +3745,11 @@ async function pollDeapiResult(requestId, signal, onStatus = null, options = {})
             predicted: !Number.isFinite(upstreamProgress),
         });
 
-        if (status === 'done' || ((!status || status === 'completed') && extractDeapiAudioUrl(data))) {
+        const isResultReady = typeof options.isResultReady === 'function'
+            ? Boolean(options.isResultReady(data, response.data))
+            : Boolean(extractDeapiAudioUrl(data));
+
+        if (['done', 'completed', 'success', 'succeeded'].includes(status) || (!status && isResultReady)) {
             return data;
         }
         if (['error', 'failed', 'cancelled', 'canceled'].includes(status)) {
@@ -3520,6 +3840,63 @@ router.post('/audio/download', verifyFirebaseToken, audioLimiter, async (req, re
             res.status(400).json({
                 success: false,
                 message: err.response?.data?.message || err.message || 'Az audio letöltése nem sikerült',
+            });
+        }
+    }
+});
+
+router.post('/image/download', verifyFirebaseToken, imageLimiter, async (req, res) => {
+    try {
+        const imageKey = String(req.body?.imageKey || '');
+        const filename = sanitizeImageDownloadFilename(req.body?.filename);
+
+        if (imageKey) {
+            if (!imageKey.startsWith(`users/${req.userId}/images/full/`)) {
+                return res.status(403).json({ success: false, message: 'Ervenytelen kep kulcs' });
+            }
+
+            const result = await b2.send(new GetObjectCommand({
+                Bucket: process.env.B2_BUCKET_NAME,
+                Key: imageKey,
+            }));
+
+            res.setHeader('Content-Type', result.ContentType || 'image/png');
+            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+            res.setHeader('Cache-Control', 'private, no-store');
+            if (result.ContentLength) res.setHeader('Content-Length', result.ContentLength);
+            result.Body.pipe(res);
+            return;
+        }
+
+        const safeImageUrl = await assertSafeExternalImageUrl(req.body?.imageUrl);
+        const upstream = await axios.get(safeImageUrl, {
+            responseType: 'stream',
+            timeout: 180000,
+            maxRedirects: 3,
+            httpsAgent,
+            headers: {
+                Accept: 'image/*,application/octet-stream,*/*;q=0.8',
+            },
+        });
+
+        const contentType = upstream.headers['content-type'] || 'image/png';
+        const lowerContentType = String(contentType).toLowerCase();
+        if (!lowerContentType.startsWith('image/') && !lowerContentType.startsWith('application/octet-stream')) {
+            throw new Error('A letoltott fajl nem kep');
+        }
+
+        const contentLength = upstream.headers['content-length'];
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Cache-Control', 'private, no-store');
+        if (contentLength) res.setHeader('Content-Length', contentLength);
+        upstream.data.pipe(res);
+    } catch (err) {
+        console.error('image download proxy hiba:', err.response?.data || err.message || err);
+        if (!res.headersSent) {
+            res.status(400).json({
+                success: false,
+                message: err.response?.data?.message || err.message || 'A kep letoltese nem sikerult',
             });
         }
     }
@@ -3697,7 +4074,9 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
                 max: maxGuidance,
                 fallback: minGuidance,
             });
-            const safeSeed = Number.isFinite(Number(seed)) ? Math.trunc(Number(seed)) : -1;
+            const seedText = String(seed ?? '').trim();
+            const parsedSeed = Number(seedText);
+            const safeSeed = seedText === '' || !Number.isFinite(parsedSeed) ? -1 : Math.trunc(parsedSeed);
             const safeFormat = String(format || '').trim() || 'flac';
             const safeBpm = bpm === null || bpm === ''
                 ? null
@@ -4165,6 +4544,9 @@ async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
             .toBuffer();
         await uploadMediaToB2(thumbBuffer, thumbKey, 'image/webp');
 
+        const storedWidth = metadata.width || meta.width || 1024;
+        const storedHeight = metadata.height || meta.height || 1024;
+
         // 3. Save to Firestore
         const docRef = await admin.firestore().collection('generated_images').add({
             userId,
@@ -4174,12 +4556,22 @@ async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
             modelId: metadata.modelId || '',
             provider: metadata.provider || '',
             aspect_ratio: metadata.aspect_ratio || '1:1',
-            width: metadata.width || 1024,
-            height: metadata.height || 1024,
+            width: storedWidth,
+            height: storedHeight,
+            operation: metadata.operation || null,
+            requestId: metadata.requestId || null,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        return docRef.id;
+        return {
+            id: docRef.id,
+            fullKey,
+            thumbKey,
+            width: storedWidth,
+            height: storedHeight,
+            contentType: originalMime,
+            extension: ext,
+        };
     } catch (err) {
         console.error('[GalleryStore] Error:', err.message);
         return null;
