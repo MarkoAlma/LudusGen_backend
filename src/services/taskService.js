@@ -97,6 +97,41 @@ function normalizeFileRefList(list, fallbackType = "png") {
   return list.map((item) => normalizeFileRef(item, fallbackType));
 }
 
+function normalizeOptionalFileRef(input, fallbackType = "png") {
+  if (!input) return {};
+  if (typeof input === "object" && !trimString(input.file_token) && !trimString(input.url) && !normalizeObjectRef(input.object)) {
+    return {};
+  }
+  return normalizeFileRef(input, fallbackType);
+}
+
+function normalizeMultiviewFileRefList(list, fallbackType = "png") {
+  if (!Array.isArray(list)) return [];
+  return list.map((item, index) => {
+    try {
+      return normalizeOptionalFileRef(item, fallbackType);
+    } catch (err) {
+      throw new Error(`files[${index}] ${err.message}`);
+    }
+  });
+}
+
+function hasConcreteFileRef(ref) {
+  return Boolean(ref?.file_token || ref?.url || ref?.object);
+}
+
+function validateMultiviewFileList(files) {
+  if (!Array.isArray(files) || files.length !== 4) {
+    throw new Error("multiview_to_model files must contain exactly 4 items in order: front, left, back, right");
+  }
+  if (!hasConcreteFileRef(files[0])) {
+    throw new Error("multiview_to_model files[0] front view is required");
+  }
+  if (files.filter(hasConcreteFileRef).length < 2) {
+    throw new Error("multiview_to_model requires at least two uploaded views");
+  }
+}
+
 function normalizeTexturePromptFileRef(input) {
   const ref = normalizeFileRef(input, "jpg");
   return ref;
@@ -359,10 +394,11 @@ class TaskService {
         }
 
         if (body.type === "multiview_to_model") {
-          if (b.files) b.files = normalizeFileRefList(b.files, "png");
+          if (b.files) b.files = normalizeMultiviewFileRefList(b.files, "png");
           if (!b.original_task_id && (!Array.isArray(b.files) || b.files.length === 0)) {
             throw new Error("files or original_task_id required for multiview_to_model");
           }
+          if (!b.original_task_id) validateMultiviewFileList(b.files);
         }
 
         const np = b["negative_prompt"];
@@ -431,10 +467,11 @@ class TaskService {
         }
 
         if (body.type === "multiview_to_model") {
-          if (b.files) b.files = normalizeFileRefList(b.files, "png");
+          if (b.files) b.files = normalizeMultiviewFileRefList(b.files, "png");
           if (!b.original_task_id && (!Array.isArray(b.files) || b.files.length === 0)) {
             throw new Error("files or original_task_id required for multiview_to_model");
           }
+          if (!b.original_task_id) validateMultiviewFileList(b.files);
         }
 
         // negative_prompt length — Tripo API max 255 characters
@@ -519,38 +556,26 @@ class TaskService {
       }
 
       case "generate_multiview_image": {
-        normalizeStringField(b, "prompt");
-        if (!b.prompt && !b.reference_image && !b.reference_images?.length) {
-          throw new Error("prompt or reference image required for generate_multiview_image");
-        }
-        if (b.prompt) validatePromptLength(b.prompt, "prompt");
-        normalizeStringField(b, "model");
-        normalizeStringField(b, "template_id");
-        normalizeOptionalEnum(b, "mode", VALID_MULTIVIEW_IMAGE_MODES);
-        normalizeSharedGenerationFields(b);
-        if (b.reference_image) b.reference_image = normalizeFileRef(b.reference_image, "png");
-        if (b.reference_images) b.reference_images = normalizeFileRefList(b.reference_images, "png");
-        if (b.orthographic_projection !== undefined) {
-          b.orthographic_projection = normalizeBoolean(b.orthographic_projection, false);
-        }
+        if (b.file) b.file = normalizeFileRef(b.file, "png");
+        if (!b.file) throw new Error("file required for generate_multiview_image");
         break;
       }
 
       case "edit_multiview_image": {
-        normalizeStringField(b, "prompt");
-        if (b.prompt) validatePromptLength(b.prompt, "prompt");
-        normalizeStringField(b, "model");
-        normalizeStringField(b, "template_id");
-        normalizeSharedGenerationFields(b);
-        if (b.reference_image) b.reference_image = normalizeFileRef(b.reference_image, "png");
-        if (b.reference_images) b.reference_images = normalizeFileRefList(b.reference_images, "png");
-        if (b.files) b.files = normalizeFileRefList(b.files, "png");
-        if (b.orthographic_projection !== undefined) {
-          b.orthographic_projection = normalizeBoolean(b.orthographic_projection, false);
-        }
-        if (!b.original_task_id && (!b.reference_images?.length && !b.files?.length && !b.reference_image)) {
-          throw new Error("original_task_id or reference images required for edit_multiview_image");
-        }
+        normalizeStringField(b, "original_task_id");
+        if (!b.original_task_id) throw new Error("original_task_id required for edit_multiview_image");
+        const prompts = Array.isArray(b.prompts) ? b.prompts : [];
+        b.prompts = prompts.map((entry, index) => {
+          const prompt = trimString(entry?.prompt);
+          const view = trimString(entry?.view);
+          if (!prompt) throw new Error(`prompts[${index}].prompt required`);
+          validatePromptLength(prompt, `prompts[${index}].prompt`);
+          if (!["front", "left", "back", "right"].includes(view)) {
+            throw new Error(`prompts[${index}].view must be one of front, left, back, right`);
+          }
+          return { prompt, view };
+        });
+        if (b.prompts.length === 0) throw new Error("prompts required for edit_multiview_image");
         break;
       }
 
