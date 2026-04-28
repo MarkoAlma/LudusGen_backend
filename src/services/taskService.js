@@ -63,6 +63,24 @@ function normalizeOptionalEnum(body, key, validValues) {
   body[key] = value;
 }
 
+function normalizeCallbackUrl(value) {
+  const urlValue = trimString(value);
+  if (!urlValue) return null;
+  if (urlValue.length > 2048) {
+    throw new Error("callback_url too long");
+  }
+  let parsed;
+  try {
+    parsed = new URL(urlValue);
+  } catch {
+    throw new Error("Invalid callback_url");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("callback_url must use http or https");
+  }
+  return parsed.toString();
+}
+
 function normalizeObjectRef(input) {
   if (!input || typeof input !== "object") return null;
   const bucket = trimString(input.bucket);
@@ -297,7 +315,7 @@ class TaskService {
   /* ── Create ─────────────────────────────────────────────────────── */
   async create(body, opts = {}) {
     const validated = this.validate(body);
-    if (opts.callbackUrl) validated["callback_url"] = opts.callbackUrl;
+    if (opts.callbackUrl) validated["callback_url"] = normalizeCallbackUrl(opts.callbackUrl);
 
     const idempotencyKey = opts.idempotencyKey ?? crypto.randomUUID();
     const client = getTripoClient();
@@ -364,6 +382,11 @@ class TaskService {
   /* ── Validate task body ──────────────────────────────────────────── */
   validate(body) {
     const b = { ...body }; // ne mutáljuk az eredetit
+    if (b.callback_url !== undefined) {
+      const normalizedCallbackUrl = normalizeCallbackUrl(b.callback_url);
+      if (normalizedCallbackUrl) b.callback_url = normalizedCallbackUrl;
+      else delete b.callback_url;
+    }
 
     switch (body.type) {
       case "text_to_model":
