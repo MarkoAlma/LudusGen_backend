@@ -28,6 +28,11 @@ import {
     SUMMARY_TRIGGER_COUNT,
     trimToContextLimit,
 } from './src/lib/contextBuilder.js';
+import {
+    encodeImageGalleryCursor,
+    decodeImageGalleryCursor,
+    clampImageGalleryLimit,
+} from './src/lib/imageGalleryCursor.js';
 import { storageService } from './src/services/storageService.js';
 import { canAccessMarketplaceStorageKey } from './src/services/marketplaceService.js';
 import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
@@ -5016,6 +5021,22 @@ async function deleteFromB2(key) {
     }
 }
 
+async function mapWithConcurrency(items, limit, mapper) {
+    const results = new Array(items.length);
+    let index = 0;
+
+    async function worker() {
+        while (index < items.length) {
+            const current = index++;
+            results[current] = await mapper(items[current], current);
+        }
+    }
+
+    const workerCount = Math.min(Math.max(limit, 1), items.length || 1);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results;
+}
+
 const AUDIO_MIME_EXT = {
     'audio/mpeg': 'mp3',
     'audio/mp3': 'mp3',
@@ -5439,17 +5460,32 @@ router.delete('/chat/session/:sessionId', verifyFirebaseToken, async (req, res) 
 router.get('/image-gallery', verifyFirebaseToken, async (req, res) => {
     try {
         const userId = req.userId;
-        const snap = await admin.firestore()
+        const limit = clampImageGalleryLimit(req.query.limit);
+        const cursor = decodeImageGalleryCursor(req.query.cursor);
+        let query = admin.firestore()
             .collection('generated_images')
             .where('userId', '==', userId)
             .orderBy('createdAt', 'desc')
-            .limit(100)
-            .get();
+            .orderBy(admin.firestore.FieldPath.documentId(), 'desc')
+            .limit(limit + 1);
 
-        if (snap.empty) return res.json({ success: true, images: [] });
+        if (cursor?.createdAtMs && cursor?.id) {
+            query = query.startAfter(
+                admin.firestore.Timestamp.fromMillis(cursor.createdAtMs),
+                cursor.id
+            );
+        }
 
-        const images = await Promise.all(snap.docs.map(async (doc) => {
+        const snap = await query.get();
+        const pageDocs = snap.docs.slice(0, limit);
+        const hasMore = snap.docs.length > limit;
+
+        const images = await Promise.all(pageDocs.map(async (doc) => {
             const data = doc.data();
+            const createdAtMs = getTimestampMillis(data.createdAt);
+            const createdAt = data.createdAt?.toDate
+                ? data.createdAt.toDate().toISOString()
+                : data.createdAt || null;
             const canReadFull = data.full_key
                 ? await canAccessMarketplaceStorageKey(admin.firestore(), { userId, key: data.full_key })
                 : false;
@@ -5472,15 +5508,28 @@ router.get('/image-gallery', verifyFirebaseToken, async (req, res) => {
 
             return {
                 id: doc.id,
-                ...data,
-                fullUrl,
+                prompt: data.prompt || '',
+                modelId: data.modelId || '',
+                provider: data.provider || '',
+                aspect_ratio: data.aspect_ratio || '1:1',
+                width: data.width ?? null,
+                height: data.height ?? null,
+                thumb_key: data.thumb_key || null,
+                full_key: data.full_key || null,
                 thumbUrl,
+                fullUrl,
                 downloadUrl,
-                createdAt: data.createdAt?.toDate?.() || new Date(),
+                createdAt,
+                createdAtMs,
             };
         }));
 
-        res.json({ success: true, images });
+        const lastImage = images[images.length - 1];
+        const nextCursor = hasMore && lastImage?.createdAtMs
+            ? encodeImageGalleryCursor({ createdAtMs: lastImage.createdAtMs, id: lastImage.id })
+            : null;
+
+        res.json({ success: true, images, hasMore, nextCursor });
     } catch (err) {
         console.error('[GalleryList] Error:', err);
         res.status(500).json({ success: false, message: 'Galéria lekérdezése sikertelen' });

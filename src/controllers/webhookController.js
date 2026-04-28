@@ -102,10 +102,11 @@ async function saveCompletedTaskToHistory(taskId, payload) {
   const taskType = payload.type ?? taskData.type;
   const preferTexturedOutput = taskType === "texture_model" || taskInput.texture === true || taskInput.pbr === true;
   const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskType);
-  const { modelUrl, chosenSource } = extractModelUrl(
+  const { modelUrl, chosenSource, previewImageUrl, previewImageUrls } = extractModelUrl(
     { output: out, type: taskType },
     { preferBaseModel: preferDraftOutput, preferPbrModel: preferTexturedOutput },
   );
+
 
   if (!modelUrl) {
     console.log(`[WebhookController] No model URL for completed task ${taskId}`);
@@ -117,6 +118,9 @@ async function saveCompletedTaskToHistory(taskId, payload) {
     text_to_model: "generate",
     image_to_model: "generate",
     multiview_to_model: "generate",
+    generate_image: "image",
+    generate_multiview_image: "multiview_image",
+    edit_multiview_image: "multiview_image",
     refine_model: "refine",
     stylize_model: "stylize",
     texture_model: "texture",
@@ -147,6 +151,8 @@ async function saveCompletedTaskToHistory(taskId, payload) {
       texture: !!taskInput.texture,
       pbr: !!taskInput.pbr,
       chosen_source: chosenSource,
+      preview_image_url: previewImageUrl ?? null,
+      preview_image_urls: previewImageUrls ?? [],
       originalModelTaskId: taskInput.original_model_task_id ?? taskInput.original_model_id ?? null,
       draftModelTaskId: taskInput.draft_model_task_id ?? null,
       rig_type: out.rig_type ?? out.topology ?? null,
