@@ -1,4 +1,5 @@
 import admin from "firebase-admin";
+import crypto from "node:crypto";
 
 export const MARKETPLACE_COLLECTIONS = {
   assets: "marketplace_assets",
@@ -9,6 +10,7 @@ export const MARKETPLACE_COLLECTIONS = {
 
 const USERS_COLLECTION = "users";
 const CREDIT_HISTORY_COLLECTION = "credit_history";
+const PURCHASE_SIGNATURE_VERSION = "v1";
 const PAYOUT_BUCKETS = [
   { percent: 80, weight: 45 },
   { percent: 85, weight: 35 },
@@ -42,6 +44,147 @@ function isMetadataComplete(asset = {}) {
   );
 }
 
+function getStorageKey(asset = {}) {
+  return asset.storage?.key || asset.storageKey || null;
+}
+
+function safePositiveDimension(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  const rounded = Math.round(number);
+  return rounded > 0 && rounded <= 200_000 ? rounded : null;
+}
+
+function normalizeAssetMetadata(metadata = {}, type = "") {
+  if (type !== "image") return null;
+
+  const source = metadata?.image || metadata || {};
+  const width = safePositiveDimension(source.width);
+  const height = safePositiveDimension(source.height);
+  if (!width || !height) return null;
+
+  return {
+    image: {
+      width,
+      height,
+      ...(source.format ? { format: String(source.format).slice(0, 24) } : {}),
+      ...(source.animated === true ? { animated: true } : {}),
+    },
+  };
+}
+
+export function isProtectedMarketplaceStorageKey(key) {
+  const value = String(key || "");
+  return value.startsWith("marketplace/") && !value.startsWith("marketplace/previews/");
+}
+
+function getPurchaseSigningSecret() {
+  return process.env.MARKETPLACE_PURCHASE_SIGNING_SECRET || process.env.B2_APP_KEY;
+}
+
+function canonicalPurchasePayload(purchase = {}) {
+  return JSON.stringify({
+    version: PURCHASE_SIGNATURE_VERSION,
+    id: String(purchase.id || ""),
+    buyerId: String(purchase.buyerId || ""),
+    sellerId: String(purchase.sellerId || ""),
+    assetId: String(purchase.assetId || ""),
+    assetType: String(purchase.assetType || ""),
+    priceCredits: Number(purchase.priceCredits || 0),
+    storageKey: String(purchase.storageKey || ""),
+    status: String(purchase.status || ""),
+  });
+}
+
+export function signMarketplacePurchase(purchase = {}) {
+  const secret = getPurchaseSigningSecret();
+  if (!secret) {
+    throw new Error("Missing marketplace purchase signing secret");
+  }
+  return crypto
+    .createHmac("sha256", secret)
+    .update(canonicalPurchasePayload(purchase))
+    .digest("hex");
+}
+
+function signaturesMatch(actual, expected) {
+  if (!actual || !expected || actual.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(actual, "hex"), Buffer.from(expected, "hex"));
+}
+
+export function isVerifiedMarketplacePurchase(purchase = {}, { buyerId, assetId, asset } = {}) {
+  if (!purchase || typeof purchase !== "object") return false;
+  if (purchase.status !== "completed") return false;
+  if (purchase.buyerId !== buyerId) return false;
+  if (purchase.assetId !== assetId) return false;
+  if (purchase.sellerId !== asset?.ownerId) return false;
+  if (purchase.assetType !== asset?.type) return false;
+  if (purchase.storageKey !== getStorageKey(asset)) return false;
+  if (!Number.isInteger(Number(purchase.priceCredits)) || Number(purchase.priceCredits) < 20) return false;
+  if (purchase.signatureVersion !== PURCHASE_SIGNATURE_VERSION || purchase.serverVerified !== true) return false;
+
+  try {
+    return signaturesMatch(purchase.accessSignature, signMarketplacePurchase(purchase));
+  } catch {
+    return false;
+  }
+}
+
+export async function getVerifiedMarketplacePurchase(db, { buyerId, assetId, asset } = {}) {
+  if (!buyerId || !assetId || !asset) return null;
+  const purchaseRef = db.collection(MARKETPLACE_COLLECTIONS.purchases).doc(getPurchaseId(buyerId, assetId));
+  const purchaseDoc = await purchaseRef.get();
+  if (!purchaseDoc.exists) return null;
+
+  const purchase = purchaseDoc.data();
+  if (!isVerifiedMarketplacePurchase(purchase, { buyerId, assetId, asset })) return null;
+  return { id: purchaseDoc.id, ...purchase };
+}
+
+export async function canAccessMarketplaceStorageKey(db, { userId, key, assetId = null } = {}) {
+  if (!isProtectedMarketplaceStorageKey(key)) return true;
+  if (!userId || !key) return false;
+
+  let resolvedAssetId = assetId;
+  let asset = null;
+
+  if (resolvedAssetId) {
+    const assetDoc = await db.collection(MARKETPLACE_COLLECTIONS.assets).doc(resolvedAssetId).get();
+    if (!assetDoc.exists) return false;
+    asset = assetDoc.data();
+  } else {
+    const assetSnap = await db.collection(MARKETPLACE_COLLECTIONS.assets)
+      .where("storage.key", "==", key)
+      .limit(1)
+      .get();
+    if (assetSnap.empty) return false;
+    const assetDoc = assetSnap.docs[0];
+    resolvedAssetId = assetDoc.id;
+    asset = assetDoc.data();
+  }
+
+  if (getStorageKey(asset) !== key) return false;
+  if (asset.ownerId === userId) return true;
+
+  const purchase = await getVerifiedMarketplacePurchase(db, {
+    buyerId: userId,
+    assetId: resolvedAssetId,
+    asset,
+  });
+  return Boolean(purchase);
+}
+
+export function sanitizePurchaseForClient(purchase = {}) {
+  const {
+    accessSignature,
+    serverVerified,
+    signatureVersion,
+    storageKey,
+    ...safePurchase
+  } = purchase;
+  return safePurchase;
+}
+
 export function calculateFeaturedScore(asset = {}, now = Date.now()) {
   const manualFeaturedBoost = Number(asset.manualFeaturedBoost || 0);
   const purchaseCount = Number(asset.metrics?.purchaseCount ?? asset.purchaseCount ?? 0);
@@ -52,7 +195,7 @@ export function calculateFeaturedScore(asset = {}, now = Date.now()) {
   const compatibilityScore = asset.type === "3d"
     ? (asset.tripo?.compatible ? 20 : 0)
     : 10;
-  const previewExists = Boolean(asset.preview?.key || asset.storage?.thumbKey || asset.storage?.key || asset.previewUrl);
+  const previewExists = Boolean(asset.preview?.key || asset.storage?.thumbKey || asset.previewUrl);
   const qualityScore = previewExists && isMetadataComplete(asset) ? 10 : 0;
 
   return manualFeaturedBoost + purchaseScore + freshnessScore + compatibilityScore + qualityScore;
@@ -85,6 +228,7 @@ export function normalizeAssetForClient(id, data = {}) {
     tags: Array.isArray(data.tags) ? data.tags : [],
     status: data.status || "published",
     source: data.source || null,
+    metadata: normalizeAssetMetadata(data.metadata, data.type),
     storage: {
       fileName: data.storage?.fileName || data.fileName || "asset",
       contentType: data.storage?.contentType || data.contentType || "application/octet-stream",
@@ -105,7 +249,7 @@ export function normalizeAssetForClient(id, data = {}) {
 export async function syncPurchasedAssetToHistory(buyerId, assetId, asset, purchaseId) {
   const db = admin.firestore();
   const now = Date.now();
-  const storageKey = asset.storage?.key || asset.storageKey;
+  const storageKey = getStorageKey(asset);
   const downloadUrl = `/api/marketplace/assets/${assetId}/download?inline=1`;
 
   if (asset.type === "3d") {
@@ -133,20 +277,22 @@ export async function syncPurchasedAssetToHistory(buyerId, assetId, asset, purch
   }
 
   if (asset.type === "audio" && storageKey) {
-    await db.collection("audio_history").doc(`marketplace_${buyerId}_${assetId}`).set({
+    await db.collection("generated_audio").doc(`marketplace_${buyerId}_${assetId}`).set({
       userId: buyerId,
       type: asset.source?.audioKind || "audio",
       title: asset.title || "Marketplace audio",
       prompt: asset.description || "",
-      storageKey,
+      b2_key: storageKey,
       marketplaceLocked: true,
       marketplaceAssetId: assetId,
       marketplacePurchaseId: purchaseId,
       fileName: asset.storage?.fileName || "marketplace_audio.mp3",
       fileFormat: asset.storage?.fileName?.split(".").pop()?.toLowerCase() || "mp3",
       contentType: asset.storage?.contentType || "audio/mpeg",
-      size: Number(asset.storage?.size || 0),
+      fileSize: Number(asset.storage?.size || 0),
+      storage: "b2",
       provider: "marketplace",
+      createdAtMs: now,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       ts: now,
     }, { merge: true });
@@ -155,7 +301,7 @@ export async function syncPurchasedAssetToHistory(buyerId, assetId, asset, purch
 
 export async function purchaseAsset(assetId, buyerId) {
   if (!assetId || !buyerId) {
-    throw Object.assign(new Error("Hianyzo asset vagy vasarlo azonosito"), { status: 400 });
+    throw Object.assign(new Error("Missing asset or buyer identifier"), { status: 400 });
   }
 
   const db = admin.firestore();
@@ -168,29 +314,34 @@ export async function purchaseAsset(assetId, buyerId) {
   let result = null;
 
   await db.runTransaction(async (tx) => {
-    const purchaseDoc = await tx.get(purchaseRef);
-    if (purchaseDoc.exists) {
-      const existing = purchaseDoc.data();
-      result = {
-        alreadyOwned: true,
-        purchaseId,
-        purchase: existing,
-        libraryItem: { id: purchaseId, ...existing },
-      };
-      return;
-    }
-
     const assetDoc = await tx.get(assetRef);
     if (!assetDoc.exists) {
       throw Object.assign(new Error("Asset nem talalhato"), { status: 404 });
     }
 
     const asset = assetDoc.data();
+    const purchaseDoc = await tx.get(purchaseRef);
+    if (purchaseDoc.exists) {
+      const existing = purchaseDoc.data();
+      if (!isVerifiedMarketplacePurchase(existing, { buyerId, assetId, asset })) {
+        throw Object.assign(new Error("Ervenytelen marketplace purchase record"), { status: 409 });
+      }
+
+      const safePurchase = sanitizePurchaseForClient({ id: purchaseId, ...existing });
+      result = {
+        alreadyOwned: true,
+        purchaseId,
+        purchase: safePurchase,
+        libraryItem: safePurchase,
+      };
+      return;
+    }
+
     if (asset.status !== "published") {
       throw Object.assign(new Error("Ez az asset jelenleg nem vasarolhato"), { status: 409 });
     }
     if (asset.ownerId === buyerId) {
-      throw Object.assign(new Error("Sajat assetet nem lehet megvasarolni"), { status: 400 });
+      throw Object.assign(new Error("You cannot buy your own asset"), { status: 400 });
     }
 
     const priceCredits = Number(asset.priceCredits || 0);
@@ -204,15 +355,15 @@ export async function purchaseAsset(assetId, buyerId) {
     const sellerDoc = await tx.get(sellerRef);
 
     if (!buyerDoc.exists) {
-      throw Object.assign(new Error("Vasarloi profil nem talalhato"), { status: 404 });
+      throw Object.assign(new Error("Buyer profile not found"), { status: 404 });
     }
     if (!sellerDoc.exists) {
-      throw Object.assign(new Error("Eladoi profil nem talalhato"), { status: 404 });
+      throw Object.assign(new Error("Seller profile not found"), { status: 404 });
     }
 
     const buyerCredits = Number(buyerDoc.data().credits || 0);
     if (buyerCredits < priceCredits) {
-      throw Object.assign(new Error("Nincs eleg kredit a vasarlashoz"), {
+      throw Object.assign(new Error("Not enough credits for this purchase"), {
         status: 402,
         code: "INSUFFICIENT_CREDITS",
         available: buyerCredits,
@@ -226,7 +377,7 @@ export async function purchaseAsset(assetId, buyerId) {
     const createdAt = admin.firestore.FieldValue.serverTimestamp();
     const assetSnapshot = normalizeAssetForClient(assetDoc.id, asset);
 
-    const purchase = {
+    const purchaseBase = {
       id: purchaseId,
       buyerId,
       sellerId: asset.ownerId,
@@ -237,10 +388,17 @@ export async function purchaseAsset(assetId, buyerId) {
       sellerPayoutPercent: payoutPercent,
       sellerPayoutCredits,
       platformProfitCredits,
-      storageKey: asset.storage?.key || asset.storageKey || null,
+      storageKey: getStorageKey(asset),
       createdAt,
       status: "completed",
     };
+    const purchase = {
+      ...purchaseBase,
+      serverVerified: true,
+      signatureVersion: PURCHASE_SIGNATURE_VERSION,
+      accessSignature: signMarketplacePurchase(purchaseBase),
+    };
+    const safePurchase = sanitizePurchaseForClient(purchase);
 
     tx.update(buyerRef, { credits: buyerCredits - priceCredits });
     tx.update(sellerRef, { credits: admin.firestore.FieldValue.increment(sellerPayoutCredits) });
@@ -302,10 +460,10 @@ export async function purchaseAsset(assetId, buyerId) {
     result = {
       alreadyOwned: false,
       purchaseId,
-      purchase,
+      purchase: safePurchase,
       libraryItem: {
         id: purchaseId,
-        ...purchase,
+        ...safePurchase,
         asset: assetSnapshot,
       },
       asset,

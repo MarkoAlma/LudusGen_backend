@@ -2,17 +2,22 @@ import admin from "firebase-admin";
 import axios from "axios";
 import crypto from "node:crypto";
 import path from "node:path";
+import { Readable } from "node:stream";
 import sharp from "sharp";
 import { storageService } from "../services/storageService.js";
 import {
   MARKETPLACE_COLLECTIONS,
   calculateFeaturedScore,
+  getVerifiedMarketplacePurchase,
+  isVerifiedMarketplacePurchase,
   normalizeAssetForClient,
   purchaseAsset,
+  sanitizePurchaseForClient,
 } from "../services/marketplaceService.js";
 import { getTripoClient } from "../lib/tripoClient.js";
 import { taskService } from "../services/taskService.js";
 import { registerTask as registerForRecovery } from "../services/taskRecoveryService.js";
+import { createWatermarkedAudioPreview } from "../services/audioPreviewService.js";
 
 const TYPE_CONFIG = {
   image: {
@@ -85,6 +90,13 @@ function safeFileName(name = "asset") {
     .slice(0, 120);
 }
 
+function contentDisposition(type, filename) {
+  const fallback = safeFileName(filename || "asset.bin").replace(/"/g, "") || "asset.bin";
+  const encoded = encodeURIComponent(String(filename || fallback))
+    .replace(/['()]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${type}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
 function safeTags(tags) {
   if (Array.isArray(tags)) return tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 12);
   if (typeof tags === "string") return tags.split(",").map((tag) => tag.trim()).filter(Boolean).slice(0, 12);
@@ -97,6 +109,81 @@ function keyFor(userId, type, filename, folder = "assets") {
   return `marketplace/${folder}/${userId}/${Date.now()}_${crypto.randomUUID()}_${base}.${ext}`;
 }
 
+function safePreviewKey(key, ownerId, storageKey = null) {
+  const value = String(key || "");
+  if (!value) return null;
+  if (storageKey && value === storageKey) return null;
+  return value.startsWith(`marketplace/previews/${ownerId}/`) ? value : null;
+}
+
+function safePositiveDimension(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  const rounded = Math.round(number);
+  return rounded > 0 && rounded <= 200_000 ? rounded : null;
+}
+
+function imageMetadataFromSharpMetadata(metadata = {}) {
+  const rawWidth = safePositiveDimension(metadata.width);
+  const rawHeight = safePositiveDimension(metadata.height);
+  if (!rawWidth || !rawHeight) return null;
+
+  const orientation = Number(metadata.orientation || 1);
+  const shouldSwap = [5, 6, 7, 8].includes(orientation);
+  const image = {
+    width: shouldSwap ? rawHeight : rawWidth,
+    height: shouldSwap ? rawWidth : rawHeight,
+  };
+
+  if (metadata.format) image.format = String(metadata.format);
+  if (Number(metadata.pages || 0) > 1) image.animated = true;
+  return { image };
+}
+
+function sanitizeImageMetadata(metadata = {}) {
+  const source = metadata?.image || metadata || {};
+  const width = safePositiveDimension(source.width);
+  const height = safePositiveDimension(source.height);
+  if (!width || !height) return null;
+
+  const image = { width, height };
+  if (source.format) image.format = String(source.format).slice(0, 24);
+  if (source.animated === true) image.animated = true;
+  return { image };
+}
+
+async function getImageMetadata(buffer) {
+  const metadata = await sharp(buffer, { failOn: "none" }).metadata();
+  return imageMetadataFromSharpMetadata(metadata);
+}
+
+async function getImageMetadataFromStorage(storageKey) {
+  if (!storageKey) return null;
+  const buffer = await storageService.getFileBuffer(storageKey);
+  return getImageMetadata(buffer);
+}
+
+async function ensureImageMetadata(ref, data = {}) {
+  if (data.type !== "image") return data;
+
+  const existing = sanitizeImageMetadata(data.metadata);
+  if (existing) return { ...data, metadata: existing };
+
+  try {
+    const metadata = await getImageMetadataFromStorage(data.storage?.key || data.storageKey);
+    if (!metadata) return data;
+
+    ref.update({
+      metadata,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => {});
+    return { ...data, metadata };
+  } catch (err) {
+    console.warn("[Marketplace] image metadata detection failed:", err.message);
+    return data;
+  }
+}
+
 function toMillis(value) {
   if (!value) return null;
   if (typeof value === "number") return value;
@@ -104,6 +191,99 @@ function toMillis(value) {
   if (typeof value?.toMillis === "function") return value.toMillis();
   if (typeof value?.toDate === "function") return value.toDate().getTime();
   return null;
+}
+
+const DEFAULT_MARKETPLACE_PAGE_SIZE = 32;
+const MAX_MARKETPLACE_PAGE_SIZE = 64;
+const MARKETPLACE_CURSOR_VERSION = 1;
+
+const MARKETPLACE_SORTS = {
+  featured: { id: "featured", field: "featuredScore", direction: "desc" },
+  newest: { id: "newest", field: "ts", direction: "desc" },
+  price_asc: { id: "price_asc", field: "priceCredits", direction: "asc" },
+  price_desc: { id: "price_desc", field: "priceCredits", direction: "desc" },
+  most_bought: { id: "most_bought", field: "metrics.purchaseCount", direction: "desc" },
+  popular: { id: "most_bought", field: "metrics.purchaseCount", direction: "desc" },
+};
+
+function parseMarketplacePageSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size)) return DEFAULT_MARKETPLACE_PAGE_SIZE;
+  return Math.min(MAX_MARKETPLACE_PAGE_SIZE, Math.max(1, Math.floor(size)));
+}
+
+function parseOptionalPrice(value, name) {
+  if (value == null || value === "") return null;
+  const price = Number(value);
+  if (!Number.isFinite(price) || price < 0) {
+    throw Object.assign(new Error(`Invalid ${name}`), { status: 400 });
+  }
+  return price;
+}
+
+function normalizeMarketplaceSort(value) {
+  const key = String(value || "featured").toLowerCase();
+  return MARKETPLACE_SORTS[key] || MARKETPLACE_SORTS.featured;
+}
+
+function encodeMarketplaceCursor(doc, sortConfig) {
+  const payload = JSON.stringify({
+    v: MARKETPLACE_CURSOR_VERSION,
+    sort: sortConfig.id,
+    id: doc.id,
+  });
+  return Buffer.from(payload, "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function decodeMarketplaceCursor(value, sortConfig) {
+  const cursor = String(value || "").trim();
+  if (!cursor) return null;
+
+  try {
+    const base64 = cursor.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+    const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+    if (
+      payload?.v !== MARKETPLACE_CURSOR_VERSION ||
+      payload?.sort !== sortConfig.id ||
+      typeof payload?.id !== "string" ||
+      payload.id.length > 180
+    ) {
+      throw new Error("Cursor does not match this marketplace query");
+    }
+    return payload;
+  } catch (err) {
+    throw Object.assign(new Error(err.message || "Invalid marketplace cursor"), { status: 400 });
+  }
+}
+
+function matchesMarketplaceFilters(doc, filters) {
+  const data = doc.data();
+  if (data.status !== "published") return false;
+  if (filters.requestedType && data.type !== filters.requestedType) return false;
+
+  if (filters.qText) {
+    const haystack = [
+      data.title,
+      data.description,
+      data.ownerName,
+      ...(Array.isArray(data.tags) ? data.tags : []),
+    ].join(" ").toLowerCase();
+    if (!haystack.includes(filters.qText)) return false;
+  }
+
+  const priceCredits = Number(data.priceCredits || 0);
+  if (filters.minPrice != null && priceCredits < filters.minPrice) return false;
+  if (filters.maxPrice != null && priceCredits > filters.maxPrice) return false;
+  if (filters.ownership === "owned" && !filters.ownedIds.has(doc.id)) return false;
+  if (filters.ownership === "not_owned" && filters.ownedIds.has(doc.id)) return false;
+  if (filters.tripo === "compatible" && !(data.type === "3d" && data.tripo?.compatible === true)) return false;
+  if (filters.tripo === "download_only" && !(data.type === "3d" && data.tripo?.compatible !== true)) return false;
+  return true;
 }
 
 async function getOptionalUserId(req) {
@@ -117,14 +297,44 @@ async function getOptionalUserId(req) {
   }
 }
 
-async function getOwnedAssetIds(userId) {
+async function getOwnedAssetIds(userId, { verifyAssets = true } = {}) {
   if (!userId) return new Set();
+  const db = admin.firestore();
   const snap = await admin.firestore()
     .collection(MARKETPLACE_COLLECTIONS.purchases)
     .where("buyerId", "==", userId)
     .limit(500)
     .get();
-  return new Set(snap.docs.map((doc) => doc.data().assetId).filter(Boolean));
+  const ownedIds = new Set();
+
+  if (!verifyAssets) {
+    snap.docs.forEach((doc) => {
+      const purchase = doc.data();
+      if (
+        purchase?.buyerId === userId &&
+        purchase?.assetId &&
+        purchase?.status === "completed" &&
+        purchase?.serverVerified === true
+      ) {
+        ownedIds.add(purchase.assetId);
+      }
+    });
+    return ownedIds;
+  }
+
+  await Promise.all(snap.docs.map(async (doc) => {
+    const purchase = doc.data();
+    const assetId = purchase.assetId;
+    if (!assetId) return;
+
+    const assetSnap = await db.collection(MARKETPLACE_COLLECTIONS.assets).doc(assetId).get();
+    if (!assetSnap.exists) return;
+    if (isVerifiedMarketplacePurchase(purchase, { buyerId: userId, assetId, asset: assetSnap.data() })) {
+      ownedIds.add(assetId);
+    }
+  }));
+
+  return ownedIds;
 }
 
 async function assetForClient(doc, ownedIds = new Set()) {
@@ -165,7 +375,8 @@ async function assetForClient(doc, ownedIds = new Set()) {
   }
 
   const asset = normalizeAssetForClient(id, data);
-  const previewKey = data.preview?.key || data.storage?.thumbKey || (data.type === "image" ? data.storage?.key : null);
+  const storageKey = data.storage?.key || data.storageKey;
+  const previewKey = safePreviewKey(data.preview?.key || data.storage?.thumbKey, data.ownerId, storageKey);
 
   if (previewKey) {
     asset.previewUrl = await storageService.getSignedUrl(previewKey, 3600);
@@ -176,11 +387,125 @@ async function assetForClient(doc, ownedIds = new Set()) {
   return asset;
 }
 
+const MARKETPLACE_PREVIEW_MAX_SIZE = 720;
+const MARKETPLACE_WATERMARK_TEXT = "LudusGen Preview";
+const MARKETPLACE_WATERMARK_MICROTEXT = "LUDUSGEN MARKETPLACE PREVIEW ONLY";
+
+function escapeSvgText(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function createWatermarkNoise(width, height, seedText) {
+  const count = Math.max(28, Math.round((width * height) / 15500));
+  const marks = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const hash = crypto.createHash("sha256")
+      .update(`${seedText}:${width}:${height}:${index}`)
+      .digest();
+    const x = Math.round((hash[0] / 255) * width);
+    const y = Math.round((hash[1] / 255) * height);
+    const length = 6 + Math.round((hash[2] / 255) * 18);
+    const angle = ((hash[3] / 255) * 360) * (Math.PI / 180);
+    const x2 = Math.round(x + Math.cos(angle) * length);
+    const y2 = Math.round(y + Math.sin(angle) * length);
+    const opacity = (0.018 + (hash[4] / 255) * 0.026).toFixed(3);
+    const stroke = hash[5] % 2 === 0 ? "#ffffff" : "#000000";
+
+    marks.push(`<line x1="${x}" y1="${y}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-opacity="${opacity}" stroke-width="1" stroke-linecap="round" />`);
+  }
+
+  return marks.join("");
+}
+
+function createWatermarkSvg(width, height, seedText = "") {
+  const fontSize = Math.max(18, Math.round(Math.min(width, height) * 0.044));
+  const microFontSize = Math.max(7, Math.round(Math.min(width, height) * 0.014));
+  const patternWidth = Math.max(260, Math.round(width * 0.44));
+  const patternHeight = Math.max(116, Math.round(height * 0.18));
+  const microPatternWidth = Math.max(210, Math.round(width * 0.31));
+  const microPatternHeight = Math.max(58, Math.round(height * 0.085));
+  const label = escapeSvgText(MARKETPLACE_WATERMARK_TEXT);
+  const microLabel = escapeSvgText(MARKETPLACE_WATERMARK_MICROTEXT);
+  const noise = createWatermarkNoise(width, height, seedText || label);
+
+  return `
+    <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <pattern id="wm-main" width="${patternWidth}" height="${patternHeight}" patternUnits="userSpaceOnUse" patternTransform="rotate(-31)">
+          <text x="14" y="${Math.round(patternHeight * 0.52)}"
+            font-family="Arial, Helvetica, sans-serif"
+            font-size="${fontSize}"
+            font-weight="900"
+            letter-spacing="0.8"
+            fill="#ffffff"
+            fill-opacity="0.18"
+            stroke="#000000"
+            stroke-width="2.4"
+            stroke-opacity="0.2">${label}</text>
+          <text x="${Math.round(patternWidth * 0.22)}" y="${Math.round(patternHeight * 0.88)}"
+            font-family="Arial, Helvetica, sans-serif"
+            font-size="${Math.max(12, Math.round(fontSize * 0.54))}"
+            font-weight="900"
+            letter-spacing="1.2"
+            fill="#000000"
+            fill-opacity="0.1"
+            stroke="#ffffff"
+            stroke-width="1.4"
+            stroke-opacity="0.12">${label}</text>
+        </pattern>
+        <pattern id="wm-micro" width="${microPatternWidth}" height="${microPatternHeight}" patternUnits="userSpaceOnUse" patternTransform="rotate(19)">
+          <text x="6" y="${Math.round(microPatternHeight * 0.58)}"
+            font-family="Arial, Helvetica, sans-serif"
+            font-size="${microFontSize}"
+            font-weight="800"
+            letter-spacing="1.1"
+            fill="#ffffff"
+            fill-opacity="0.095"
+            stroke="#000000"
+            stroke-width="0.8"
+            stroke-opacity="0.09">${microLabel}</text>
+        </pattern>
+        <pattern id="wm-fine-lines" width="56" height="56" patternUnits="userSpaceOnUse" patternTransform="rotate(-31)">
+          <path d="M0 18H56 M0 46H56" fill="none" stroke="#ffffff" stroke-opacity="0.026" stroke-width="1" />
+          <path d="M0 32H56" fill="none" stroke="#000000" stroke-opacity="0.02" stroke-width="1" />
+        </pattern>
+      </defs>
+      <rect width="${width}" height="${height}" fill="url(#wm-fine-lines)" />
+      <rect width="${width}" height="${height}" fill="url(#wm-main)" />
+      <rect width="${width}" height="${height}" fill="url(#wm-micro)" />
+      <g>${noise}</g>
+      <rect x="0" y="${Math.max(0, height - 36)}" width="${width}" height="36" fill="#000000" fill-opacity="0.2" />
+      <text x="${Math.max(16, width - 232)}" y="${Math.max(24, height - 13)}"
+        font-family="Arial, Helvetica, sans-serif"
+        font-size="13"
+        font-weight="900"
+        letter-spacing="1.5"
+        fill="#ffffff"
+        fill-opacity="0.76">${label}</text>
+    </svg>
+  `;
+}
+
 async function createImageThumb(buffer, userId, sourceName) {
-  const thumbBuffer = await sharp(buffer)
-    .resize(520, 520, { fit: "inside", withoutEnlargement: true })
-    .webp({ quality: 82 })
+  const resized = await sharp(buffer, { failOn: "none" })
+    .rotate()
+    .resize(MARKETPLACE_PREVIEW_MAX_SIZE, MARKETPLACE_PREVIEW_MAX_SIZE, { fit: "inside", withoutEnlargement: true })
+    .toColorspace("srgb")
+    .png()
+    .toBuffer({ resolveWithObject: true });
+
+  const watermarkSvg = createWatermarkSvg(resized.info.width, resized.info.height, sourceName);
+  const thumbBuffer = await sharp(resized.data)
+    .composite([{ input: Buffer.from(watermarkSvg), blend: "over" }])
+    .webp({ quality: 74, effort: 5 })
     .toBuffer();
+
   const thumbKey = `marketplace/previews/${userId}/${Date.now()}_${crypto.randomUUID()}_${safeFileName(sourceName)}.webp`;
   await storageService.uploadFile(thumbBuffer, thumbKey, "image/webp");
   return thumbKey;
@@ -221,7 +546,7 @@ async function startTripoImportForUpload(file, userId) {
       compatible: false,
       importStatus: "failed",
       importError: err.message,
-      message: "Csak letolteskent publikalhato, a Tripo import nem sikerult",
+      message: "Can only be published as download-only because the Tripo import failed",
     };
   }
 }
@@ -247,11 +572,22 @@ async function downloadExternalAsset(url) {
 
 async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
   const db = admin.firestore();
-  const collectionName = sourceCollection || (
+  const defaultCollection = (
     assetType === "image" ? "generated_images" :
-    assetType === "audio" ? "audio_history" :
+    assetType === "audio" ? "generated_audio" :
     "tripo_history"
   );
+  const collectionName = String(sourceCollection || defaultCollection).trim();
+  const allowedCollections = assetType === "image"
+    ? new Set(["generated_images"])
+    : assetType === "audio"
+      ? new Set(["generated_audio", "audio_history"])
+      : new Set(["tripo_history"]);
+
+  if (!allowedCollections.has(collectionName)) {
+    throw Object.assign(new Error("Unsupported history source"), { status: 400 });
+  }
+
   const ref = db.collection(collectionName).doc(sourceId);
   const snap = await ref.get();
 
@@ -261,24 +597,25 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
 
   const data = snap.data();
   if (data.userId !== userId) {
-    throw Object.assign(new Error("Nincs jogosultsag ehhez a history elemhez"), { status: 403 });
+    throw Object.assign(new Error("You do not have access to this history item"), { status: 403 });
   }
 
   if (assetType === "image") {
     const sourceKey = data.full_key || data.storageKey || data.b2_key;
-    if (!sourceKey) throw Object.assign(new Error("A kep fajlja nem masolhato"), { status: 400 });
+    if (!sourceKey) throw Object.assign(new Error("The image file cannot be copied"), { status: 400 });
     const ext = getExt(sourceKey) || "png";
     const fileName = `ludusgen_image_${sourceId}.${ext}`;
     const targetKey = keyFor(userId, "image", fileName, "assets");
-    const copied = await copyB2Object(sourceKey, targetKey, contentTypeFor(ext, "image/png"));
+    const contentType = contentTypeFor(ext, "image/png");
+    const sourceBuffer = await storageService.getFileBuffer(sourceKey);
+    await storageService.uploadFile(sourceBuffer, targetKey, contentType);
+    const copied = { key: targetKey, size: sourceBuffer.length };
+    const metadata = await getImageMetadata(sourceBuffer).catch(() => null);
     let thumbKey = null;
-    if (data.thumb_key) {
-      try {
-        thumbKey = `marketplace/previews/${userId}/${Date.now()}_${crypto.randomUUID()}_${sourceId}.webp`;
-        await copyB2Object(data.thumb_key, thumbKey, "image/webp");
-      } catch {
-        thumbKey = null;
-      }
+    try {
+      thumbKey = await createImageThumb(sourceBuffer, userId, fileName);
+    } catch {
+      thumbKey = null;
     }
 
     return {
@@ -286,9 +623,10 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
         key: copied.key,
         thumbKey,
         fileName,
-        contentType: contentTypeFor(ext, "image/png"),
+        contentType,
         size: copied.size,
       },
+      metadata,
       source: {
         kind: "history",
         collection: collectionName,
@@ -301,19 +639,26 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
 
   if (assetType === "audio") {
     const sourceKey = data.storageKey || data.b2_key || data.key;
-    if (!sourceKey) throw Object.assign(new Error("Az audio fajl nem masolhato"), { status: 400 });
+    if (!sourceKey) throw Object.assign(new Error("The audio file cannot be copied"), { status: 400 });
     const ext = getExt(sourceKey) || data.fileFormat || "mp3";
     const fileName = data.fileName || `ludusgen_audio_${sourceId}.${ext}`;
     const targetKey = keyFor(userId, "audio", fileName, "assets");
     const contentType = data.contentType || contentTypeFor(ext, "audio/mpeg");
-    const copied = await copyB2Object(sourceKey, targetKey, contentType);
+    const sourceBuffer = await storageService.getFileBuffer(sourceKey);
+    await storageService.uploadFile(sourceBuffer, targetKey, contentType);
+    const preview = await createWatermarkedAudioPreview(sourceBuffer, userId, fileName);
 
     return {
       storage: {
-        key: copied.key,
+        key: targetKey,
+        thumbKey: preview.key,
         fileName,
         contentType,
-        size: copied.size,
+        size: sourceBuffer.length,
+      },
+      preview: {
+        ...preview,
+        kind: "audio",
       },
       source: {
         kind: "history",
@@ -346,7 +691,7 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
     buffer = downloaded.buffer;
     contentType = downloaded.contentType;
   } else {
-    throw Object.assign(new Error("A 3D history fajl nem masolhato"), { status: 400 });
+    throw Object.assign(new Error("The 3D history file cannot be copied"), { status: 400 });
   }
 
   const fileName = data.params?.filename || data.prompt || `ludusgen_model_${sourceId}.${ext}`;
@@ -380,57 +725,106 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
 export async function listMarketplaceAssets(req, res) {
   try {
     const viewerId = await getOptionalUserId(req);
-    const ownedIds = await getOwnedAssetIds(viewerId);
+    const ownedIds = await getOwnedAssetIds(viewerId, { verifyAssets: false });
     const requestedType = normalizeAssetType(req.query.type);
-    const qText = String(req.query.q || "").trim().toLowerCase();
-    const minPrice = req.query.minPrice ? Number(req.query.minPrice) : null;
-    const maxPrice = req.query.maxPrice ? Number(req.query.maxPrice) : null;
+    const qText = String(req.query.q || "").trim().toLowerCase().slice(0, 120);
+    const minPrice = parseOptionalPrice(req.query.minPrice, "minPrice");
+    const maxPrice = parseOptionalPrice(req.query.maxPrice, "maxPrice");
     const ownership = String(req.query.ownership || "all").toLowerCase();
     const tripo = String(req.query.tripo || "all").toLowerCase();
-    const sort = String(req.query.sort || "featured").toLowerCase();
+    const sortConfig = normalizeMarketplaceSort(req.query.sort);
+    const pageSize = parseMarketplacePageSize(req.query.limit);
+
+    if (minPrice != null && maxPrice != null && minPrice > maxPrice) {
+      return res.status(400).json({ success: false, message: "minPrice cannot be greater than maxPrice" });
+    }
+
+    const allowedOwnership = new Set(["all", "owned", "not_owned"]);
+    const allowedTripo = new Set(["all", "compatible", "download_only"]);
+    if (!allowedOwnership.has(ownership)) {
+      return res.status(400).json({ success: false, message: "Invalid ownership filter" });
+    }
+    if (!allowedTripo.has(tripo)) {
+      return res.status(400).json({ success: false, message: "Invalid 3D compatibility filter" });
+    }
 
     const db = admin.firestore();
-    const snap = await db.collection(MARKETPLACE_COLLECTIONS.assets)
-      .where("status", "==", "published")
-      .limit(300)
-      .get();
-
-    let docs = snap.docs.filter((doc) => {
-      const data = doc.data();
-      if (requestedType && data.type !== requestedType) return false;
-      if (qText) {
-        const hay = [
-          data.title,
-          data.description,
-          data.ownerName,
-          ...(Array.isArray(data.tags) ? data.tags : []),
-        ].join(" ").toLowerCase();
-        if (!hay.includes(qText)) return false;
+    const assetsRef = db.collection(MARKETPLACE_COLLECTIONS.assets);
+    const decodedCursor = decodeMarketplaceCursor(req.query.cursor, sortConfig);
+    let cursorDoc = null;
+    if (decodedCursor?.id) {
+      cursorDoc = await assetsRef.doc(decodedCursor.id).get();
+      if (!cursorDoc.exists) {
+        return res.status(400).json({ success: false, message: "Marketplace cursor is no longer valid" });
       }
-      if (minPrice != null && Number(data.priceCredits || 0) < minPrice) return false;
-      if (maxPrice != null && Number(data.priceCredits || 0) > maxPrice) return false;
-      if (ownership === "owned" && !ownedIds.has(doc.id)) return false;
-      if (ownership === "not_owned" && ownedIds.has(doc.id)) return false;
-      if (tripo === "compatible" && !(data.type === "3d" && data.tripo?.compatible === true)) return false;
-      if (tripo === "download_only" && !(data.type === "3d" && data.tripo?.compatible !== true)) return false;
-      return true;
-    });
+    }
 
-    docs = docs.sort((a, b) => {
-      const ad = a.data();
-      const bd = b.data();
-      if (sort === "newest") return (toMillis(bd.createdAt) || bd.ts || 0) - (toMillis(ad.createdAt) || ad.ts || 0);
-      if (sort === "price_asc") return Number(ad.priceCredits || 0) - Number(bd.priceCredits || 0);
-      if (sort === "price_desc") return Number(bd.priceCredits || 0) - Number(ad.priceCredits || 0);
-      if (sort === "most_bought" || sort === "popular") return Number(bd.metrics?.purchaseCount || 0) - Number(ad.metrics?.purchaseCount || 0);
-      return Number(bd.featuredScore || 0) - Number(ad.featuredScore || 0);
-    });
+    const filters = {
+      requestedType,
+      qText,
+      minPrice,
+      maxPrice,
+      ownership,
+      tripo,
+      ownedIds,
+    };
+    const docs = [];
+    const needsFilteredScan = Boolean(
+      requestedType ||
+      qText ||
+      minPrice != null ||
+      maxPrice != null ||
+      ownership !== "all" ||
+      tripo !== "all"
+    );
+    const batchSize = needsFilteredScan ? Math.max(pageSize * 3, 96) : pageSize + 1;
+    let exhausted = false;
+    let lastScannedDoc = cursorDoc;
 
-    const assets = await Promise.all(docs.map((doc) => assetForClient(doc, ownedIds)));
-    res.json({ success: true, assets, ownedAssetIds: [...ownedIds], sort: sort || "featured" });
+    while (docs.length < pageSize + 1 && !exhausted) {
+      let queryRef = assetsRef
+        .orderBy(sortConfig.field, sortConfig.direction)
+        .limit(batchSize);
+
+      if (lastScannedDoc) {
+        queryRef = queryRef.startAfter(lastScannedDoc);
+      }
+
+      const snap = await queryRef.get();
+      if (snap.empty) {
+        exhausted = true;
+        break;
+      }
+
+      for (const doc of snap.docs) {
+        lastScannedDoc = doc;
+        if (matchesMarketplaceFilters(doc, filters)) {
+          docs.push(doc);
+          if (docs.length >= pageSize + 1) break;
+        }
+      }
+
+      if (snap.size < batchSize) exhausted = true;
+    }
+
+    const pageDocs = docs.slice(0, pageSize);
+    const assets = await Promise.all(pageDocs.map((doc) => assetForClient(doc, ownedIds)));
+    const nextCursor = pageDocs.length
+      ? encodeMarketplaceCursor(pageDocs[pageDocs.length - 1], sortConfig)
+      : null;
+
+    res.json({
+      success: true,
+      assets,
+      ownedAssetIds: [...ownedIds],
+      sort: sortConfig.id,
+      limit: pageSize,
+      nextCursor,
+      hasMore: docs.length > pageSize,
+    });
   } catch (err) {
     console.error("[Marketplace] list error:", err);
-    res.status(500).json({ success: false, message: "Marketplace lista betoltese sikertelen" });
+    res.status(err.status || 500).json({ success: false, message: err.message || "Failed to load marketplace list" });
   }
 }
 
@@ -442,18 +836,32 @@ export async function getMarketplaceAsset(req, res) {
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
 
-    if (snap.data().status === "published") {
+    let data = snap.data();
+    if (data.status !== "published") {
+      if (!viewerId) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
+      const isOwner = data.ownerId === viewerId;
+      const purchase = !isOwner ? await getVerifiedMarketplacePurchase(admin.firestore(), {
+        buyerId: viewerId,
+        assetId: req.params.id,
+        asset: data,
+      }) : null;
+      if (!isOwner && !purchase) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
+    }
+
+    data = await ensureImageMetadata(ref, data);
+
+    if (data.status === "published") {
       ref.update({
         "metrics.viewCount": admin.firestore.FieldValue.increment(1),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
     }
 
-    const asset = await assetForClient(snap, ownedIds);
+    const asset = await assetForClient({ id: snap.id, ref, data: () => data }, ownedIds);
     res.json({ success: true, asset });
   } catch (err) {
     console.error("[Marketplace] detail error:", err);
-    res.status(500).json({ success: false, message: "Asset betoltese sikertelen" });
+    res.status(500).json({ success: false, message: "Failed to load asset" });
   }
 }
 
@@ -461,16 +869,16 @@ export async function uploadMarketplaceAsset(req, res) {
   try {
     const userId = req.user?.uid || req.userId;
     const file = req.file;
-    if (!file) return res.status(400).json({ success: false, message: "Hianyzo fajl" });
+    if (!file) return res.status(400).json({ success: false, message: "Missing file" });
 
     const assetType = normalizeAssetType(req.body.assetType) || inferAssetType(file);
     const config = TYPE_CONFIG[assetType];
-    if (!config) return res.status(400).json({ success: false, message: "Ismeretlen asset tipus" });
-    if (file.size > config.maxBytes) return res.status(400).json({ success: false, message: "Tul nagy fajl" });
+    if (!config) return res.status(400).json({ success: false, message: "Unknown asset type" });
+    if (file.size > config.maxBytes) return res.status(400).json({ success: false, message: "File is too large" });
 
     const ext = getExt(file.originalname);
     if (!config.extensions.has(ext)) {
-      return res.status(400).json({ success: false, message: `Nem tamogatott fajltipus: .${ext}` });
+      return res.status(400).json({ success: false, message: `Unsupported file type: .${ext}` });
     }
 
     const storageKey = keyFor(userId, assetType, file.originalname, "uploads");
@@ -478,8 +886,14 @@ export async function uploadMarketplaceAsset(req, res) {
     await storageService.uploadFile(file.buffer, storageKey, contentType);
 
     let thumbKey = null;
+    let metadata = null;
+    let preview = null;
     if (assetType === "image") {
+      metadata = await getImageMetadata(file.buffer);
       thumbKey = await createImageThumb(file.buffer, userId, file.originalname);
+    } else if (assetType === "audio") {
+      preview = await createWatermarkedAudioPreview(file.buffer, userId, file.originalname);
+      thumbKey = preview.key;
     }
 
     const tripo = assetType === "3d"
@@ -497,12 +911,14 @@ export async function uploadMarketplaceAsset(req, res) {
           contentType,
           size: file.size,
         },
+        preview,
+        metadata,
         tripo,
       },
     });
   } catch (err) {
     console.error("[Marketplace] upload error:", err);
-    res.status(500).json({ success: false, message: err.message || "Feltoltes sikertelen" });
+    res.status(500).json({ success: false, message: err.message || "Upload failed" });
   }
 }
 
@@ -515,10 +931,10 @@ export async function createMarketplaceAsset(req, res) {
     const assetType = normalizeAssetType(body.assetType || body.type);
     const priceCredits = Number(body.priceCredits);
 
-    if (!title) return res.status(400).json({ success: false, message: "Hianyzo cim" });
-    if (!TYPE_CONFIG[assetType]) return res.status(400).json({ success: false, message: "Ismeretlen asset tipus" });
+    if (!title) return res.status(400).json({ success: false, message: "Missing title" });
+    if (!TYPE_CONFIG[assetType]) return res.status(400).json({ success: false, message: "Unknown asset type" });
     if (!Number.isInteger(priceCredits) || priceCredits < 20) {
-      return res.status(400).json({ success: false, message: "Az ar legalabb 20 kredit es egesz szam legyen" });
+      return res.status(400).json({ success: false, message: "Price must be an integer and at least 20 credits" });
     }
 
     let sourceBundle;
@@ -529,16 +945,27 @@ export async function createMarketplaceAsset(req, res) {
       const upload = body.upload || body.uploadResult || {};
       const storage = upload.storage || body.storage || {};
       if (!storage.key || !String(storage.key).startsWith(`marketplace/uploads/${userId}/`)) {
-        return res.status(400).json({ success: false, message: "Ervenytelen feltoltesi hivatkozas" });
+        return res.status(400).json({ success: false, message: "Invalid upload reference" });
+      }
+      let thumbKey = safePreviewKey(storage.thumbKey, userId);
+      let preview = upload.preview || null;
+      if (assetType === "audio" && !thumbKey) {
+        const sourceBuffer = await storageService.getFileBuffer(storage.key);
+        preview = await createWatermarkedAudioPreview(sourceBuffer, userId, storage.fileName || "audio.mp3");
+        thumbKey = preview.key;
       }
       sourceBundle = {
         storage: {
           key: storage.key,
-          thumbKey: storage.thumbKey || null,
+          thumbKey,
           fileName: storage.fileName || "asset",
           contentType: storage.contentType || "application/octet-stream",
           size: Number(storage.size || 0),
         },
+        preview,
+        metadata: assetType === "image"
+          ? await getImageMetadataFromStorage(storage.key).catch(() => sanitizeImageMetadata(upload.metadata || body.metadata))
+          : null,
         source: { kind: "upload" },
         tripo: upload.tripo || body.tripo || (assetType === "3d"
           ? { compatible: false, importStatus: "failed" }
@@ -564,9 +991,17 @@ export async function createMarketplaceAsset(req, res) {
       status: "published",
       storage: sourceBundle.storage,
       preview: {
-        key: sourceBundle.storage.thumbKey || (assetType === "image" ? sourceBundle.storage.key : null),
-        kind: assetType === "image" ? "image" : assetType === "audio" ? "waveform" : "model",
+        key: safePreviewKey(sourceBundle.storage.thumbKey, userId),
+        kind: assetType === "image" ? "image" : assetType === "audio" ? "audio" : "model",
+        watermarked: assetType === "image" || assetType === "audio",
+        ...(assetType === "audio" ? {
+          contentType: sourceBundle.preview?.contentType || "audio/mpeg",
+          fileName: sourceBundle.preview?.fileName || null,
+          fullLength: sourceBundle.preview?.fullLength === true,
+          watermarkIntervalSeconds: sourceBundle.preview?.watermarkIntervalSeconds || null,
+        } : {}),
       },
+      metadata: sourceBundle.metadata || null,
       source: sourceBundle.source,
       tripo: assetType === "3d" ? sourceBundle.tripo : { compatible: false, importStatus: "not_applicable" },
       metrics: { purchaseCount: 0, viewCount: 0 },
@@ -592,7 +1027,7 @@ export async function createMarketplaceAsset(req, res) {
     res.status(201).json({ success: true, asset: clientAsset });
   } catch (err) {
     console.error("[Marketplace] create error:", err);
-    res.status(err.status || 500).json({ success: false, message: err.message || "Publikalas sikertelen" });
+    res.status(err.status || 500).json({ success: false, message: err.message || "Publishing failed" });
   }
 }
 
@@ -603,7 +1038,7 @@ export async function updateMarketplaceAsset(req, res) {
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
     const data = snap.data();
-    if (data.ownerId !== userId) return res.status(403).json({ success: false, message: "Csak a feltolto modosithatja" });
+    if (data.ownerId !== userId) return res.status(403).json({ success: false, message: "Only the uploader can edit this asset" });
 
     const patch = {};
     if (req.body.title != null) patch.title = String(req.body.title).trim();
@@ -612,7 +1047,7 @@ export async function updateMarketplaceAsset(req, res) {
     if (req.body.priceCredits != null) {
       const priceCredits = Number(req.body.priceCredits);
       if (!Number.isInteger(priceCredits) || priceCredits < 20) {
-        return res.status(400).json({ success: false, message: "Az ar legalabb 20 kredit legyen" });
+        return res.status(400).json({ success: false, message: "Price must be at least 20 credits" });
       }
       patch.priceCredits = priceCredits;
     }
@@ -627,7 +1062,37 @@ export async function updateMarketplaceAsset(req, res) {
     res.json({ success: true, asset: await assetForClient(updated, new Set()) });
   } catch (err) {
     console.error("[Marketplace] update error:", err);
-    res.status(500).json({ success: false, message: err.message || "Modositas sikertelen" });
+    res.status(500).json({ success: false, message: err.message || "Update failed" });
+  }
+}
+
+export async function deleteMarketplaceAsset(req, res) {
+  try {
+    const userId = req.user?.uid || req.userId;
+    const ref = admin.firestore().collection(MARKETPLACE_COLLECTIONS.assets).doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
+
+    const data = snap.data();
+    if (data.ownerId !== userId) {
+      return res.status(403).json({ success: false, message: "Only the uploader can delete this asset" });
+    }
+
+    await ref.update({
+      status: "deleted",
+      deletedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deletedBy: userId,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({
+      success: true,
+      id: req.params.id,
+      message: "Asset torolve a marketplace listarol",
+    });
+  } catch (err) {
+    console.error("[Marketplace] delete error:", err);
+    res.status(500).json({ success: false, message: err.message || "Delete failed" });
   }
 }
 
@@ -639,7 +1104,7 @@ export async function purchaseMarketplaceAsset(req, res) {
     console.error("[Marketplace] purchase error:", err.message);
     res.status(err.status || 500).json({
       success: false,
-      message: err.message || "Vasarlas sikertelen",
+      message: err.message || "Purchase failed",
       code: err.code,
       available: err.available,
       required: err.required,
@@ -656,24 +1121,55 @@ export async function downloadMarketplaceAsset(req, res) {
     if (!assetDoc.exists) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
 
     const asset = assetDoc.data();
-    const purchaseDoc = await db.collection(MARKETPLACE_COLLECTIONS.purchases)
-      .doc(`${userId}_${req.params.id}`)
-      .get();
-    const canAccess = asset.ownerId === userId || purchaseDoc.exists;
-    if (!canAccess) return res.status(403).json({ success: false, message: "Elobb meg kell vasarolnod az assetet" });
+    const isOwner = asset.ownerId === userId;
+    if (!isOwner) {
+      const purchase = await getVerifiedMarketplacePurchase(db, {
+        buyerId: userId,
+        assetId: req.params.id,
+        asset,
+      });
+      if (!purchase) return res.status(403).json({ success: false, message: "Elobb meg kell vasarolnod az assetet" });
+    }
 
     const key = asset.storage?.key || asset.storageKey;
-    if (!key) return res.status(404).json({ success: false, message: "Letoltheto fajl nem talalhato" });
+    if (!key) return res.status(404).json({ success: false, message: "Downloadable file not found" });
 
-    const signedUrl = req.query.inline === "1"
-      ? await storageService.getSignedUrl(key, 3600)
-      : await storageService.getSignedDownloadUrl(key, asset.storage?.fileName || `${asset.title || "asset"}.bin`, 3600);
-    if (!signedUrl) return res.status(500).json({ success: false, message: "Letoltesi URL nem keszitheto" });
+    const fileName = asset.storage?.fileName || `${asset.title || "asset"}.bin`;
+    const fileObject = await storageService.getFileObject(key);
+    const body = fileObject.Body;
+    if (!body) return res.status(404).json({ success: false, message: "Downloadable file not found" });
 
-    res.redirect(signedUrl);
+    res.setHeader("Content-Type", fileObject.ContentType || asset.storage?.contentType || "application/octet-stream");
+    res.setHeader("Content-Disposition", contentDisposition(req.query.inline === "1" ? "inline" : "attachment", fileName));
+    res.setHeader("Cache-Control", "private, max-age=0, must-revalidate");
+    if (fileObject.ContentLength != null) {
+      res.setHeader("Content-Length", String(fileObject.ContentLength));
+    }
+
+    if (typeof body.pipe === "function") {
+      body.on("error", (streamErr) => {
+        console.error("[Marketplace] download stream error:", streamErr);
+        if (!res.headersSent) res.status(500).end();
+        else res.destroy(streamErr);
+      });
+      body.pipe(res);
+      return;
+    }
+
+    if (typeof body.transformToWebStream === "function") {
+      Readable.fromWeb(body.transformToWebStream()).pipe(res);
+      return;
+    }
+
+    if (typeof body.transformToByteArray === "function") {
+      res.end(Buffer.from(await body.transformToByteArray()));
+      return;
+    }
+
+    res.status(500).json({ success: false, message: "Download stream could not be read" });
   } catch (err) {
     console.error("[Marketplace] download error:", err);
-    res.status(500).json({ success: false, message: err.message || "Letoltes sikertelen" });
+    res.status(500).json({ success: false, message: err.message || "Download failed" });
   }
 }
 
@@ -686,26 +1182,35 @@ export async function getMyMarketplaceLibrary(req, res) {
       .limit(300)
       .get();
 
-    const ownedIds = new Set(snap.docs.map((doc) => doc.data().assetId).filter(Boolean));
-    const items = await Promise.all(snap.docs.map(async (doc) => {
+    const ownedIds = await getOwnedAssetIds(userId);
+    const items = (await Promise.all(snap.docs.map(async (doc) => {
       const purchase = doc.data();
-      let asset = purchase.asset || null;
-      if (purchase.assetId) {
-        const assetSnap = await db.collection(MARKETPLACE_COLLECTIONS.assets).doc(purchase.assetId).get();
-        if (assetSnap.exists) asset = await assetForClient(assetSnap, ownedIds);
+      if (!purchase.assetId) return null;
+
+      const assetSnap = await db.collection(MARKETPLACE_COLLECTIONS.assets).doc(purchase.assetId).get();
+      if (!assetSnap.exists) return null;
+      if (!isVerifiedMarketplacePurchase(purchase, {
+        buyerId: userId,
+        assetId: purchase.assetId,
+        asset: assetSnap.data(),
+      })) {
+        return null;
       }
+
+      const asset = await assetForClient(assetSnap, ownedIds);
+      const safePurchase = sanitizePurchaseForClient({ id: doc.id, ...purchase });
       return {
         id: doc.id,
-        ...purchase,
+        ...safePurchase,
         asset,
         createdAtMs: toMillis(purchase.createdAt),
       };
-    }));
+    }))).filter(Boolean);
 
     items.sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
     res.json({ success: true, items, ownedAssetIds: [...ownedIds] });
   } catch (err) {
     console.error("[Marketplace] library error:", err);
-    res.status(500).json({ success: false, message: "Konyvtar betoltese sikertelen" });
+    res.status(500).json({ success: false, message: "Failed to load library" });
   }
 }
