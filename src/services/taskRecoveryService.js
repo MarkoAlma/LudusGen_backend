@@ -206,7 +206,7 @@ async function saveToHistory(entry, taskData) {
   }
   const prefersTexturedOutput = entry.type === "texture_model" || entry.texture === true || entry.pbr === true;
   const prefersDraftOutput = !prefersTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(entry.type);
-  const { modelUrl, chosenSource, previewImageUrl } = extractModelUrl(
+  const { modelUrl, chosenSource, previewImageUrl, previewImageUrls } = extractModelUrl(
     { output: out, type: entry.type },
     { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput },
   );
@@ -265,6 +265,7 @@ async function saveToHistory(entry, taskData) {
         chosen_source: chosenSource,
         consumed_credit: taskData.consumed_credit ?? out.consumed_credit ?? null,
         preview_image_url: previewImageUrl ?? null,
+        preview_image_urls: previewImageUrls ?? [],
         originalModelTaskId: taskInput.original_model_task_id ?? taskInput.original_model_id ?? null,
         originalTaskId: taskInput.original_task_id ?? null,
         draftModelTaskId: taskInput.draft_model_task_id ?? null,

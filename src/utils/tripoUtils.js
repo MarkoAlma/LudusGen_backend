@@ -10,6 +10,43 @@
 export function extractModelUrl(task, opts = {}) {
   const out = task.output ?? {};
   const taskType = task.type ?? null;
+
+  // Handle image-only task types (generate_image, generate_multiview_image)
+  if (taskType === "generate_multiview_image" || taskType === "edit_multiview_image") {
+    const mv = out.generate_multiview_image ?? out.edit_multiview_image ?? out;
+    const url = mv.front_view_url ?? mv.image_url;
+    if (url) {
+      const allViews = [mv.front_view_url, mv.left_view_url, mv.back_view_url, mv.right_view_url].filter(Boolean);
+      return {
+        modelUrl: url,
+        chosenSource: mv.front_view_url ? "front_view_url" : "image_url",
+        rigCheckResult: null,
+        rigType: null,
+        topology: null,
+        rawOutput: out,
+        previewImageUrl: url,
+        previewImageUrls: allViews.length > 0 ? allViews : [url],
+      };
+    }
+  }
+
+  if (taskType === "generate_image" || taskType === "text_to_image") {
+    const imgNode = out.generate_image ?? out;
+    const url = imgNode.image_url ?? imgNode.url ?? (Array.isArray(imgNode.images) ? imgNode.images[0] : null);
+    if (url) {
+       return {
+        modelUrl: url,
+        chosenSource: "image_url",
+        rigCheckResult: null,
+        rigType: null,
+        topology: null,
+        rawOutput: out,
+        previewImageUrl: url,
+        previewImageUrls: [url],
+      };
+    }
+  }
+
   const animatedModel =
     Array.isArray(out.animated_models) && out.animated_models.length > 0
       ? out.animated_models[0]
@@ -105,6 +142,10 @@ function extractUrlFromNode(node) {
     node.rendered_image_url ??
     node.preview_url ??
     node.file_url ??
+    node.front_view_url ??
+    node.left_view_url ??
+    node.back_view_url ??
+    node.right_view_url ??
     null
   );
 }
@@ -121,6 +162,9 @@ export function extractPreviewImages(out = {}) {
     out.generated_images,
     out.multiview_images,
     out.views,
+    out.generate_multiview_image,
+    out.edit_multiview_image,
+    out.generate_image,
   ];
 
   const urls = [];
@@ -133,6 +177,17 @@ export function extractPreviewImages(out = {}) {
       });
       continue;
     }
+
+    // Special case for multiview object: extract all 4 views
+    if (typeof candidate === "object" && (candidate.front_view_url || candidate.left_view_url)) {
+      [
+        candidate.front_view_url,
+        candidate.left_view_url,
+        candidate.back_view_url,
+        candidate.right_view_url,
+      ].forEach(u => { if (u) urls.push(u); });
+    }
+
     const url = extractUrlFromNode(candidate);
     if (url) urls.push(url);
   }

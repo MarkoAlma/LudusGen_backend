@@ -61,6 +61,40 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isAllowedProxyHost(hostname, allowedHosts) {
+  const normalizedHost = String(hostname || "").trim().toLowerCase();
+  return allowedHosts.some((candidate) => {
+    const normalizedCandidate = String(candidate || "").trim().toLowerCase();
+    return normalizedHost === normalizedCandidate || normalizedHost.endsWith(`.${normalizedCandidate}`);
+  });
+}
+
+async function mapWithConcurrency(items, concurrency, iteratee) {
+  const limit = Math.max(1, Math.min(concurrency || 1, items.length || 1));
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      try {
+        results[currentIndex] = {
+          status: "fulfilled",
+          value: await iteratee(items[currentIndex], currentIndex),
+        };
+      } catch (error) {
+        results[currentIndex] = {
+          status: "rejected",
+          reason: error,
+        };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  return results;
+}
+
 function toMillis(value) {
   if (value == null) return null;
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -93,6 +127,34 @@ function getHistoryExpiryMillis(data) {
   if (ts != null) return ts + HISTORY_TTL_MS;
 
   return null;
+}
+
+async function userOwnsTask(taskId, uid) {
+  if (!taskId || !uid) return false;
+  const taskMeta = getRegisteredTaskMeta(taskId);
+  if (taskMeta?.userId === uid) return true;
+
+  const db = admin.firestore();
+  const snap = await db.collection(HISTORY_COLLECTION)
+    .where("taskId", "==", taskId)
+    .where("userId", "==", uid)
+    .limit(1)
+    .get();
+  return !snap.empty;
+}
+
+async function requireTaskAccess(req, res, taskId = req.params.taskId) {
+  const uid = req.user?.uid;
+  if (!uid) {
+    res.status(401).json({ success: false, message: "Unauthorized" });
+    return false;
+  }
+  const allowed = await userOwnsTask(taskId, uid);
+  if (!allowed) {
+    res.status(403).json({ success: false, message: "Forbidden" });
+    return false;
+  }
+  return true;
 }
 
 async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
@@ -629,6 +691,7 @@ export async function createTask(req, res) {
 /* ─── Task: get status ────────────────────────────────────────────────── */
 export async function getTask(req, res) {
   try {
+    if (!await requireTaskAccess(req, res)) return;
     const taskMeta = getRegisteredTaskMeta(req.params.taskId);
     const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
     const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
@@ -667,6 +730,7 @@ export async function streamTask(req, res) {
     res.status(400).json({ success: false, message: "taskId required" });
     return;
   }
+  if (!await requireTaskAccess(req, res, taskId)) return;
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -713,6 +777,7 @@ export async function streamTask(req, res) {
 /* ─── Task: cancel ────────────────────────────────────────────────────── */
 export async function cancelTask(req, res) {
   try {
+    if (!await requireTaskAccess(req, res)) return;
     const result = await taskService.cancel(req.params.taskId);
     res.json({ success: true, cancelled: result.cancelled, message: result.message });
   } catch (err) {
@@ -726,6 +791,7 @@ export async function acknowledgeTask(req, res) {
   try {
     const { taskId } = req.params;
     if (!taskId) return res.status(400).json({ success: false, message: "taskId required" });
+    if (!await requireTaskAccess(req, res, taskId)) return;
     unregisterTask(taskId);
     res.json({ success: true, unregistered: true });
   } catch (err) {
@@ -800,6 +866,7 @@ export async function uploadFile(req, res) {
 // keyed by taskId. Entries are evicted after 6 hours (TTL).
 const MODEL_CACHE = new Map();
 const MODEL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const MODEL_IN_FLIGHT = new Map();
 
 // Track tasks that Tripo reports as 404 (deleted/expired).
 // We cache these for 1 hour to avoid repeated expensive refresh attempts
@@ -837,8 +904,14 @@ startCacheCleanup();
 
 export async function modelProxy(req, res) {
   let { url, taskId: taskIdParam } = req.query;
+  let requestCacheKey;
+  let rejectInFlight = null;
 
   if (!url) { res.status(400).json({ success: false, message: "url missing" }); return; }
+  if (taskIdParam && !await userOwnsTask(taskIdParam, req.user?.uid)) {
+    res.status(403).json({ success: false, message: "Forbidden" });
+    return;
+  }
 
   const allowedHosts = [
     "tripo3d.ai",
@@ -863,7 +936,7 @@ export async function modelProxy(req, res) {
       return { error: 400, message: "Invalid URL" };
     }
 
-    if (!allowedHosts.some(h => parsed.hostname.endsWith(h))) {
+    if (!isAllowedProxyHost(parsed.hostname, allowedHosts)) {
       return { error: 400, message: "Source not allowed" };
     }
 
@@ -884,6 +957,14 @@ export async function modelProxy(req, res) {
   };
 
   try {
+    const sendModelEntry = (entry, cacheHeader = "HIT") => {
+      res.setHeader("Content-Type", entry.contentType);
+      res.setHeader("Content-Disposition", `attachment; filename="model.${entry.ext}"`);
+      res.setHeader("Content-Length", entry.buffer.length);
+      res.setHeader("X-Cache", cacheHeader);
+      res.end(entry.buffer);
+    };
+
     // Read entire model binary into a Buffer (for caching)
     const readBody = async (upstream) => {
       const chunks = [];
@@ -895,11 +976,7 @@ export async function modelProxy(req, res) {
     if (taskIdParam && MODEL_CACHE.has(taskIdParam)) {
       const entry = MODEL_CACHE.get(taskIdParam);
       if (Date.now() - entry.cachedAt < MODEL_CACHE_TTL_MS) {
-        res.setHeader("Content-Type", entry.contentType);
-        res.setHeader("Content-Disposition", `attachment; filename="model.${entry.ext}"`);
-        res.setHeader("Content-Length", entry.buffer.length);
-        res.setHeader("X-Cache", "HIT");
-        res.end(entry.buffer);
+        sendModelEntry(entry, "HIT");
         return;
       }
       MODEL_CACHE.delete(taskIdParam); // expired
@@ -930,6 +1007,21 @@ export async function modelProxy(req, res) {
     }
 
     // ── Fetch from upstream (B2 or Tripo) ────────────────────────────
+    requestCacheKey = taskIdParam || `url_${url}`;
+    const existingInFlight = MODEL_IN_FLIGHT.get(requestCacheKey);
+    if (existingInFlight) {
+      const entry = await existingInFlight;
+      sendModelEntry(entry, "INFLIGHT");
+      return;
+    }
+
+    let resolveInFlight;
+    const inFlightPromise = new Promise((resolve, reject) => {
+      resolveInFlight = resolve;
+      rejectInFlight = reject;
+    });
+    MODEL_IN_FLIGHT.set(requestCacheKey, inFlightPromise);
+
     let { error, upstream, message } = await performFetch(url);
 
     // If upstream returns 401/403/410/502, try to refresh URL via taskId
@@ -942,6 +1034,8 @@ export async function modelProxy(req, res) {
         // Check if we already know this task is dead
         if (REFRESH_FAILURE_CACHE.has(taskId)) {
           console.log(`[TaskController] modelProxy: skipping refresh for known dead task ${taskId}`);
+          rejectInFlight?.(Object.assign(new Error("Task expired or deleted from source"), { status: 410, code: "TASK_NOT_FOUND" }));
+          MODEL_IN_FLIGHT.delete(requestCacheKey);
           res.status(410).json({ success: false, message: "Task expired or deleted from source", code: "TASK_NOT_FOUND" });
           return;
         }
@@ -993,6 +1087,8 @@ export async function modelProxy(req, res) {
             })();
 
             res.status(410).json({ success: false, message: "Model no longer exists on Tripo", code: "TASK_NOT_FOUND" });
+            rejectInFlight?.(Object.assign(new Error("Model no longer exists on Tripo"), { status: 410, code: "TASK_NOT_FOUND" }));
+            MODEL_IN_FLIGHT.delete(requestCacheKey);
             return;
           }
         }
@@ -1013,6 +1109,11 @@ export async function modelProxy(req, res) {
           console.warn(`[TaskController] modelProxy cleanup failed for ${taskIdParam}:`, cleanupErr.message);
         }
       }
+      rejectInFlight?.(Object.assign(new Error(message || `Upstream ${error}`), {
+        status: finalStatus,
+        code: error === 410 ? "TASK_EXPIRED" : "UPSTREAM_ERROR",
+      }));
+      MODEL_IN_FLIGHT.delete(requestCacheKey);
       res.status(finalStatus).json({ success: false, message: message || `Upstream ${error}`, code: error === 410 ? "TASK_EXPIRED" : "UPSTREAM_ERROR" });
       return;
     }
@@ -1042,14 +1143,15 @@ export async function modelProxy(req, res) {
       ext,
       cachedAt: Date.now(),
     });
+    const createdEntry = MODEL_CACHE.get(cacheKey);
+    resolveInFlight?.(createdEntry);
+    MODEL_IN_FLIGHT.delete(requestCacheKey);
 
     // ── Stream to client ───────────────────────────────────────────────
-    res.setHeader("Content-Type", ct);
-    res.setHeader("Content-Disposition", `attachment; filename="model.${ext}"`);
-    res.setHeader("Content-Length", buffer.length);
-    res.setHeader("X-Cache", "MISS");
-    res.end(buffer);
+    sendModelEntry(createdEntry, "MISS");
   } catch (err) {
+    rejectInFlight?.(err);
+    if (requestCacheKey) MODEL_IN_FLIGHT.delete(requestCacheKey);
     console.error("[TaskController] proxy error:", err.message);
     if (!res.headersSent) res.status(500).json({ success: false, message: err.message });
   }
@@ -1087,11 +1189,11 @@ export async function getEnginePreset(req, res) {
 
 /* ─── Batch generation ────────────────────────────────────────────────── */
 export async function batchGenerate(req, res) {
-  const { prompts, image_tokens, model_version, texture, pbr, texture_quality, callback_url } = req.body;
-  const items = prompts ?? image_tokens ?? [];
+  const { prompts, image_tokens, images, model_version, texture, pbr, texture_quality, callback_url } = req.body;
+  const items = prompts ?? images ?? image_tokens ?? [];
 
   if (!items.length) {
-    res.status(400).json({ success: false, message: "prompts or image_tokens array required (min 1)" });
+    res.status(400).json({ success: false, message: "prompts, images, or image_tokens array required (min 1)" });
     return;
   }
   if (items.length > 50) {
@@ -1113,7 +1215,11 @@ export async function batchGenerate(req, res) {
         type: isPrompt ? "text_to_model" : "image_to_model",
         ...(isPrompt
           ? { prompt: item }
-          : { file: { type: "jpg", file_token: item } }),
+          : {
+              file: typeof item === "string"
+                ? { type: "jpg", file_token: item }
+                : item,
+            }),
         model_version: mv,
         texture: texture === true,
         ...(pbr === true && { pbr: true }),
@@ -1131,8 +1237,10 @@ export async function batchGenerate(req, res) {
         message: "Batch enqueued. Track progress via GET /tripo/batch/:batchId",
       });
     } else {
-      const taskIds = await Promise.allSettled(
-        jobDataList.map(d => taskService.create(d.taskBody, { callbackUrl: callback_url })),
+      const taskIds = await mapWithConcurrency(
+        jobDataList,
+        4,
+        (d) => taskService.create(d.taskBody, { callbackUrl: callback_url }),
       );
       res.json({
         success: true,
@@ -1143,6 +1251,9 @@ export async function batchGenerate(req, res) {
           taskId: r.status === "fulfilled" ? r.value : null,
           error: r.status === "rejected" ? r.reason.message : undefined,
         })),
+        taskIds: taskIds
+          .filter((r) => r.status === "fulfilled")
+          .map((r) => r.value),
       });
     }
   } catch (err) {
@@ -1179,8 +1290,7 @@ export async function deleteHistoryItem(req, res) {
 
   try {
     const db = admin.firestore();
-    const collection = req.query.collection || HISTORY_COLLECTION;
-    const ref = db.collection(collection).doc(id);
+    const ref = db.collection(HISTORY_COLLECTION).doc(id);
     const doc = await ref.get();
 
     if (!doc.exists) {
@@ -1211,11 +1321,10 @@ export async function clearHistory(req, res) {
 
   const ALLOWED_SOURCES = ["tripo", "trellis", "upload"];
   const source = ALLOWED_SOURCES.includes(req.query.source) ? req.query.source : "tripo";
-  const collection = req.query.collection || HISTORY_COLLECTION;
 
   try {
     const db = admin.firestore();
-    const snap = await db.collection(collection)
+    const snap = await db.collection(HISTORY_COLLECTION)
       .where("userId", "==", uid)
       .where("source", "==", source)
       .get();

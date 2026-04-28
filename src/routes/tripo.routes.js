@@ -5,7 +5,7 @@
 
 import express, { Router } from "express";
 import multer from "multer";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 
 // Controllers
 import {
@@ -90,8 +90,17 @@ const genLimiter = rateLimit({
 const adminLimiter = rateLimit({
   windowMs: 60_000,
   max:      120,
+  keyGenerator: (req) => `user:${req.user?.uid ?? ipKeyGenerator(req.ip)}`,
   message:  { success: false, message: "Rate limit exceeded." },
 });
+
+function requireTripoAdmin(req, res, next) {
+  if (req.user?.isAdmin) {
+    next();
+    return;
+  }
+  res.status(403).json({ success: false, message: "Admin access required" });
+}
 
 /* ─── Router factory ──────────────────────────────────────────────────── */
 export function createTripoRouter(verifyAuth) {
@@ -123,7 +132,7 @@ export function createTripoRouter(verifyAuth) {
   router.post("/tripo/task/:taskId/ack", verifyAuth, acknowledgeTask);
 
   /** List tasks with pagination + status filter */
-  router.get("/tripo/tasks", verifyAuth, listTasks);
+  router.get("/tripo/tasks", verifyAuth, requireTripoAdmin, adminLimiter, listTasks);
 
   /** Authenticated model download proxy */
   router.get("/tripo/model-proxy", verifyAuth, modelProxy);
@@ -207,9 +216,9 @@ export function createTripoRouter(verifyAuth) {
    *  ANALYTICS + MONITORING
    * ════════════════════════════════════════════════════════════════════ */
 
-  router.get("/tripo/analytics/summary", verifyAuth, adminLimiter, getSummary);
-  router.get("/tripo/analytics/credits",  verifyAuth, adminLimiter, getDailyCredits);
-  router.get("/tripo/analytics/tasks",    verifyAuth, adminLimiter, getRecentTasks);
+  router.get("/tripo/analytics/summary", verifyAuth, requireTripoAdmin, adminLimiter, getSummary);
+  router.get("/tripo/analytics/credits",  verifyAuth, requireTripoAdmin, adminLimiter, getDailyCredits);
+  router.get("/tripo/analytics/tasks",    verifyAuth, requireTripoAdmin, adminLimiter, getRecentTasks);
 
   /* ════════════════════════════════════════════════════════════════════
    *  MODEL CAPABILITIES
