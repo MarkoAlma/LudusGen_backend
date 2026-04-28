@@ -34,6 +34,7 @@ import {
     clampImageGalleryLimit,
 } from './src/lib/imageGalleryCursor.js';
 import { storageService } from './src/services/storageService.js';
+import { canAccessMarketplaceStorageKey } from './src/services/marketplaceService.js';
 import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
 
 import { registerJob, unregisterJob, activeJobs } from './src/lib/jobRegistry.js';
@@ -3646,6 +3647,10 @@ function getTimestampMillis(value) {
     return Date.now();
 }
 
+function getAudioHistoryStorageKey(data = {}) {
+    return data.b2_key || data.storageKey || data.key || null;
+}
+
 async function readAudioSourceAsBuffer(audioSource, preferredFormat = 'mp3') {
     const source = String(audioSource || '').trim();
     if (!source) throw new Error('Hiányzó audio forrás');
@@ -3737,15 +3742,51 @@ async function persistGeneratedAudio(userId, audioSource, metadata = {}) {
 function serializeGeneratedAudioDoc(doc) {
     const data = doc.data() || {};
     const createdAtMs = data.createdAtMs || getTimestampMillis(data.createdAt);
-    const { b2_key, userId, ...publicData } = data;
+    const { b2_key, storageKey, key, userId, ...publicData } = data;
     return {
         id: doc.id,
         audioId: doc.id,
+        sourceCollection: 'generated_audio',
+        sourceId: doc.id,
         ...publicData,
         storage: 'b2',
-        secureAudio: true,
+        secureAudio: Boolean(getAudioHistoryStorageKey(data)),
         createdAtMs,
     };
+}
+
+function serializeAudioHistoryDoc(doc) {
+    const data = doc.data() || {};
+    const createdAtMs = data.createdAtMs || getTimestampMillis(data.createdAt || data.ts);
+    const { b2_key, storageKey, key, userId, ...publicData } = data;
+    const fileFormat = data.fileFormat || getAudioExtensionFromUrl(getAudioHistoryStorageKey(data) || '') || 'mp3';
+    const routeId = `audio-history-${doc.id}`;
+    return {
+        id: routeId,
+        audioId: routeId,
+        sourceCollection: 'audio_history',
+        sourceId: doc.id,
+        ...publicData,
+        storage: 'b2',
+        secureAudio: Boolean(getAudioHistoryStorageKey(data)),
+        fileFormat,
+        contentType: data.contentType || 'audio/mpeg',
+        fileSize: data.fileSize || data.size || null,
+        createdAtMs,
+    };
+}
+
+async function loadFirestoreAudioHistory(userId) {
+    try {
+        const snap = await admin.firestore()
+            .collection('audio_history')
+            .where('userId', '==', userId)
+            .get();
+        return snap.docs.map(serializeAudioHistoryDoc);
+    } catch (err) {
+        console.warn('[AudioArchive] Legacy audio_history lista sikertelen:', err.message);
+        return [];
+    }
 }
 
 async function loadLegacyAudioHistory(userId) {
@@ -4255,8 +4296,11 @@ router.get('/audio/history', verifyFirebaseToken, audioLimiter, async (req, res)
             .get();
 
         const storedItems = snap.docs.map(serializeGeneratedAudioDoc);
-        const legacyItems = await loadLegacyAudioHistory(userId);
-        const items = [...storedItems, ...legacyItems]
+        const [audioHistoryItems, legacyItems] = await Promise.all([
+            loadFirestoreAudioHistory(userId),
+            loadLegacyAudioHistory(userId),
+        ]);
+        const items = [...storedItems, ...audioHistoryItems, ...legacyItems]
             .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
             .slice(0, 100);
 
@@ -4269,25 +4313,52 @@ router.get('/audio/history', verifyFirebaseToken, audioLimiter, async (req, res)
 
 router.get('/audio/history/:id/file', verifyFirebaseToken, audioLimiter, async (req, res) => {
     try {
-        const docRef = admin.firestore().collection('generated_audio').doc(req.params.id);
-        const doc = await docRef.get();
+        const db = admin.firestore();
+        const requestedId = String(req.params.id || '');
+        let collectionName = 'generated_audio';
+        let docId = requestedId;
+        if (requestedId.startsWith('audio-history-')) {
+            collectionName = 'audio_history';
+            docId = requestedId.slice('audio-history-'.length);
+        }
+
+        let doc = await db.collection(collectionName).doc(docId).get();
+        if (!doc.exists && collectionName === 'generated_audio') {
+            const fallbackDoc = await db.collection('audio_history').doc(docId).get();
+            if (fallbackDoc.exists) {
+                collectionName = 'audio_history';
+                doc = fallbackDoc;
+            }
+        }
         if (!doc.exists) return res.status(404).json({ success: false, message: 'Audio nem található' });
 
         const data = doc.data() || {};
         if (data.userId !== req.userId) {
             return res.status(403).json({ success: false, message: 'Nincs jogosultság' });
         }
-        if (!data.b2_key || !String(data.b2_key).startsWith(`users/${req.userId}/audio/`)) {
-            return res.status(403).json({ success: false, message: 'Érvénytelen audio kulcs' });
+        const storageKey = getAudioHistoryStorageKey(data);
+        if (!storageKey) {
+            return res.status(404).json({ success: false, message: 'Audio fajl nem talalhato' });
+        }
+
+        const isOwnArchiveKey = String(storageKey).startsWith(`users/${req.userId}/audio/`);
+        const canReadStorage = isOwnArchiveKey || await canAccessMarketplaceStorageKey(db, {
+            userId: req.userId,
+            key: storageKey,
+            assetId: data.marketplaceAssetId || null,
+        });
+        if (!canReadStorage) {
+            return res.status(403).json({ success: false, message: 'You need to buy this asset first' });
         }
 
         const result = await b2.send(new GetObjectCommand({
             Bucket: process.env.B2_BUCKET_NAME,
-            Key: data.b2_key,
+            Key: storageKey,
         }));
 
+        const filename = data.fileName || `ludusgen_audio_${doc.id}.${data.fileFormat || getAudioExtensionFromUrl(storageKey) || 'mp3'}`;
         res.setHeader('Content-Type', data.contentType || 'audio/mpeg');
-        res.setHeader('Content-Disposition', `inline; filename="${sanitizeAudioDownloadFilename(`ludusgen_audio_${doc.id}.${data.fileFormat || 'mp3'}`)}"`);
+        res.setHeader('Content-Disposition', `inline; filename="${sanitizeAudioDownloadFilename(filename)}"`);
         res.setHeader('Cache-Control', 'private, max-age=3600');
         if (result.ContentLength) res.setHeader('Content-Length', result.ContentLength);
         result.Body.pipe(res);
@@ -4923,6 +4994,15 @@ async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
 }
 
 async function streamB2Key(key, filename, res) {
+    const allowed = await canAccessMarketplaceStorageKey(admin.firestore(), {
+        userId: res.req?.userId,
+        key,
+    });
+    if (!allowed) {
+        res.status(403).json({ success: false, message: 'Elobb meg kell vasarolnod az assetet' });
+        return;
+    }
+
     const cmd = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key });
     const data = await b2.send(cmd);
     res.setHeader('Content-Type', key.endsWith('.glb') ? 'model/gltf-binary' : 'image/png');
@@ -5022,13 +5102,14 @@ async function persistAudioToHistory(userId, audioUrl, metadata = {}) {
 
     const { buffer, contentType } = await loadAudioBuffer(audioUrl);
     const fileFormat = String(metadata.fileFormat || audioExtFrom(contentType)).replace(/^\./, '').toLowerCase();
-    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const now = Date.now();
+    const id = `${now}_${Math.random().toString(36).slice(2, 10)}`;
     const fileName = `${safeAudioName(metadata.title || metadata.type || 'ludusgen_audio')}_${id}.${fileFormat}`;
     const storageKey = `users/${userId}/audio/${fileName}`;
 
     await uploadMediaToB2(buffer, storageKey, contentType);
 
-    const docRef = await admin.firestore().collection('audio_history').add({
+    const docRef = await admin.firestore().collection('generated_audio').add({
         userId,
         type: metadata.type || 'audio',
         title: metadata.title || 'LudusGen audio',
@@ -5036,13 +5117,15 @@ async function persistAudioToHistory(userId, audioUrl, metadata = {}) {
         provider: metadata.provider || '',
         model: metadata.model || '',
         duration: metadata.duration || null,
-        storageKey,
+        b2_key: storageKey,
         fileName,
         fileFormat,
         contentType,
-        size: buffer.length,
+        fileSize: buffer.length,
+        storage: 'b2',
+        createdAtMs: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        ts: Date.now(),
+        ts: now,
     });
 
     return {
@@ -5054,59 +5137,6 @@ async function persistAudioToHistory(userId, audioUrl, metadata = {}) {
         size: buffer.length,
     };
 }
-
-async function streamAudioB2Key(key, filename, contentType, res, disposition = 'inline') {
-    const cmd = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key });
-    const data = await b2.send(cmd);
-    res.setHeader('Content-Type', contentType || 'audio/mpeg');
-    res.setHeader('Content-Disposition', `${disposition}; filename="${safeAudioName(filename || key.split('/').pop())}"`);
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-    data.Body.pipe(res);
-}
-
-router.get('/audio/history', verifyFirebaseToken, async (req, res) => {
-    try {
-        const snap = await admin.firestore()
-            .collection('audio_history')
-            .where('userId', '==', req.userId)
-            .orderBy('createdAt', 'desc')
-            .limit(100)
-            .get();
-
-        const items = await Promise.all(snap.docs.map(async (doc) => {
-            const data = doc.data();
-            const fileUrl = data.storageKey
-                ? await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.storageKey }), { expiresIn: 3600 })
-                : null;
-            return {
-                id: doc.id,
-                ...data,
-                fileUrl,
-                audioUrl: fileUrl,
-                createdAt: data.createdAt?.toDate?.() || new Date(data.ts || Date.now()),
-            };
-        }));
-
-        res.json({ success: true, items });
-    } catch (err) {
-        console.error('[AudioHistory] list error:', err);
-        res.status(500).json({ success: false, message: 'Audio archivum betoltese sikertelen' });
-    }
-});
-
-router.get('/audio/history/:audioId/file', verifyFirebaseToken, async (req, res) => {
-    try {
-        const doc = await admin.firestore().collection('audio_history').doc(req.params.audioId).get();
-        if (!doc.exists) return res.status(404).json({ success: false, message: 'Audio nem talalhato' });
-        const data = doc.data();
-        if (data.userId !== req.userId) return res.status(403).json({ success: false, message: 'Nincs jogosultsag' });
-        if (!data.storageKey) return res.status(404).json({ success: false, message: 'Audio fajl nem talalhato' });
-        await streamAudioB2Key(data.storageKey, data.fileName || `${doc.id}.${data.fileFormat || 'mp3'}`, data.contentType || 'audio/mpeg', res, 'inline');
-    } catch (err) {
-        console.error('[AudioHistory] file error:', err);
-        if (!res.headersSent) res.status(500).json({ success: false, message: 'Audio fajl betoltese sikertelen' });
-    }
-});
 
 router.post('/audio/download', verifyFirebaseToken, async (req, res) => {
     try {
@@ -5447,22 +5477,34 @@ router.get('/image-gallery', verifyFirebaseToken, async (req, res) => {
         }
 
         const snap = await query.get();
-        const docs = snap.docs.slice(0, limit);
+        const pageDocs = snap.docs.slice(0, limit);
         const hasMore = snap.docs.length > limit;
-        const images = await mapWithConcurrency(docs, 6, async (doc) => {
-            const data = doc.data() || {};
-            const createdAtMs = data.createdAt?.toMillis?.() ?? data.createdAt?.toDate?.()?.getTime?.() ?? 0;
-            const createdAt = createdAtMs > 0 ? new Date(createdAtMs) : new Date(0);
-            const thumbUrl = data.thumb_key
-                ? await getSignedUrl(
-                    b2,
-                    new GetObjectCommand({
-                        Bucket: process.env.B2_BUCKET_NAME,
-                        Key: data.thumb_key,
-                    }),
-                    { expiresIn: 3600 }
-                )
+
+        const images = await Promise.all(pageDocs.map(async (doc) => {
+            const data = doc.data();
+            const createdAtMs = getTimestampMillis(data.createdAt);
+            const createdAt = data.createdAt?.toDate
+                ? data.createdAt.toDate().toISOString()
+                : data.createdAt || null;
+            const canReadFull = data.full_key
+                ? await canAccessMarketplaceStorageKey(admin.firestore(), { userId, key: data.full_key })
+                : false;
+            const canReadThumb = data.thumb_key
+                ? await canAccessMarketplaceStorageKey(admin.firestore(), { userId, key: data.thumb_key })
+                : false;
+            const fullUrl = data.full_key && canReadFull
+                ? await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.full_key }), { expiresIn: 3600 })
                 : null;
+            const thumbUrl = data.thumb_key && canReadThumb
+                ? await getSignedUrl(b2, new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: data.thumb_key }), { expiresIn: 3600 })
+                : null;
+
+            // Specifically for downloading: force attachment header
+            const downloadUrl = data.full_key && canReadFull ? await getSignedUrl(b2, new GetObjectCommand({
+                Bucket: process.env.B2_BUCKET_NAME,
+                Key: data.full_key,
+                ResponseContentDisposition: `attachment; filename="ludusgen_${doc.id}.png"`
+            }), { expiresIn: 3600 }) : null;
 
             return {
                 id: doc.id,
@@ -5475,10 +5517,12 @@ router.get('/image-gallery', verifyFirebaseToken, async (req, res) => {
                 thumb_key: data.thumb_key || null,
                 full_key: data.full_key || null,
                 thumbUrl,
+                fullUrl,
+                downloadUrl,
                 createdAt,
                 createdAtMs,
             };
-        });
+        }));
 
         const lastImage = images[images.length - 1];
         const nextCursor = hasMore && lastImage?.createdAtMs

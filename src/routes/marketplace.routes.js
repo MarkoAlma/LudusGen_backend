@@ -2,6 +2,7 @@ import express from "express";
 import multer from "multer";
 import {
   createMarketplaceAsset,
+  deleteMarketplaceAsset,
   downloadMarketplaceAsset,
   getMarketplaceAsset,
   getMyMarketplaceLibrary,
@@ -24,6 +25,7 @@ export function createMarketplaceRouter(verifyFirebaseToken) {
   router.post("/marketplace/assets/upload", verifyFirebaseToken, upload.single("file"), uploadMarketplaceAsset);
   router.post("/marketplace/assets", verifyFirebaseToken, createMarketplaceAsset);
   router.patch("/marketplace/assets/:id", verifyFirebaseToken, updateMarketplaceAsset);
+  router.delete("/marketplace/assets/:id", verifyFirebaseToken, deleteMarketplaceAsset);
   router.post("/marketplace/assets/:id/purchase", verifyFirebaseToken, purchaseMarketplaceAsset);
   router.get("/marketplace/assets/:id/download", verifyFirebaseToken, downloadMarketplaceAsset);
   router.get("/marketplace/me/library", verifyFirebaseToken, getMyMarketplaceLibrary);

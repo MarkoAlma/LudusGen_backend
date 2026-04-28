@@ -7,6 +7,11 @@ import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
 import { deductCredits, refundCredits, linkTaskIdToTransaction } from "../services/creditService.js";
 import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskMeta } from "../services/taskRecoveryService.js";
+import {
+  MARKETPLACE_COLLECTIONS,
+  canAccessMarketplaceStorageKey,
+  getVerifiedMarketplacePurchase,
+} from "../services/marketplaceService.js";
 import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS, TRIPO_IMAGE_UPLOAD_MAX_BYTES } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
@@ -203,6 +208,42 @@ async function deleteHistoryForDeadModel({ taskId, modelUrl, uid = null, reason 
   if (queries.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0 };
   const snaps = await Promise.all(queries);
   return deleteHistoryDocsWithStorage(snaps.flatMap(snap => snap.docs), reason);
+}
+
+async function getAuthorizedHistoryForModelProxy(taskId, uid) {
+  if (!taskId || !uid) return null;
+
+  const db = admin.firestore();
+  const snap = await db.collection(HISTORY_COLLECTION)
+    .where("taskId", "==", taskId)
+    .limit(25)
+    .get();
+
+  const doc = snap.docs.find((item) => item.data()?.userId === uid);
+  if (!doc) return null;
+
+  const data = doc.data();
+  if (data.marketplaceAssetId) {
+    const assetDoc = await db.collection(MARKETPLACE_COLLECTIONS.assets).doc(data.marketplaceAssetId).get();
+    if (!assetDoc.exists) return null;
+    const purchase = await getVerifiedMarketplacePurchase(db, {
+      buyerId: uid,
+      assetId: data.marketplaceAssetId,
+      asset: assetDoc.data(),
+    });
+    if (!purchase) return null;
+  }
+
+  if (data.b2_key) {
+    const canRead = await canAccessMarketplaceStorageKey(db, {
+      userId: uid,
+      key: data.b2_key,
+      assetId: data.marketplaceAssetId || null,
+    });
+    if (!canRead) return null;
+  }
+
+  return { doc, data };
 }
 
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
@@ -902,8 +943,16 @@ function startCacheCleanup() {
 }
 startCacheCleanup();
 
+function storageKeyFromB2Url(parsedUrl) {
+  const bucket = process.env.B2_BUCKET_NAME;
+  const pathParts = parsedUrl.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part));
+  if (bucket && pathParts[0] === bucket) return pathParts.slice(1).join("/");
+  return pathParts.join("/");
+}
+
 export async function modelProxy(req, res) {
   let { url, taskId: taskIdParam } = req.query;
+  const requesterId = req.user?.uid;
   let requestCacheKey;
   let rejectInFlight = null;
 
@@ -922,8 +971,9 @@ export async function modelProxy(req, res) {
     "assets.tripo3d.com",
     "data.tripo3d.com",
   ];
+  let b2Host = null;
   try {
-    const b2Host = process.env.B2_ENDPOINT ? new URL(process.env.B2_ENDPOINT).hostname : null;
+    b2Host = process.env.B2_ENDPOINT ? new URL(process.env.B2_ENDPOINT).hostname : null;
     if (b2Host) allowedHosts.push(b2Host);
   } catch {
     // Ignore malformed optional B2 endpoint; Tripo hosts are still enforced.
@@ -938,6 +988,15 @@ export async function modelProxy(req, res) {
 
     if (!isAllowedProxyHost(parsed.hostname, allowedHosts)) {
       return { error: 400, message: "Source not allowed" };
+    }
+
+    if (b2Host && parsed.hostname.endsWith(b2Host)) {
+      const key = storageKeyFromB2Url(parsed);
+      const canRead = await canAccessMarketplaceStorageKey(admin.firestore(), {
+        userId: requesterId,
+        key,
+      });
+      if (!canRead) return { error: 403, message: "Forbidden" };
     }
 
     const apiKey = process.env.TRIPO3D_API_KEY;
@@ -957,6 +1016,15 @@ export async function modelProxy(req, res) {
   };
 
   try {
+    let authorizedHistory = null;
+    if (taskIdParam) {
+      authorizedHistory = await getAuthorizedHistoryForModelProxy(taskIdParam, requesterId);
+      if (!authorizedHistory) {
+        res.status(403).json({ success: false, message: "Forbidden" });
+        return;
+      }
+    }
+
     const sendModelEntry = (entry, cacheHeader = "HIT") => {
       res.setHeader("Content-Type", entry.contentType);
       res.setHeader("Content-Disposition", `attachment; filename="model.${entry.ext}"`);
@@ -985,20 +1053,12 @@ export async function modelProxy(req, res) {
     // ── Permanent Storage: Check B2 first ─────────────────────────────
     if (taskIdParam) {
       try {
-        const db = admin.firestore();
-        const snap = await db.collection(HISTORY_COLLECTION)
-          .where("taskId", "==", taskIdParam)
-          .limit(1)
-          .get();
-        
-        if (!snap.empty) {
-          const histData = snap.docs[0].data();
-          if (histData.b2_key) {
-            console.log(`[TaskController] modelProxy: found B2 key ${histData.b2_key} for task ${taskIdParam}`);
-            const b2Url = await storageService.getSignedUrl(histData.b2_key);
-            if (b2Url) {
-              url = b2Url; // Use B2 URL instead of Tripo URL
-            }
+        const histData = authorizedHistory?.data;
+        if (histData?.b2_key) {
+          console.log(`[TaskController] modelProxy: found B2 key ${histData.b2_key} for task ${taskIdParam}`);
+          const b2Url = await storageService.getSignedUrl(histData.b2_key);
+          if (b2Url) {
+            url = b2Url; // Use B2 URL instead of Tripo URL
           }
         }
       } catch (fsErr) {
@@ -1071,11 +1131,13 @@ export async function modelProxy(req, res) {
                 // 1. Try taskId matches
                 const taskSnap = await db.collection(HISTORY_COLLECTION)
                   .where("taskId", "==", taskId)
+                  .where("userId", "==", requesterId)
                   .get();
 
                 // 2. Try model_url matches (important for old records missing taskId field)
                 const urlSnap = await db.collection(HISTORY_COLLECTION)
                   .where("model_url", "==", url)
+                  .where("userId", "==", requesterId)
                   .get();
 
                 const allDocs = [...taskSnap.docs, ...urlSnap.docs];
