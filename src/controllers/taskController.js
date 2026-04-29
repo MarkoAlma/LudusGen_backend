@@ -184,18 +184,9 @@ async function deleteHistoryForDeadModel({ taskId, modelUrl, uid = null, reason 
   return deleteHistoryDocsWithStorage(snaps.flatMap(snap => snap.docs), reason);
 }
 
-async function getAuthorizedHistoryForModelProxy(taskId, uid) {
-  if (!taskId || !uid) return null;
-
+async function authorizeHistoryDocForModelProxy(doc, uid) {
+  if (!doc || !uid) return null;
   const db = admin.firestore();
-  const snap = await db.collection(HISTORY_COLLECTION)
-    .where("taskId", "==", taskId)
-    .limit(25)
-    .get();
-
-  const doc = snap.docs.find((item) => item.data()?.userId === uid);
-  if (!doc) return null;
-
   const data = doc.data();
   if (data.marketplaceAssetId) {
     const assetDoc = await db.collection(MARKETPLACE_COLLECTIONS.assets).doc(data.marketplaceAssetId).get();
@@ -218,6 +209,48 @@ async function getAuthorizedHistoryForModelProxy(taskId, uid) {
   }
 
   return { doc, data };
+}
+
+async function getAuthorizedHistoryForModelProxy(taskId, uid, modelUrl = null) {
+  if (!uid || (!taskId && !modelUrl)) return null;
+
+  const db = admin.firestore();
+  const candidates = [];
+
+  if (taskId) {
+    const taskSnap = await db.collection(HISTORY_COLLECTION)
+      .where("taskId", "==", taskId)
+      .limit(25)
+      .get();
+    candidates.push(...taskSnap.docs);
+  }
+
+  if (modelUrl) {
+    const urlSnap = await db.collection(HISTORY_COLLECTION)
+      .where("model_url", "==", modelUrl)
+      .where("userId", "==", uid)
+      .limit(10)
+      .get();
+    candidates.push(...urlSnap.docs);
+  }
+
+  const seenIds = new Set();
+  const uniqueCandidates = candidates.filter((doc) => {
+    if (!doc?.id || seenIds.has(doc.id)) return false;
+    seenIds.add(doc.id);
+    return true;
+  });
+
+  const exactUrlDoc = modelUrl
+    ? uniqueCandidates.find((item) => item.data()?.userId === uid && item.data()?.model_url === modelUrl)
+    : null;
+  if (exactUrlDoc) {
+    return authorizeHistoryDocForModelProxy(exactUrlDoc, uid);
+  }
+
+  const taskDoc = uniqueCandidates.find((item) => item.data()?.userId === uid);
+  if (!taskDoc) return null;
+  return authorizeHistoryDocForModelProxy(taskDoc, uid);
 }
 
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
@@ -251,19 +284,21 @@ export async function createTask(req, res) {
     
     // Normalize image inputs
     if (type === "image_to_model") {
-      const tokens = (body.images && Array.isArray(body.images)) ? body.images
-                   : (body.batch_images && Array.isArray(body.batch_images)) ? body.batch_images
-                   : [];
-      const onlyStringTokens = tokens.length > 0 && tokens.every((item) => typeof item === "string");
+      const imageInputs = Array.isArray(body.images)
+        ? body.images
+        : Array.isArray(body.batch_images)
+          ? body.batch_images
+          : [];
 
-      if (onlyStringTokens && tokens.length === 1) {
+      if (imageInputs.length === 1) {
         // Normalize single image task
-        body.file = { type: "jpg", file_token: tokens[0] };
+        const imageInput = imageInputs[0];
+        body.file = typeof imageInput === "string" ? { type: "jpg", file_token: imageInput } : imageInput;
         delete body.images;
         delete body.batch_images;
-      } else if (onlyStringTokens && tokens.length > 1) {
-        // Keep tokens for later splitting in this controller
-        body.batch_images = tokens;
+      } else if (imageInputs.length > 1) {
+        // Keep inputs for later splitting in this controller
+        body.batch_images = imageInputs;
         delete body.images;
       }
     }
@@ -931,10 +966,6 @@ export async function modelProxy(req, res) {
   let rejectInFlight = null;
 
   if (!url) { res.status(400).json({ success: false, message: "url missing" }); return; }
-  if (taskIdParam && !await userOwnsTask(taskIdParam, req.user?.uid)) {
-    res.status(403).json({ success: false, message: "Forbidden" });
-    return;
-  }
 
   const allowedHosts = [
     "tripo3d.ai",
@@ -992,7 +1023,7 @@ export async function modelProxy(req, res) {
   try {
     let authorizedHistory = null;
     if (taskIdParam) {
-      authorizedHistory = await getAuthorizedHistoryForModelProxy(taskIdParam, requesterId);
+      authorizedHistory = await getAuthorizedHistoryForModelProxy(taskIdParam, requesterId, url);
       if (!authorizedHistory) {
         res.status(403).json({ success: false, message: "Forbidden" });
         return;

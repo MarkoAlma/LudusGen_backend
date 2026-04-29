@@ -80,8 +80,16 @@ export function estimateCost(req) {
 
   const totalPerImage = base + texAddon + ultraAddon + slpAddon + partsAddon + quadAddon + styleAddon;
   
-  // Handle batch images cost multiplier
-  const batchCount = (req.batch_images && Array.isArray(req.batch_images)) ? req.batch_images.length : 1;
+  // Handle image-to-model batch aliases. The controller may receive either
+  // batch_images or images before splitting them into separate Tripo tasks.
+  const batchImages = Array.isArray(req.batch_images)
+    ? req.batch_images
+    : Array.isArray(req.images)
+      ? req.images
+      : null;
+  const batchCount = req.type === "image_to_model" && batchImages
+    ? Math.max(1, batchImages.filter(Boolean).length)
+    : 1;
   const total = totalPerImage * batchCount;
 
   if (batchCount > 1) {
