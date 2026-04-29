@@ -130,6 +130,27 @@ console.log("\nSanity: P1 text_to_model with standard texture (normal case)");
 // ─────────────────────────────────────────────────────────────────────────────
 // Summary
 // ─────────────────────────────────────────────────────────────────────────────
+console.log("\nScenario: image_to_model images array charges per image");
+{
+  const result = estimateCost({
+    type: "image_to_model",
+    model_version: "v3.1-20260211",
+    images: [
+      { type: "png", file_token: "one" },
+      { type: "png", file_token: "two" },
+      { type: "png", file_token: "three" },
+    ],
+    texture: false,
+    pbr: false,
+  });
+
+  assert(result.total === 60, `Total should be 60 (20 x 3 images), got ${result.total}`);
+  assert(
+    result.breakdown.batch_multiplier === "x3",
+    `Batch multiplier should be x3, got ${result.breakdown.batch_multiplier}`,
+  );
+}
+
 console.log(`\n${"=".repeat(60)}`);
 console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
 if (failed > 0) {
