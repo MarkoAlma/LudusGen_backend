@@ -74,32 +74,6 @@ function isAllowedProxyHost(hostname, allowedHosts) {
   });
 }
 
-async function mapWithConcurrency(items, concurrency, iteratee) {
-  const limit = Math.max(1, Math.min(concurrency || 1, items.length || 1));
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex++;
-      try {
-        results[currentIndex] = {
-          status: "fulfilled",
-          value: await iteratee(items[currentIndex], currentIndex),
-        };
-      } catch (error) {
-        results[currentIndex] = {
-          status: "rejected",
-          reason: error,
-        };
-      }
-    }
-  }
-
-  await Promise.all(Array.from({ length: limit }, () => worker()));
-  return results;
-}
-
 function toMillis(value) {
   if (value == null) return null;
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -1258,66 +1232,30 @@ export async function batchGenerate(req, res) {
     res.status(400).json({ success: false, message: "prompts, images, or image_tokens array required (min 1)" });
     return;
   }
-  if (items.length > 50) {
-    res.status(400).json({ success: false, message: "max 50 items per batch" });
-    return;
-  }
 
-  const batchId = uuid();
   const isPrompt = !!prompts;
   const mv = model_version ?? DEFAULT_MODEL;
 
   try {
-    const jobDataList = items.map((item, index) => ({
-      jobType: "batch_item",
-      batchId,
-      batchIndex: index,
-      callbackUrl: callback_url,
-      taskBody: {
-        type: isPrompt ? "text_to_model" : "image_to_model",
-        ...(isPrompt
-          ? { prompt: item }
-          : {
-              file: typeof item === "string"
-                ? { type: "jpg", file_token: item }
-                : item,
-            }),
+    if (!isPrompt) {
+      req.body = {
+        type: "image_to_model",
+        batch_images: items,
         model_version: mv,
         texture: texture === true,
         ...(pbr === true && { pbr: true }),
-        texture_quality: texture_quality ?? "detailed",
-      },
-    }));
-
-    if (USE_QUEUE) {
-      const jobIds = await enqueueBatch(jobDataList);
-      res.json({
-        success: true,
-        batchId,
-        total: items.length,
-        jobIds,
-        message: "Batch enqueued. Track progress via GET /tripo/batch/:batchId",
-      });
-    } else {
-      const taskIds = await mapWithConcurrency(
-        jobDataList,
-        4,
-        (d) => taskService.create(d.taskBody, { callbackUrl: callback_url }),
-      );
-      res.json({
-        success: true,
-        batchId,
-        total: items.length,
-        tasks: taskIds.map((r, i) => ({
-          index: i,
-          taskId: r.status === "fulfilled" ? r.value : null,
-          error: r.status === "rejected" ? r.reason.message : undefined,
-        })),
-        taskIds: taskIds
-          .filter((r) => r.status === "fulfilled")
-          .map((r) => r.value),
-      });
+        ...(texture_quality && { texture_quality }),
+        ...(callback_url && { callback_url }),
+      };
+      return createTask(req, res);
     }
+
+    res.status(400).json({
+      success: false,
+      message: "Batch prompts are disabled on this endpoint until per-item billing and task ownership tracking are enabled.",
+      code: "BATCH_PROMPTS_DISABLED",
+    });
+    return;
   } catch (err) {
     console.error("[TaskController] batchGenerate error:", err.message);
     res.status(500).json({ success: false, message: err.message });

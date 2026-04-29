@@ -8,6 +8,7 @@ export const POLL_INTERVAL   = 4_000;
 export const TRIPO_PROMPT_MAX_LENGTH = 1024;
 export const TRIPO_NEGATIVE_PROMPT_MAX_LENGTH = 255;
 export const TRIPO_IMAGE_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+export const TRIPO_IMAGE_TO_MODEL_BATCH_MAX = 10;
 export const TRIPO_MODEL_IMPORT_MAX_BYTES = 150 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────

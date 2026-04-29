@@ -16,6 +16,7 @@ import {
   DEFAULT_MODEL,
   TRIPO_PROMPT_MAX_LENGTH,
   TRIPO_NEGATIVE_PROMPT_MAX_LENGTH,
+  TRIPO_IMAGE_TO_MODEL_BATCH_MAX,
 } from "../config/tripo.config.js";
 import { validateFaceLimit } from "../lib/enginePresets.js";
 import crypto from "crypto";
@@ -412,6 +413,9 @@ class TaskService {
           if (b.file) b.file = normalizeFileRef(b.file, "png");
           if (b.images) b.images = normalizeFileRefList(b.images, "png");
           if (b.batch_images) b.batch_images = normalizeFileRefList(b.batch_images, "png");
+          if (b.batch_images?.length > TRIPO_IMAGE_TO_MODEL_BATCH_MAX) {
+            throw new Error(`image_to_model batch_images maximum ${TRIPO_IMAGE_TO_MODEL_BATCH_MAX} images`);
+          }
           const hasFile = !!b.file || (!!b.images && b.images.length > 0) || (!!b.batch_images && b.batch_images.length > 0);
           if (!hasFile) throw new Error("file, images, or batch_images required for image_to_model");
         }
@@ -485,6 +489,9 @@ class TaskService {
           if (b.file) b.file = normalizeFileRef(b.file, "png");
           if (b.images) b.images = normalizeFileRefList(b.images, "png");
           if (b.batch_images) b.batch_images = normalizeFileRefList(b.batch_images, "png");
+          if (b.batch_images?.length > TRIPO_IMAGE_TO_MODEL_BATCH_MAX) {
+            throw new Error(`image_to_model batch_images maximum ${TRIPO_IMAGE_TO_MODEL_BATCH_MAX} images`);
+          }
           const hasFile = !!b.file || (!!b.images && b.images.length > 0) || (!!b.batch_images && b.batch_images.length > 0);
           if (!hasFile) throw new Error("file, images, or batch_images required for image_to_model");
         }

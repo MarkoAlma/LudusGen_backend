@@ -61,4 +61,16 @@ const editedViews = taskService.validate({
 assert.equal(editedViews.original_task_id, "task-123");
 assert.deepEqual(editedViews.prompts, [{ prompt: "add a helmet", view: "front" }]);
 
+assert.throws(
+  () => taskService.validate({
+    type: "image_to_model",
+    model_version: "v3.1-20260211",
+    batch_images: Array.from({ length: 11 }, (_, index) => ({
+      type: "jpg",
+      file_token: `image-token-${index}`,
+    })),
+  }),
+  /maximum 10 images/
+);
+
 console.log("tripoTaskService assertions passed");
