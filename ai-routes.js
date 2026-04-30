@@ -4925,8 +4925,50 @@ async function uploadMediaToB2(buffer, key, contentType) {
     return key;
 }
 
+function safeGalleryDocId(value) {
+    return String(value || '')
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 180);
+}
+
+function isAllowedGalleryImportSource(source) {
+    const value = String(source || '');
+    if (value.startsWith('data:image/')) return true;
+    try {
+        const parsed = new URL(value);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+        const host = parsed.hostname.toLowerCase();
+        return host === 'tripo3d.ai' ||
+            host === 'tripo3d.com' ||
+            host.endsWith('.tripo3d.ai') ||
+            host.endsWith('.tripo3d.com');
+    } catch {
+        return false;
+    }
+}
+
 async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
     try {
+        const galleryCollection = admin.firestore().collection('generated_images');
+        const requestedDocId = safeGalleryDocId(metadata.docId);
+        if (requestedDocId) {
+            const existing = await galleryCollection.doc(requestedDocId).get();
+            if (existing.exists && existing.data()?.userId === userId) {
+                return {
+                    id: existing.id,
+                    duplicate: true,
+                    fullKey: existing.data()?.full_key || null,
+                    thumbKey: existing.data()?.thumb_key || null,
+                    width: existing.data()?.width || null,
+                    height: existing.data()?.height || null,
+                    contentType: existing.data()?.contentType || 'image/png',
+                    extension: 'png',
+                };
+            }
+        }
+
         let inputBuffer;
         let originalMime = 'image/png';
 
@@ -4963,7 +5005,7 @@ async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
         const storedHeight = metadata.height || meta.height || 1024;
 
         // 3. Save to Firestore
-        const docRef = await admin.firestore().collection('generated_images').add({
+        const galleryPayload = {
             userId,
             full_key: fullKey,
             thumb_key: thumbKey,
@@ -4976,7 +5018,15 @@ async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
             operation: metadata.operation || null,
             requestId: metadata.requestId || null,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        };
+
+        let docRef;
+        if (requestedDocId) {
+            docRef = galleryCollection.doc(requestedDocId);
+            await docRef.set(galleryPayload);
+        } else {
+            docRef = await galleryCollection.add(galleryPayload);
+        }
 
         return {
             id: docRef.id,
@@ -5533,6 +5583,51 @@ router.get('/image-gallery', verifyFirebaseToken, async (req, res) => {
     } catch (err) {
         console.error('[GalleryList] Error:', err);
         res.status(500).json({ success: false, message: 'Galéria lekérdezése sikertelen' });
+    }
+});
+
+router.post('/image-gallery/import', verifyFirebaseToken, async (req, res) => {
+    try {
+        const userId = req.userId;
+        const {
+            url,
+            prompt = '',
+            taskId = '',
+            index = 0,
+            type = 'tripo_image',
+            mode = 'views',
+            width = null,
+            height = null,
+            operation = 'tripo_3d_image',
+        } = req.body || {};
+
+        if (!url) return res.status(400).json({ success: false, message: 'Missing image url' });
+        if (!isAllowedGalleryImportSource(url)) {
+            return res.status(400).json({ success: false, message: 'Unsupported gallery import source' });
+        }
+
+        const safeTaskId = safeGalleryDocId(taskId || `manual_${Date.now()}`);
+        const safeIndex = Math.max(0, Number.parseInt(index, 10) || 0);
+        const stored = await processImageAndUpload(userId, url, {
+            prompt,
+            modelId: type || mode || 'tripo',
+            provider: 'tripo',
+            aspect_ratio: 'tripo',
+            width,
+            height,
+            operation,
+            requestId: `tripo:${safeTaskId}:${safeIndex}`,
+            docId: `tripo_${userId}_${safeTaskId}_${safeIndex}`,
+        });
+
+        if (!stored) {
+            return res.status(500).json({ success: false, message: 'Gallery import failed' });
+        }
+
+        res.json({ success: true, image: stored });
+    } catch (err) {
+        console.error('[GalleryImport] Error:', err);
+        res.status(500).json({ success: false, message: 'Gallery import failed' });
     }
 });
 
