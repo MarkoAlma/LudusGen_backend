@@ -5,7 +5,7 @@ import { storageService } from "../services/storageService.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
-import { deductCredits, refundCredits, linkTaskIdToTransaction } from "../services/creditService.js";
+import { deductCredits, refundCredits, linkTaskIdToTransaction, hasBeenCharged } from "../services/creditService.js";
 import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskMeta } from "../services/taskRecoveryService.js";
 import {
   MARKETPLACE_COLLECTIONS,
@@ -15,7 +15,9 @@ import {
 import { DEFAULT_MODEL, VALID_MODEL_VERSIONS, MODEL_CAPABILITIES, DEFAULT_CAPABILITIES, HISTORY_TTL_MS, TRIPO_IMAGE_UPLOAD_MAX_BYTES } from "../config/tripo.config.js";
 import { v4 as uuid } from "uuid";
 import admin from "firebase-admin";
+import { createHash } from "node:crypto";
 import { registerJob, unregisterJob } from "../lib/jobRegistry.js";
+import { getTaskLookupHttpStatus, isMissingTripoTaskError } from "../lib/tripoTaskErrors.js";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -24,6 +26,24 @@ const HISTORY_COLLECTION = "tripo_history";
 const REFINE_DIRECT_SOURCE_TYPES = new Set(["text_to_model", "image_to_model", "multiview_to_model"]);
 const REFINE_UPSTREAM_SOURCE_TYPES = new Set(["texture_model", "convert_model", "smart_low_poly", "stylize_model", "mesh_segmentation", "mesh_completion"]);
 const TEXTURE_DIRECT_SOURCE_TYPES = new Set(["text_to_model", "image_to_model", "multiview_to_model", "texture_model", "import_model"]);
+const TASK_TYPE_TO_MODE = {
+  text_to_model: "generate",
+  image_to_model: "generate",
+  multiview_to_model: "generate",
+  import_model: "upload",
+  generate_image: "views",
+  generate_multiview_image: "views",
+  edit_multiview_image: "views",
+  refine_model: "refine",
+  stylize_model: "stylize",
+  texture_model: "texture",
+  convert_model: "retopo",
+  smart_low_poly: "retopo",
+  mesh_segmentation: "segment",
+  mesh_completion: "fill_parts",
+  animate_rig: "animate",
+  animate_retarget: "animate",
+};
 
 function getHistoryModelVersion(data) {
   return data?.params?.model_version ||
@@ -58,8 +78,49 @@ function errorPayload(err, message = err.message) {
   };
 }
 
+function omitUndefined(obj) {
+  return Object.fromEntries(Object.entries(obj).filter(([, value]) => value !== undefined));
+}
+
 function uniqueDocs(docs) {
   return Array.from(new Map(docs.filter(Boolean).map(d => [d.ref.path, d])).values());
+}
+
+function normalizeHistoryTaskKey(value) {
+  const key = String(value || "").trim();
+  return key.startsWith("tripo_") ? key.slice(6) : key;
+}
+
+async function getHistoryDocsByTaskKey(db, taskId) {
+  const normalizedTaskId = normalizeHistoryTaskKey(taskId);
+  if (!normalizedTaskId) return [];
+
+  const collection = db.collection(HISTORY_COLLECTION);
+  const docs = [];
+
+  const prefixedDoc = await collection.doc(`tripo_${normalizedTaskId}`).get();
+  if (prefixedDoc.exists) docs.push(prefixedDoc);
+
+  if (String(taskId || "").trim() !== `tripo_${normalizedTaskId}`) {
+    const directDoc = await collection.doc(String(taskId || "").trim()).get();
+    if (directDoc.exists) docs.push(directDoc);
+  }
+
+  const taskSnap = await collection
+    .where("taskId", "==", normalizedTaskId)
+    .limit(25)
+    .get();
+  docs.push(...taskSnap.docs);
+
+  if (String(taskId || "").trim() && String(taskId || "").trim() !== normalizedTaskId) {
+    const rawTaskSnap = await collection
+      .where("taskId", "==", String(taskId || "").trim())
+      .limit(25)
+      .get();
+    docs.push(...rawTaskSnap.docs);
+  }
+
+  return uniqueDocs(docs);
 }
 
 function delay(ms) {
@@ -110,16 +171,20 @@ function getHistoryExpiryMillis(data) {
 
 async function userOwnsTask(taskId, uid) {
   if (!taskId || !uid) return false;
-  const taskMeta = getRegisteredTaskMeta(taskId);
+  const normalizedTaskId = normalizeHistoryTaskKey(taskId);
+  const taskMeta = getRegisteredTaskMeta(normalizedTaskId) || getRegisteredTaskMeta(taskId);
   if (taskMeta?.userId === uid) return true;
 
+  try {
+    if (await hasBeenCharged(uid, normalizedTaskId)) return true;
+    if (normalizedTaskId !== taskId && await hasBeenCharged(uid, taskId)) return true;
+  } catch (err) {
+    console.warn(`[TaskController] Credit ownership lookup failed for task ${taskId}:`, err.message);
+  }
+
   const db = admin.firestore();
-  const snap = await db.collection(HISTORY_COLLECTION)
-    .where("taskId", "==", taskId)
-    .where("userId", "==", uid)
-    .limit(1)
-    .get();
-  return !snap.empty;
+  const docs = await getHistoryDocsByTaskKey(db, taskId);
+  return docs.some((doc) => doc.data()?.userId === uid);
 }
 
 async function requireTaskAccess(req, res, taskId = req.params.taskId) {
@@ -134,6 +199,49 @@ async function requireTaskAccess(req, res, taskId = req.params.taskId) {
     return false;
   }
   return true;
+}
+
+async function writePendingHistoryTask({
+  taskId,
+  userId,
+  body = {},
+  prompt = null,
+}) {
+  if (!taskId || !userId) return;
+
+  const type = body.type ?? "unknown";
+  const mode = TASK_TYPE_TO_MODE[type] ?? "generate";
+  const now = Date.now();
+  const params = omitUndefined({
+    model_version: body.model_version ?? DEFAULT_MODEL,
+    mode,
+    type,
+    texture: body.texture === true,
+    pbr: body.pbr === true,
+    originalModelTaskId: body.original_model_task_id ?? body.original_model_id,
+    originalTaskId: body.original_task_id,
+    draftModelTaskId: body.draft_model_task_id,
+    preprocessTaskId: body.preprocessTaskId,
+    preprocessTaskType: body.preprocessTaskType,
+    generate_parts: body.generate_parts === true ? true : undefined,
+  });
+
+  try {
+    await admin.firestore().collection(HISTORY_COLLECTION).doc(`tripo_${taskId}`).set({
+      userId,
+      prompt: prompt ?? body.prompt ?? type,
+      status: "pending",
+      source: type === "import_model" ? "upload" : "tripo",
+      mode,
+      taskId,
+      params,
+      ts: now,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: now + HISTORY_TTL_MS,
+    }, { merge: true });
+  } catch (err) {
+    console.warn(`[TaskController] Pending history write failed for task ${taskId}:`, err.message);
+  }
 }
 
 async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
@@ -191,12 +299,16 @@ async function authorizeHistoryDocForModelProxy(doc, uid) {
   if (data.marketplaceAssetId) {
     const assetDoc = await db.collection(MARKETPLACE_COLLECTIONS.assets).doc(data.marketplaceAssetId).get();
     if (!assetDoc.exists) return null;
-    const purchase = await getVerifiedMarketplacePurchase(db, {
-      buyerId: uid,
-      assetId: data.marketplaceAssetId,
-      asset: assetDoc.data(),
-    });
-    if (!purchase) return null;
+    const assetData = assetDoc.data();
+    const isMarketplaceAssetOwner = assetData.ownerId === uid;
+    if (!isMarketplaceAssetOwner) {
+      const purchase = await getVerifiedMarketplacePurchase(db, {
+        buyerId: uid,
+        assetId: data.marketplaceAssetId,
+        asset: assetData,
+      });
+      if (!purchase) return null;
+    }
   }
 
   if (data.b2_key) {
@@ -218,11 +330,7 @@ async function getAuthorizedHistoryForModelProxy(taskId, uid, modelUrl = null) {
   const candidates = [];
 
   if (taskId) {
-    const taskSnap = await db.collection(HISTORY_COLLECTION)
-      .where("taskId", "==", taskId)
-      .limit(25)
-      .get();
-    candidates.push(...taskSnap.docs);
+    candidates.push(...await getHistoryDocsByTaskKey(db, taskId));
   }
 
   if (modelUrl) {
@@ -648,6 +756,12 @@ export async function createTask(req, res) {
             );
           }
           if (userId) {
+            await writePendingHistoryTask({
+              taskId,
+              userId,
+              body: subBody,
+              prompt: inheritedPrompt,
+            });
             registerForRecovery(taskId, userId, subBody.type, subBody.model_version ?? DEFAULT_MODEL, inheritedPrompt, {
               texture: subBody.texture === true,
               pbr: subBody.pbr === true,
@@ -673,6 +787,12 @@ export async function createTask(req, res) {
 
         // Register for background recovery with inherited prompt
         if (userId) {
+          await writePendingHistoryTask({
+            taskId,
+            userId,
+            body,
+            prompt: inheritedPrompt,
+          });
           registerForRecovery(taskId, userId, body.type, body.model_version ?? DEFAULT_MODEL, inheritedPrompt, {
             texture: body.texture === true,
             pbr: body.pbr === true,
@@ -770,7 +890,10 @@ export async function getTask(req, res) {
     res.json({ success: true, ...taskData });
   } catch (err) {
     console.error("[TaskController] getTask error:", err.message);
-    res.status(500).json(errorPayload(err));
+    const status = getTaskLookupHttpStatus(err);
+    res.status(status).json(
+      errorPayload(err, status === 410 ? "Task expired or deleted from source" : err.message),
+    );
   }
 }
 
@@ -816,7 +939,18 @@ export async function streamTask(req, res) {
       await delay(2_500);
     }
   } catch (err) {
-    send("error", errorPayload(err));
+    if (isMissingTripoTaskError(err)) {
+      send("status", {
+        success: true,
+        status: "failed",
+        progress: 100,
+        errorMessage: "Task expired or deleted from source",
+        errorCode: "TASK_NOT_FOUND",
+        ts: Date.now(),
+      });
+    } else {
+      send("error", errorPayload(err));
+    }
   } finally {
     if (!closed) {
       res.end();
@@ -959,6 +1093,54 @@ function storageKeyFromB2Url(parsedUrl) {
   return pathParts.join("/");
 }
 
+function isModelProxyArchiveEnabled() {
+  return ["B2_ENDPOINT", "B2_KEY_ID", "B2_APP_KEY", "B2_BUCKET_NAME"]
+    .every((name) => Boolean(process.env[name]?.trim?.()));
+}
+
+function safeArchivePathPart(value, fallback) {
+  return String(value || fallback)
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 96) || fallback;
+}
+
+function buildModelProxyArchiveKey({ requesterId, taskId, sourceUrl, ext }) {
+  const hash = createHash("sha1").update(`${taskId || ""}|${sourceUrl || ""}`).digest("hex").slice(0, 12);
+  const safeUid = safeArchivePathPart(requesterId, "user");
+  const safeTaskId = safeArchivePathPart(taskId, hash);
+  const safeExt = safeArchivePathPart(ext, "glb").toLowerCase();
+  return `tripo/${safeUid}/${safeTaskId}_${hash}.${safeExt}`;
+}
+
+async function archiveModelProxyFetch({
+  authorizedHistory,
+  requesterId,
+  taskId,
+  sourceUrl,
+  buffer,
+  contentType,
+  ext,
+}) {
+  if (!isModelProxyArchiveEnabled()) return;
+  if (!authorizedHistory?.doc?.ref || authorizedHistory.data?.b2_key) return;
+  if (!taskId || !buffer?.length) return;
+
+  const key = buildModelProxyArchiveKey({ requesterId, taskId, sourceUrl, ext });
+  try {
+    await storageService.uploadFile(buffer, key, contentType);
+    await authorizedHistory.doc.ref.update({
+      b2_key: key,
+      archivedAt: admin.firestore.FieldValue.serverTimestamp(),
+      archiveSource: "model_proxy",
+    });
+    console.log(`[TaskController] modelProxy archived task ${taskId} to ${key}`);
+  } catch (err) {
+    console.warn(`[TaskController] modelProxy archive failed for ${taskId}:`, err.message);
+  }
+}
+
 export async function modelProxy(req, res) {
   let { url, taskId: taskIdParam } = req.query;
   const requesterId = req.user?.uid;
@@ -1085,6 +1267,7 @@ export async function modelProxy(req, res) {
       resolveInFlight = resolve;
       rejectInFlight = reject;
     });
+    inFlightPromise.catch(() => {});
     MODEL_IN_FLIGHT.set(requestCacheKey, inFlightPromise);
 
     let { error, upstream, message } = await performFetch(url);
@@ -1201,6 +1384,16 @@ export async function modelProxy(req, res) {
       usdz: "model/vnd.usdz+zip",
     };
     const ct = EXT_CT_MAP[ext] ?? "model/gltf-binary";
+
+    void archiveModelProxyFetch({
+      authorizedHistory,
+      requesterId,
+      taskId: taskIdParam,
+      sourceUrl: url,
+      buffer,
+      contentType: ct,
+      ext,
+    });
 
     // ── Cache the result ───────────────────────────────────────────────
     const cacheKey = taskIdParam || `url_${cleanPath}`;
@@ -1325,7 +1518,7 @@ export async function deleteHistoryItem(req, res) {
     const doc = await ref.get();
 
     if (!doc.exists) {
-      res.status(404).json({ success: false, message: "Item not found" });
+      res.json({ success: true, id, deleted: 0, b2Deleted: 0, b2Failed: 0, alreadyDeleted: true });
       return;
     }
     if (doc.data()?.userId !== uid) {
