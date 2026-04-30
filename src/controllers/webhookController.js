@@ -6,6 +6,7 @@ import admin from "firebase-admin";
 import { storageService } from "../services/storageService.js";
 import axios from "axios";
 import { extractModelUrl } from "../utils/tripoUtils.js";
+import { isFailedLikeTripoTaskStatus, normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
 
 const HISTORY_COLLECTION = "tripo_history";
 
@@ -30,7 +31,9 @@ export async function handleWebhook(req, res) {
     // Acknowledge immediately — process async
     res.json({ success: true, received: true });
 
-    if (payload.status === "success") {
+    const normalizedStatus = normalizeTripoTaskStatus(payload.status);
+
+    if (normalizedStatus === "success") {
       // Task completed successfully — save to Firestore history automatically.
       // This ensures the model is preserved even if the user navigated away.
       await saveCompletedTaskToHistory(payload.task_id, payload);
@@ -38,8 +41,8 @@ export async function handleWebhook(req, res) {
 
     // If task failed via webhook, trigger refund (webhook doesn't have userId,
     // so we look it up from credit_history)
-    if (["failed", "cancelled"].includes(payload.status)) {
-      await processRefundForTask(payload.task_id, payload.status, payload);
+    if (isFailedLikeTripoTaskStatus(payload.status)) {
+      await processRefundForTask(payload.task_id, normalizedStatus, payload);
     }
 
     await webhookService.handlePayload(payload);

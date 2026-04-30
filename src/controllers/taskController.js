@@ -361,6 +361,64 @@ async function getAuthorizedHistoryForModelProxy(taskId, uid, modelUrl = null) {
   return authorizeHistoryDocForModelProxy(taskDoc, uid);
 }
 
+function collectHistoryPreviewImageUrls(historyData = {}) {
+  const params = historyData.params ?? {};
+  return [...new Set([
+    ...(Array.isArray(historyData.previewImageUrls) ? historyData.previewImageUrls : []),
+    ...(Array.isArray(historyData.preview_image_urls) ? historyData.preview_image_urls : []),
+    ...(historyData.previewImageUrl ? [historyData.previewImageUrl] : []),
+    ...(historyData.preview_image_url ? [historyData.preview_image_url] : []),
+    ...(Array.isArray(params.previewImageUrls) ? params.previewImageUrls : []),
+    ...(Array.isArray(params.preview_image_urls) ? params.preview_image_urls : []),
+    ...(params.previewImageUrl ? [params.previewImageUrl] : []),
+    ...(params.preview_image_url ? [params.preview_image_url] : []),
+  ].filter(Boolean))];
+}
+
+async function buildArchivedTaskFallback(taskId, uid) {
+  const authorizedHistory = await getAuthorizedHistoryForModelProxy(taskId, uid);
+  if (!authorizedHistory) return null;
+
+  const historyData = authorizedHistory.data ?? {};
+  const params = historyData.params ?? {};
+  const previewImageUrls = collectHistoryPreviewImageUrls(historyData);
+
+  let modelUrl = historyData.model_url ?? null;
+  if (historyData.b2_key) {
+    try {
+      const signedUrl = await storageService.getSignedUrl(historyData.b2_key);
+      if (signedUrl) modelUrl = signedUrl;
+    } catch (err) {
+      console.warn(`[TaskController] archived task fallback B2 URL failed for ${taskId}:`, err.message);
+    }
+  }
+
+  const normalizedStatus = historyData.status === "succeeded" ? "success" : (historyData.status ?? "success");
+  return {
+    success: true,
+    status: normalizedStatus,
+    progress: normalizedStatus === "success" ? 100 : 0,
+    modelUrl,
+    tripoTraceId: null,
+    chosenSource: params.chosen_source ?? "history",
+    rigCheckResult: params.is_animatable ?? null,
+    rigType: params.rig_type ?? params.topology ?? null,
+    topology: params.topology ?? null,
+    previewImageUrl: previewImageUrls[0] ?? null,
+    previewImageUrls,
+    consumedCredit: params.consumed_credit ?? null,
+    originalTaskId: params.originalTaskId ?? params.originalModelTaskId ?? params.draftModelTaskId ?? null,
+    rawOutput: {
+      model_url: modelUrl,
+      preview_image_url: previewImageUrls[0] ?? null,
+      preview_image_urls: previewImageUrls,
+    },
+    errorMessage: null,
+    errorCode: null,
+    archivedHistoryFallback: true,
+  };
+}
+
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
 export async function createTask(req, res) {
   const { type, callback_url, idempotency_key, ...rest } = req.body;
@@ -891,6 +949,14 @@ export async function getTask(req, res) {
   } catch (err) {
     console.error("[TaskController] getTask error:", err.message);
     const status = getTaskLookupHttpStatus(err);
+    if (status === 410) {
+      const archivedFallback = await buildArchivedTaskFallback(req.params.taskId, req.user?.uid ?? null);
+      if (archivedFallback) {
+        console.log(`[TaskController] getTask served archived history fallback for ${req.params.taskId}`);
+        res.json(archivedFallback);
+        return;
+      }
+    }
     res.status(status).json(
       errorPayload(err, status === 410 ? "Task expired or deleted from source" : err.message),
     );
