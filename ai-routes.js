@@ -29,6 +29,11 @@ import {
     trimToContextLimit,
 } from './src/lib/contextBuilder.js';
 import {
+    buildTripoAssetNameFallback,
+    buildTripoAssetNamingMessages,
+    normalizeTripoAssetName,
+} from './src/lib/tripoAssetNaming.js';
+import {
     encodeImageGalleryCursor,
     decodeImageGalleryCursor,
     clampImageGalleryLimit,
@@ -6061,6 +6066,55 @@ router.get('/chat/summary/:sessionId', verifyFirebaseToken, async (req, res) => 
         return res.json({ success: true, summary: summaryDoc.data() });
     } catch (err) {
         return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+router.post('/tripo/asset-name', verifyFirebaseToken, async (req, res) => {
+    const {
+        prompt = '',
+        basePrompt = '',
+        mode = 'generate',
+        type = 'text_to_model',
+        styleId = '',
+        sourceName = '',
+        negativePrompt = '',
+        modelVersion = '',
+    } = req.body || {};
+
+    const fallbackName = buildTripoAssetNameFallback({
+        mode,
+        sourceName,
+        basePrompt,
+        prompt,
+    });
+
+    try {
+        const resp = await groqWithRetry({
+            model: 'openai/gpt-oss-120b',
+            messages: buildTripoAssetNamingMessages({
+                mode,
+                type,
+                prompt,
+                basePrompt,
+                styleId,
+                sourceName,
+                negativePrompt,
+                modelVersion,
+            }),
+            temperature: 0.35,
+            max_tokens: 140,
+            stream: false,
+        });
+
+        const rawContent = resp.data?.choices?.[0]?.message?.content?.trim() || '';
+        const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+        const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+        const name = normalizeTripoAssetName(parsed?.name || fallbackName) || fallbackName;
+        const summary = typeof parsed?.summary === 'string' ? parsed.summary.trim() : '';
+        return res.json({ success: true, name, summary });
+    } catch (err) {
+        console.warn('[TripoAssetName] fallback used:', err.message);
+        return res.json({ success: true, name: fallbackName, summary: '' });
     }
 });
 

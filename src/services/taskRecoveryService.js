@@ -12,6 +12,7 @@ import { getTripoClient } from "../lib/tripoClient.js";
 import { refundCredits } from "./creditService.js";
 import admin from "firebase-admin";
 import { extractModelUrl } from "../utils/tripoUtils.js";
+import { isFailedLikeTripoTaskStatus, normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
 
 const HISTORY_COLLECTION = "tripo_history";
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -141,12 +142,12 @@ export function startTaskRecovery() {
 
       try {
         const taskData = await getTripoClient().getTask(entry.taskId);
-        const status = taskData.status;
+        const status = normalizeTripoTaskStatus(taskData.status);
 
         if (status === "success") {
           await saveToHistory(entry, taskData);
           pendingTasks.delete(entry.taskId);
-        } else if (status === "failed" || status === "cancelled") {
+        } else if (isFailedLikeTripoTaskStatus(taskData.status)) {
           await handleFailedTask(entry, taskData);
           pendingTasks.delete(entry.taskId);
           // "queued" or "running" — keep polling

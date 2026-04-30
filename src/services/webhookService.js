@@ -1,6 +1,7 @@
 // src/services/webhookService.js
 import crypto from "crypto";
 import { analyticsService } from "./analyticsService.js";
+import { isFailedLikeTripoTaskStatus, isTerminalTripoTaskStatus, normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
 
 const getWebhookSecret = () =>
   process.env.TRIPO_WEBHOOK_SECRET ?? process.env.TRIPO3D_API_KEY ?? "";
@@ -35,17 +36,18 @@ class WebhookService {
 
   async handlePayload(payload) {
     const { task_id, status, progress } = payload;
-    console.log(`[WebhookService] task=${task_id} status=${status} progress=${progress}`);
+    const normalizedStatus = normalizeTripoTaskStatus(status);
+    console.log(`[WebhookService] task=${task_id} status=${status} normalized=${normalizedStatus} progress=${progress}`);
 
-    if (["success", "failed", "cancelled"].includes(status))
-      analyticsService.recordTaskEnd(task_id, status, 0);
+    if (isTerminalTripoTaskStatus(status))
+      analyticsService.recordTaskEnd(task_id, normalizedStatus, 0);
 
     const reg = this._callbacks.get(task_id);
     if (reg) {
       try   { await reg.callback(payload); }
       catch (err) { console.error(`[WebhookService] callback error task=${task_id}:`, err.message); }
       finally {
-        if (["success", "failed", "cancelled"].includes(status))
+        if (normalizedStatus === "success" || isFailedLikeTripoTaskStatus(status))
           this._callbacks.delete(task_id);
       }
     }

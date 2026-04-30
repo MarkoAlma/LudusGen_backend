@@ -23,6 +23,7 @@ import {
   TRIPO_IMAGE_TO_MODEL_BATCH_MAX,
 } from "../config/tripo.config.js";
 import { validateFaceLimit } from "../lib/enginePresets.js";
+import { getTripoTaskErrorMessage, normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
 import crypto from "crypto";
 
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -324,20 +325,7 @@ function normalizeTextureModelBody(body) {
 }
 
 function extractTaskError(task = {}) {
-  const out = task.output ?? {};
-  return (
-    task.error_msg ??
-    task.error_message ??
-    task.error ??
-    task.message ??
-    task.reason ??
-    out.error_msg ??
-    out.error_message ??
-    out.error ??
-    out.message ??
-    out.reason ??
-    null
-  );
+  return getTripoTaskErrorMessage(task);
 }
 
 function extractTaskErrorCode(task = {}) {
@@ -836,9 +824,10 @@ class TaskService {
   /* ── Convert raw task to PollResult ──────────────────────────────── */
   taskToPollResult(task, outputHints = {}) {
     const out = task.output ?? {};
+    const normalizedStatus = normalizeTripoTaskStatus(task.status);
     const errorMessage = extractTaskError(task);
     const errorCode = extractTaskErrorCode(task);
-    if (task.status === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
+    if (normalizedStatus === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
       console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
     }
     const {
@@ -851,7 +840,7 @@ class TaskService {
       previewImageUrl,
       previewImageUrls,
     } = extractModelUrl(task, outputHints);
-    if (DEBUG_TRIPO && task.status === "success") {
+    if (DEBUG_TRIPO && normalizedStatus === "success") {
       console.log("[TaskService] output selection:", JSON.stringify({
         taskId: task.task_id ?? null,
         type: task.type ?? null,
@@ -862,8 +851,8 @@ class TaskService {
       }, null, 2));
     }
     return {
-      success: task.status === "success",
-      status: task.status,
+      success: normalizedStatus === "success",
+      status: normalizedStatus,
       progress: task.progress ?? 0,
       modelUrl,
       tripoTraceId: task._traceId ?? null,
