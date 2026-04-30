@@ -1,5 +1,10 @@
 // src/lib/creditEstimator.js
-import { CREDIT_COSTS, DEFAULT_MODEL } from "../config/tripo.config.js";
+import {
+  CREDIT_COSTS,
+  DEFAULT_GENERATE_IMAGE_MODEL_VERSION,
+  DEFAULT_MODEL,
+  GENERATE_IMAGE_MODEL_COSTS,
+} from "../config/tripo.config.js";
 
 const isV14         = (mv) => mv === "v1.4-20240625";
 const supportsUltra = (mv) => mv === "P1-20260311" || mv.startsWith("v3.");
@@ -10,6 +15,11 @@ const supportsUltra = (mv) => mv === "P1-20260311" || mv.startsWith("v3.");
 // otherwise users get overcharged for addons that get stripped.
 const P1_UNSUPPORTED = new Set(["quad", "smart_low_poly", "generate_parts", "geometry_quality"]);
 const isP1 = (mv) => mv === "P1-20260311";
+
+function getGenerateImageCost(modelVersion) {
+  const mv = modelVersion || DEFAULT_GENERATE_IMAGE_MODEL_VERSION;
+  return GENERATE_IMAGE_MODEL_COSTS[mv] ?? CREDIT_COSTS.generate_image ?? 5;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GENERATION COST
@@ -23,6 +33,32 @@ const isP1 = (mv) => mv === "P1-20260311";
 export function estimateCost(req) {
   const mv  = req.model_version ?? DEFAULT_MODEL;
   const key = `${req.type}:${mv}`;
+
+  if (req.type === "generate_image") {
+    const imageModel = req.model_version || DEFAULT_GENERATE_IMAGE_MODEL_VERSION;
+    const cost = getGenerateImageCost(imageModel);
+    return {
+      total: cost,
+      breakdown: {
+        generate_image: cost,
+        model_version: imageModel,
+      },
+    };
+  }
+
+  if (req.type === "edit_multiview_image") {
+    const perImage = CREDIT_COSTS.edit_multiview_image ?? 5;
+    const promptCount = Array.isArray(req.prompts)
+      ? Math.max(1, req.prompts.filter(Boolean).length)
+      : 1;
+    return {
+      total: perImage * promptCount,
+      breakdown: {
+        edit_multiview_image: perImage,
+        ...(promptCount > 1 && { edit_count: `x${promptCount}` }),
+      },
+    };
+  }
 
   // Non-generation task types have flat costs (no model_version variant).
   // Examples: animate_prerigcheck, animate_rig, animate_retarget, convert_model,
@@ -80,8 +116,16 @@ export function estimateCost(req) {
 
   const totalPerImage = base + texAddon + ultraAddon + slpAddon + partsAddon + quadAddon + styleAddon;
   
-  // Handle batch images cost multiplier
-  const batchCount = (req.batch_images && Array.isArray(req.batch_images)) ? req.batch_images.length : 1;
+  // Handle image-to-model batch aliases. The controller may receive either
+  // batch_images or images before splitting them into separate Tripo tasks.
+  const batchImages = Array.isArray(req.batch_images)
+    ? req.batch_images
+    : Array.isArray(req.images)
+      ? req.images
+      : null;
+  const batchCount = req.type === "image_to_model" && batchImages
+    ? Math.max(1, batchImages.filter(Boolean).length)
+    : 1;
   const total = totalPerImage * batchCount;
 
   if (batchCount > 1) {

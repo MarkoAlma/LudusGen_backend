@@ -337,7 +337,7 @@ async function getOwnedAssetIds(userId, { verifyAssets = true } = {}) {
   return ownedIds;
 }
 
-async function assetForClient(doc, ownedIds = new Set()) {
+async function assetForClient(doc, ownedIds = new Set(), viewerId = null) {
   let data = doc.data ? doc.data() : doc;
   const id = doc.id || data.id;
 
@@ -377,13 +377,22 @@ async function assetForClient(doc, ownedIds = new Set()) {
   const asset = normalizeAssetForClient(id, data);
   const storageKey = data.storage?.key || data.storageKey;
   const previewKey = safePreviewKey(data.preview?.key || data.storage?.thumbKey, data.ownerId, storageKey);
+  const viewerOwnsAsset = ownedIds.has(id);
+  const viewerIsOwner = Boolean(viewerId && data.ownerId === viewerId);
+  const viewerCanAccessFile = Boolean(viewerOwnsAsset || viewerIsOwner);
 
   if (previewKey) {
     asset.previewUrl = await storageService.getSignedUrl(previewKey, 3600);
   }
   asset.hasPreview = Boolean(previewKey);
-  asset.owned = ownedIds.has(id);
+  asset.owned = viewerOwnsAsset;
+  asset.viewerCanAccessFile = viewerCanAccessFile;
   asset.downloadOnly = data.type === "3d" && data.tripo?.compatible !== true;
+  if (data.type === "3d" && viewerCanAccessFile) {
+    const inlineModelUrl = `/api/marketplace/assets/${id}/download?inline=1`;
+    asset.modelUrl = inlineModelUrl;
+    asset.modelPreviewUrl = inlineModelUrl;
+  }
   return asset;
 }
 
@@ -808,7 +817,7 @@ export async function listMarketplaceAssets(req, res) {
     }
 
     const pageDocs = docs.slice(0, pageSize);
-    const assets = await Promise.all(pageDocs.map((doc) => assetForClient(doc, ownedIds)));
+    const assets = await Promise.all(pageDocs.map((doc) => assetForClient(doc, ownedIds, viewerId)));
     const nextCursor = pageDocs.length
       ? encodeMarketplaceCursor(pageDocs[pageDocs.length - 1], sortConfig)
       : null;
@@ -857,7 +866,7 @@ export async function getMarketplaceAsset(req, res) {
       }).catch(() => {});
     }
 
-    const asset = await assetForClient({ id: snap.id, ref, data: () => data }, ownedIds);
+    const asset = await assetForClient({ id: snap.id, ref, data: () => data }, ownedIds, viewerId);
     res.json({ success: true, asset });
   } catch (err) {
     console.error("[Marketplace] detail error:", err);
@@ -1023,7 +1032,7 @@ export async function createMarketplaceAsset(req, res) {
     }
 
     const createdSnap = await assetRef.get();
-    const clientAsset = await assetForClient(createdSnap, new Set());
+    const clientAsset = await assetForClient(createdSnap, new Set(), userId);
     res.status(201).json({ success: true, asset: clientAsset });
   } catch (err) {
     console.error("[Marketplace] create error:", err);
@@ -1059,7 +1068,7 @@ export async function updateMarketplaceAsset(req, res) {
     await ref.update(patch);
 
     const updated = await ref.get();
-    res.json({ success: true, asset: await assetForClient(updated, new Set()) });
+    res.json({ success: true, asset: await assetForClient(updated, new Set(), userId) });
   } catch (err) {
     console.error("[Marketplace] update error:", err);
     res.status(500).json({ success: false, message: err.message || "Update failed" });
@@ -1197,7 +1206,7 @@ export async function getMyMarketplaceLibrary(req, res) {
         return null;
       }
 
-      const asset = await assetForClient(assetSnap, ownedIds);
+      const asset = await assetForClient(assetSnap, ownedIds, userId);
       const safePurchase = sanitizePurchaseForClient({ id: doc.id, ...purchase });
       return {
         id: doc.id,

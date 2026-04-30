@@ -130,6 +130,63 @@ console.log("\nSanity: P1 text_to_model with standard texture (normal case)");
 // ─────────────────────────────────────────────────────────────────────────────
 // Summary
 // ─────────────────────────────────────────────────────────────────────────────
+console.log("\nScenario: image_to_model images array charges per image");
+{
+  const result = estimateCost({
+    type: "image_to_model",
+    model_version: "v3.1-20260211",
+    images: [
+      { type: "png", file_token: "one" },
+      { type: "png", file_token: "two" },
+      { type: "png", file_token: "three" },
+    ],
+    texture: false,
+    pbr: false,
+  });
+
+  assert(result.total === 60, `Total should be 60 (20 x 3 images), got ${result.total}`);
+  assert(
+    result.breakdown.batch_multiplier === "x3",
+    `Batch multiplier should be x3, got ${result.breakdown.batch_multiplier}`,
+  );
+}
+
+console.log("\nScenario: generate_image charges by model_version tier");
+{
+  const premium = estimateCost({
+    type: "generate_image",
+    model_version: "gpt_image_1.5",
+    prompt: "hero warrior",
+  });
+  const standard = estimateCost({
+    type: "generate_image",
+    model_version: "gemini_2.5_flash_image_preview",
+    prompt: "hero warrior",
+  });
+  const defaultModel = estimateCost({
+    type: "generate_image",
+    prompt: "hero warrior",
+  });
+
+  assert(premium.total === 10, `GPT Image 1.5 should cost 10 credits, got ${premium.total}`);
+  assert(standard.total === 5, `Gemini 2.5 Flash Image should cost 5 credits, got ${standard.total}`);
+  assert(defaultModel.total === 5, `Default generate_image should cost 5 credits, got ${defaultModel.total}`);
+}
+
+console.log("\nScenario: edit_multiview_image charges per edited image");
+{
+  const result = estimateCost({
+    type: "edit_multiview_image",
+    original_task_id: "task-123",
+    prompts: [
+      { prompt: "add a helmet", view: "front" },
+      { prompt: "make side sharper", view: "left" },
+    ],
+  });
+
+  assert(result.total === 10, `Two edited images should cost 10 credits, got ${result.total}`);
+}
+
 console.log(`\n${"=".repeat(60)}`);
 console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
 if (failed > 0) {

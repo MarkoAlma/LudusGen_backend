@@ -14,8 +14,13 @@ import {
   VALID_MULTIVIEW_IMAGE_MODES,
   RIGGED_UNSUPPORTED_FORMATS,
   DEFAULT_MODEL,
+  DEFAULT_GENERATE_IMAGE_MODEL_VERSION,
+  GENERATE_IMAGE_MODEL_MAX_FILES,
+  GENERATE_IMAGE_PROMPT_ONLY_MODELS,
+  GENERATE_IMAGE_WEBP_UNSUPPORTED_MODELS,
   TRIPO_PROMPT_MAX_LENGTH,
   TRIPO_NEGATIVE_PROMPT_MAX_LENGTH,
+  TRIPO_IMAGE_TO_MODEL_BATCH_MAX,
 } from "../config/tripo.config.js";
 import { validateFaceLimit } from "../lib/enginePresets.js";
 import crypto from "crypto";
@@ -113,6 +118,43 @@ function normalizeFileRef(input, fallbackType = "png") {
 function normalizeFileRefList(list, fallbackType = "png") {
   if (!Array.isArray(list)) return [];
   return list.map((item) => normalizeFileRef(item, fallbackType));
+}
+
+function isWebpFileRef(ref) {
+  return String(ref?.type || "").trim().toLowerCase() === "webp";
+}
+
+function applyGenerateImageFilePolicy(body) {
+  const imageModel = body.model_version || DEFAULT_GENERATE_IMAGE_MODEL_VERSION;
+  if (GENERATE_IMAGE_PROMPT_ONLY_MODELS.has(imageModel)) {
+    delete body.file;
+    delete body.files;
+    return;
+  }
+
+  const maxFiles = GENERATE_IMAGE_MODEL_MAX_FILES[imageModel]
+    ?? GENERATE_IMAGE_MODEL_MAX_FILES[DEFAULT_GENERATE_IMAGE_MODEL_VERSION]
+    ?? 0;
+  const refs = [
+    ...(body.file ? [body.file] : []),
+    ...(Array.isArray(body.files) ? body.files : []),
+  ].filter(Boolean);
+
+  if (refs.length > maxFiles) {
+    throw new Error(`generate_image ${imageModel} maximum ${maxFiles} reference images`);
+  }
+
+  if (GENERATE_IMAGE_WEBP_UNSUPPORTED_MODELS.has(imageModel) && refs.some(isWebpFileRef)) {
+    throw new Error(`generate_image ${imageModel} does not support WebP reference images`);
+  }
+
+  delete body.file;
+  delete body.files;
+  if (refs.length === 1) {
+    body.file = refs[0];
+  } else if (refs.length > 1) {
+    body.files = refs;
+  }
 }
 
 function normalizeOptionalFileRef(input, fallbackType = "png") {
@@ -412,6 +454,9 @@ class TaskService {
           if (b.file) b.file = normalizeFileRef(b.file, "png");
           if (b.images) b.images = normalizeFileRefList(b.images, "png");
           if (b.batch_images) b.batch_images = normalizeFileRefList(b.batch_images, "png");
+          if (b.batch_images?.length > TRIPO_IMAGE_TO_MODEL_BATCH_MAX) {
+            throw new Error(`image_to_model batch_images maximum ${TRIPO_IMAGE_TO_MODEL_BATCH_MAX} images`);
+          }
           const hasFile = !!b.file || (!!b.images && b.images.length > 0) || (!!b.batch_images && b.batch_images.length > 0);
           if (!hasFile) throw new Error("file, images, or batch_images required for image_to_model");
         }
@@ -485,6 +530,9 @@ class TaskService {
           if (b.file) b.file = normalizeFileRef(b.file, "png");
           if (b.images) b.images = normalizeFileRefList(b.images, "png");
           if (b.batch_images) b.batch_images = normalizeFileRefList(b.batch_images, "png");
+          if (b.batch_images?.length > TRIPO_IMAGE_TO_MODEL_BATCH_MAX) {
+            throw new Error(`image_to_model batch_images maximum ${TRIPO_IMAGE_TO_MODEL_BATCH_MAX} images`);
+          }
           const hasFile = !!b.file || (!!b.images && b.images.length > 0) || (!!b.batch_images && b.batch_images.length > 0);
           if (!hasFile) throw new Error("file, images, or batch_images required for image_to_model");
         }
@@ -569,12 +617,28 @@ class TaskService {
         if (!prompt) throw new Error("prompt required for generate_image");
         b.prompt = prompt;
         validatePromptLength(prompt, "prompt");
-        normalizeStringField(b, "negative_prompt");
+        normalizeStringField(b, "model_version");
+        normalizeStringField(b, "template");
         normalizeStringField(b, "model");
         normalizeStringField(b, "template_id");
+        if (!b.model_version && b.model) b.model_version = b.model;
+        if (!b.template && b.template_id) b.template = b.template_id;
+        delete b.model;
+        delete b.template_id;
         normalizeSharedGenerationFields(b);
-        if (b.reference_image) b.reference_image = normalizeFileRef(b.reference_image, "png");
-        if (b.reference_images) b.reference_images = normalizeFileRefList(b.reference_images, "png");
+        if (b.file) b.file = normalizeFileRef(b.file, "png");
+        if (b.files) b.files = normalizeFileRefList(b.files, "png");
+        if (b.reference_image && !b.file) b.file = normalizeFileRef(b.reference_image, "png");
+        if (b.reference_images && !b.files) b.files = normalizeFileRefList(b.reference_images, "png");
+        applyGenerateImageFilePolicy(b);
+        delete b.negative_prompt;
+        delete b.compress;
+        delete b.orientation;
+        delete b.original_task_id;
+        delete b.render_image;
+        delete b.texture_alignment;
+        delete b.reference_image;
+        delete b.reference_images;
         break;
       }
 

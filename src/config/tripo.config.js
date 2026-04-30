@@ -8,6 +8,7 @@ export const POLL_INTERVAL   = 4_000;
 export const TRIPO_PROMPT_MAX_LENGTH = 1024;
 export const TRIPO_NEGATIVE_PROMPT_MAX_LENGTH = 255;
 export const TRIPO_IMAGE_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+export const TRIPO_IMAGE_TO_MODEL_BATCH_MAX = 10;
 export const TRIPO_MODEL_IMPORT_MAX_BYTES = 150 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,8 +183,44 @@ export const CREDIT_COSTS = {
   text_to_image:               5,
   generate_image:              5,
   generate_multiview_image:   10,
-  edit_multiview_image:       10,
+  edit_multiview_image:        5,
 };
+
+export const DEFAULT_GENERATE_IMAGE_MODEL_VERSION = "flux.1_kontext_pro";
+
+export const GENERATE_IMAGE_MODEL_COSTS = Object.freeze({
+  [DEFAULT_GENERATE_IMAGE_MODEL_VERSION]: 5,
+  "flux.1_dev": 5,
+  "gpt_4o": 5,
+  "gemini_2.5_flash_image_preview": 5,
+  "z_image": 5,
+  "gpt_image_1.5": 10,
+  "midjourney": 10,
+  "gemini_3_pro_image_preview": 10,
+  "gemini_3.1_flash_image_preview": 10,
+});
+
+export const GENERATE_IMAGE_MODEL_MAX_FILES = Object.freeze({
+  [DEFAULT_GENERATE_IMAGE_MODEL_VERSION]: 4,
+  "flux.1_dev": 0,
+  "gpt_4o": 10,
+  "gemini_2.5_flash_image_preview": 10,
+  "z_image": 0,
+  "gpt_image_1.5": 10,
+  "midjourney": 0,
+  "gemini_3_pro_image_preview": 10,
+  "gemini_3.1_flash_image_preview": 10,
+});
+
+export const GENERATE_IMAGE_PROMPT_ONLY_MODELS = new Set([
+  "flux.1_dev",
+  "z_image",
+  "midjourney",
+]);
+
+export const GENERATE_IMAGE_WEBP_UNSUPPORTED_MODELS = new Set([
+  DEFAULT_GENERATE_IMAGE_MODEL_VERSION,
+]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ENGINE PRESETS

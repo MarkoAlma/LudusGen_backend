@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import ffmpegStatic from "ffmpeg-static";
 import { storageService } from "./storageService.js";
 
 const DEFAULT_WATERMARK_VOLUME = 0.56;
@@ -11,6 +11,10 @@ const DEFAULT_WATERMARK_INTERVAL_SECONDS = 8.25;
 const PREVIEW_SAMPLE_RATE = 44100;
 const PREVIEW_BITRATE = "96k";
 const PREVIEW_CONTENT_TYPE = "audio/mpeg";
+const require = createRequire(import.meta.url);
+
+let ffmpegStaticPath = null;
+let ffmpegStaticChecked = false;
 
 function cleanEnv(name) {
   const value = process.env[name];
@@ -28,8 +32,22 @@ function getExt(name = "") {
   return path.extname(String(name || "")).replace(".", "").toLowerCase() || "mp3";
 }
 
+function resolveOptionalFfmpegStatic() {
+  if (ffmpegStaticChecked) return ffmpegStaticPath;
+  ffmpegStaticChecked = true;
+  try {
+    const resolved = require("ffmpeg-static");
+    ffmpegStaticPath = typeof resolved === "string" ? resolved : resolved?.default ?? null;
+  } catch (err) {
+    if (err?.code !== "MODULE_NOT_FOUND" && err?.code !== "ERR_MODULE_NOT_FOUND") {
+      console.warn("[AudioPreview] ffmpeg-static resolution failed:", err.message);
+    }
+  }
+  return ffmpegStaticPath;
+}
+
 function resolveFfmpegPath() {
-  return cleanEnv("FFMPEG_PATH") || ffmpegStatic || "ffmpeg";
+  return cleanEnv("FFMPEG_PATH") || resolveOptionalFfmpegStatic() || "ffmpeg";
 }
 
 function resolveWatermarkPath() {
