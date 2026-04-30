@@ -13,6 +13,7 @@ import { v2 as cloudinary } from "cloudinary";
 import aiRoutes from './ai-routes.js';
 import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
 import { createMarketplaceRouter } from './src/routes/marketplace.routes.js';
+import { createReportRouter } from './src/routes/report.routes.js';
 import { createTripoRouter } from './src/routes/tripo.routes.js';
 import { startTaskRecovery, stopTaskRecovery } from './src/services/taskRecoveryService.js';
 
@@ -36,6 +37,7 @@ app.use("/api/tripo/webhook", express.raw({
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/api', aiRoutes);     // Add routes after middlewares
 app.use('/api', createMarketplaceRouter(verifyFirebaseToken));
+app.use('/api', createReportRouter(verifyFirebaseToken));
 
 // ==================== CLOUDINARY CONFIG ====================
 
@@ -60,6 +62,7 @@ try {
 }
 
 const db = admin.firestore();
+
 
 // ==================== NODEMAILER SETUP ====================
 const transporter = nodemailer.createTransport({
@@ -699,7 +702,7 @@ app.get("/api/get-public-profile/:uid", verifyFirebaseToken, async (req, res) =>
     }
 
     const data = userDoc.data();
-    
+
     // 🔥 CSAK BIZTONSÁGOS ADATOKAT ADUNK KI
     const publicProfile = {
       uid: uid,
@@ -1556,10 +1559,10 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
 
 // Engedélyezett kredit csomagok (whitelist – nem lehet tetszőleges összeget küldeni)
 const CREDIT_PACKAGES = {
-  starter: { id: 'starter', name: 'Starter',  amount: 100,  price: 'Ingyenes' },
-  basic:   { id: 'basic',   name: 'Basic',    amount: 500,  price: '$4.99'    },
-  pro:     { id: 'pro',     name: 'Pro',      amount: 1000, price: '$9.99'    },
-  ultra:   { id: 'ultra',   name: 'Ultra',    amount: 5000, price: '$39.99'   },
+  starter: { id: 'starter', name: 'Starter', amount: 100, price: 'Ingyenes' },
+  basic: { id: 'basic', name: 'Basic', amount: 500, price: '$4.99' },
+  pro: { id: 'pro', name: 'Pro', amount: 1000, price: '$9.99' },
+  ultra: { id: 'ultra', name: 'Ultra', amount: 5000, price: '$39.99' },
 };
 
 // GET /api/get-credits – aktuális egyenleg lekérése
@@ -1595,7 +1598,7 @@ app.get('/api/get-credits', verifyFirebaseToken, async (req, res) => {
 // POST /api/add-credits – kredit hozzáadása whitelist-validációval + biztonsági védelem
 app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
   try {
-    const userId  = req.userId;
+    const userId = req.userId;
     const { packageId } = req.body;
 
     // 1. Whitelist ellenőrzés – csak előre definiált csomagok fogadhatók
@@ -1621,7 +1624,7 @@ app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
 
         // Első és egyetlen alkalom – atomikusan jelöljük meg és adjuk hozzá
         tx.set(userRef, {
-          credits:              admin.firestore.FieldValue.increment(pkg.amount),
+          credits: admin.firestore.FieldValue.increment(pkg.amount),
           hasClaimedFreeCredits: true,
         }, { merge: true });
       });
@@ -1665,11 +1668,11 @@ app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
 
     // Tranzakció előzmény mentése (mindkét esetben, ha idáig jutottunk)
     await userRef.collection('creditTransactions').add({
-      packageId:   pkg.id,
+      packageId: pkg.id,
       packageName: pkg.name,
-      amount:      pkg.amount,
-      price:       pkg.price,
-      createdAt:   admin.firestore.FieldValue.serverTimestamp(),
+      amount: pkg.amount,
+      price: pkg.price,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     // Friss egyenleg visszaadása
@@ -1723,7 +1726,17 @@ startTaskRecovery();
 
 // ==================== SERVER START ====================
 
-const server = app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));
+const PORT = Number(process.env.PORT || 3001);
+const server = app.listen(PORT, () => console.log(`🚀 Backend fut a ${PORT}-es porton (Nodemailer + Speakeasy)`));
+
+server.on("error", (error) => {
+  stopTaskRecovery();
+  if (error.code === "EADDRINUSE") {
+    console.error(`Backend inditas sikertelen: a ${PORT}-es port mar hasznalatban van. Allitsd le a masik backend folyamatot, vagy inditsd masik PORT ertekkel.`);
+    process.exit(1);
+  }
+  throw error;
+});
 
 // Graceful shutdown — stop background recovery
 process.on("SIGINT", () => { stopTaskRecovery(); server.close(); });
