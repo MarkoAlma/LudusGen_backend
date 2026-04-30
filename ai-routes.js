@@ -125,7 +125,7 @@ dotenv.config();
 
 const router = express.Router();
 
-const REQUIRED_KEYS = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'FAL_KEY', 'OPENROUTER_API_KEY', 'DEEPSEEK_API_KEY', 'MINIMAX_API_KEY', 'DEAPI_API_KEY'];
+const REQUIRED_KEYS = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'FAL_KEY', 'OPENROUTER_API_KEY', 'DEEPSEEK_API_KEY', 'MINIMAX_API_KEY', 'DEAPI_API_KEY', 'MODELSCOPE_API_KEY'];
 REQUIRED_KEYS.forEach((key) => {
     if (!process.env[key]) console.warn(`⚠️  Hiányzó .env változó: ${key}`);
 });
@@ -283,6 +283,64 @@ function normalizeMessages(messages) {
     return finalMessages;
 }
 
+function dataUrlToGeminiInlineData(dataUrl) {
+    if (typeof dataUrl !== 'string') return null;
+    const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
+    if (!match) return null;
+    return {
+        inline_data: {
+            mime_type: match[1],
+            data: match[2],
+        },
+    };
+}
+
+function toGeminiParts(content) {
+    if (!Array.isArray(content)) {
+        return [{ text: String(content) }];
+    }
+
+    const parts = [];
+    for (const part of content) {
+        if (part?.type === 'text') {
+            const text = typeof part.text === 'string' ? part.text : '';
+            if (text.trim()) parts.push({ text });
+            continue;
+        }
+
+        if (part?.type === 'image_url') {
+            const imageUrl = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+            const inlineData = dataUrlToGeminiInlineData(imageUrl);
+            if (inlineData) parts.push(inlineData);
+        }
+    }
+
+    return parts.length ? parts : [{ text: '' }];
+}
+
+function stripAssistantThinking(value, hideOpenBlock = true) {
+    let text = typeof value === 'string' ? value : value == null ? '' : String(value);
+    if (!text) return '';
+
+    text = text
+        .replace(/<think(?:ing)?\b[^>]*>[\s\S]*?<\/think(?:ing)?>/gi, '')
+        .replace(/<reasoning\b[^>]*>[\s\S]*?<\/reasoning>/gi, '')
+        .replace(/```(?:thinking|reasoning|thoughts?|chain[-_\s]?of[-_\s]?thought)\s*\n[\s\S]*?```/gi, '');
+
+    if (hideOpenBlock) {
+        text = text
+            .replace(/<think(?:ing)?\b[^>]*>[\s\S]*$/i, '')
+            .replace(/<reasoning\b[^>]*>[\s\S]*$/i, '')
+            .replace(/```(?:thinking|reasoning|thoughts?|chain[-_\s]?of[-_\s]?thought)\s*\n[\s\S]*$/i, '')
+            .replace(/<(?:t|th|thi|thin|think|thinki|thinkin|thinking|r|re|rea|reas|reaso|reason|reasoni|reasonin|reasoning)?$/i, '');
+    }
+
+    return text
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
 // ── Model config ──────────────────────────────────────────────────────────────
 function getModelConfig(modelId) {
     const MODEL_MAP = {
@@ -291,22 +349,92 @@ function getModelConfig(modelId) {
         'gpt4o_mini': { apiModel: 'gpt-4o-mini', provider: 'openai', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'gpt4o': { apiModel: 'gpt-4o', provider: 'openai', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'gpt4o_code': { apiModel: 'gpt-4o', provider: 'openai', defaultSystemPrompt: 'You are an elite software engineer with deep expertise across all programming languages and paradigms.\n- Produce production-ready, optimized code\n- Apply SOLID principles and design patterns\n- Include comprehensive error handling\n- Write thorough technical explanations\n- Review and suggest improvements proactively\n- Respond in the same language the user writes in' },
-        'trinity-large': { apiModel: 'arcee-ai/trinity-large-preview:free', provider: 'openrouter', defaultSystemPrompt: 'You are an elite software engineer with deep expertise across all programming languages and paradigms.\n- Produce production-ready, optimized code\n- Apply SOLID principles and design patterns\n- Include comprehensive error handling\n- Write thorough technical explanations\n- Review and suggest improvements proactively\n- Respond in the same language the user writes in' },
-        'gemini-3-flash': { apiModel: 'gemini-3-flash-preview', provider: 'gemini', defaultSystemPrompt: 'You are a helpful AI assistant powered by Google Gemini. Respond in the same language the user writes in.' },
-        'gemini-2.5-pro': { apiModel: 'gemini-2.5-pro', provider: 'gemini', defaultSystemPrompt: 'You are a helpful AI assistant powered by Google Gemini. Respond in the same language the user writes in.' },
+        'trinity-large': { apiModel: 'arcee-ai/trinity-large-thinking', provider: 'openrouter', defaultSystemPrompt: 'You are an elite software engineer with deep expertise across all programming languages and paradigms.\n- Produce production-ready, optimized code\n- Apply SOLID principles and design patterns\n- Include comprehensive error handling\n- Write thorough technical explanations\n- Review and suggest improvements proactively\n- Respond in the same language the user writes in' },
+        'gemini-3-flash': { apiModel: 'gemini-3-flash-preview', provider: 'gemini', supportsVision: true, defaultSystemPrompt: 'You are a helpful AI assistant powered by Google Gemini. Respond in the same language the user writes in.' },
+        'gemini-2.5-pro': { apiModel: 'gemini-2.5-pro', provider: 'gemini', supportsVision: true, defaultSystemPrompt: 'You are a helpful AI assistant powered by Google Gemini. Respond in the same language the user writes in.' },
         'groq-gpt120b': { apiModel: 'openai/gpt-oss-120b', provider: 'groq', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'groq-qwen3': { apiModel: 'qwen/qwen3-32b', provider: 'groq', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'groq-llama70b': { apiModel: 'llama-3.3-70b-versatile', provider: 'groq', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'cerebras-llama8b': { apiModel: 'llama3.1-8b', provider: 'cerebras', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'mistral-large': { apiModel: 'mistral-large-latest', provider: 'mistral', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'nvidia-glm4.7': { apiModel: 'z-ai/glm4.7', provider: 'nvidia', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
-        'deepseek-v3.2': { apiModel: 'deepseek-ai/deepseek-v3.2', provider: 'nvidia', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
-        'google-gemma-3-27b-it': { apiModel: 'google/gemma-3-27b-it', provider: 'nvidia', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'google-gemma-3-27b-it': { apiModel: 'google/gemma-3-27b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
     };
     return MODEL_MAP[modelId] || null;
 }
 
 // ── Rolling Context Summary konstansok ───────────────────────────────────────
+function readStreamToString(stream) {
+    if (!stream || typeof stream.on !== 'function') return Promise.resolve('');
+
+    return new Promise((resolve) => {
+        let body = '';
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve(body);
+        };
+
+        stream.setEncoding?.('utf8');
+        stream.on('data', (chunk) => { body += chunk; });
+        stream.on('end', finish);
+        stream.on('error', finish);
+
+        const timeout = setTimeout(finish, 1500);
+        timeout.unref?.();
+    });
+}
+
+async function getAxiosErrorDetails(err) {
+    const status = err.response?.status || err.response?.statusCode || err.response?.data?.statusCode || null;
+    const rawData = err.response?.data;
+    let rawBody = '';
+
+    if (typeof rawData === 'string') {
+        rawBody = rawData;
+    } else if (Buffer.isBuffer(rawData)) {
+        rawBody = rawData.toString('utf8');
+    } else if (rawData && typeof rawData.on === 'function') {
+        rawBody = await readStreamToString(rawData);
+    } else if (rawData && typeof rawData === 'object' && !rawData.readable) {
+        try { rawBody = JSON.stringify(rawData); } catch { rawBody = ''; }
+    }
+
+    let code = null;
+    let message = err.message || 'API request failed';
+
+    if (rawBody) {
+        try {
+            const parsed = JSON.parse(rawBody);
+            const payload = parsed.error || parsed;
+            code = payload.code || payload.type || null;
+            message = payload.message || payload.error || message;
+        } catch {
+            message = rawBody.slice(0, 500);
+        }
+    }
+
+    return { status, code, message };
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getRetryAfterMs(headers, fallbackMs) {
+    const retryAfter = headers?.['retry-after'];
+    if (!retryAfter) return fallbackMs;
+
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.min(Math.max(seconds * 1000, 500), 10000);
+
+    const dateMs = Date.parse(retryAfter);
+    if (Number.isFinite(dateMs)) return Math.min(Math.max(dateMs - Date.now(), 500), 10000);
+
+    return fallbackMs;
+}
+
 const SUMMARY_COLLECTION = 'chat_summaries';
 
 // ── Groq retry helper — kezeli a 429 rate limit hibákat ──────────────────────
@@ -338,27 +466,84 @@ async function groqWithRetry(body, retries = 3) {
     }
 }
 
+function cleanSessionTitle(value) {
+    return String(value ?? '')
+        .replace(/["'`“”„]/g, '')
+        .replace(/[\r\n\t]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^(title|same-language title|same language title|cím)\s*:\s*/iu, '')
+        .replace(/^[\s:;,.!?()[\]{}<>-]+|[\s:;,.!?()[\]{}<>-]+$/gu, '')
+        .trim();
+}
+
+function fallbackSessionTitle(firstUserMessage) {
+    const cleaned = cleanSessionTitle(firstUserMessage);
+    if (!cleaned) return null;
+
+    const words = cleaned.match(/[\p{L}\p{N}][\p{L}\p{N}'’_-]*/gu) || [];
+    if (words.length === 0) return cleaned.slice(0, 60).trim() || null;
+
+    const titleWords = words.length <= 4 && cleaned.length <= 60
+        ? words
+        : words.slice(0, 6);
+
+    return cleanSessionTitle(titleWords.join(' ')).slice(0, 60).trim() || null;
+}
+
+function shouldUseLiteralTitle(firstUserMessage) {
+    const cleaned = cleanSessionTitle(firstUserMessage);
+    const words = cleaned.match(/[\p{L}\p{N}][\p{L}\p{N}'’_-]*/gu) || [];
+    return cleaned.length <= 60 && words.length > 0 && words.length <= 4;
+}
+
+function isGenericEnglishTitle(title) {
+    const normalized = cleanSessionTitle(title).toLowerCase();
+    return [
+        'hello message',
+        'greeting message',
+        'user message',
+        'chat message',
+        'general message',
+        'general conversation',
+        'conversation starter',
+    ].includes(normalized);
+}
+
 async function generateSessionTitle(firstUserMessage) {
+    const fallbackTitle = fallbackSessionTitle(firstUserMessage);
+
+    if (shouldUseLiteralTitle(firstUserMessage)) {
+        return fallbackTitle;
+    }
+
     try {
         const resp = await groqWithRetry({
             model: 'llama-3.3-70b-versatile',
             messages: [
                 {
                     role: 'system',
-                    content: 'You are a title generator. Given a user message, respond with ONLY a 2-4 word title summarizing the topic. No punctuation, no quotes, no explanation. Just the title words.',
+                    content: [
+                        'You are a title generator.',
+                        'Create ONLY a 2-4 word title summarizing the user message.',
+                        'Keep the title in the exact same language as the user message.',
+                        'Never translate the title to English unless the user message is already English.',
+                        'If the message is only a greeting or a very short phrase, reuse the phrase in its original language.',
+                        'No punctuation, no quotes, no explanation. Just the title words.',
+                    ].join(' '),
                 },
-                { role: 'user', content: `Message: ${String(firstUserMessage).slice(0, 500)}\n\nTitle:` },
+                { role: 'user', content: `Original user message:\n${String(firstUserMessage).slice(0, 500)}\n\nSame-language title:` },
             ],
-            temperature: 0.3,
+            temperature: 0.1,
             max_tokens: 20,
             stream: false,
         });
-        const raw = resp.data?.choices?.[0]?.message?.content?.trim();
-        if (!raw || raw.toLowerCase() === 'null' || raw.length < 2) return null;
-        return raw;
+        const raw = cleanSessionTitle(resp.data?.choices?.[0]?.message?.content);
+        if (!raw || raw.toLowerCase() === 'null' || raw.length < 2) return fallbackTitle || null;
+        if (isGenericEnglishTitle(raw)) return fallbackTitle || null;
+        return raw.slice(0, 60).trim();
     } catch (e) {
         console.warn('[Title] Generation failed:', e.message);
-        return null;
+        return fallbackTitle || null;
     }
 }
 
@@ -447,6 +632,9 @@ Keep it under 180 tokens.`;
 router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
     try {
         const { sessionId, message, attachedImage, messageId, assistantMessageId } = req.body;
+        const requestedModelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim() : '';
+        const requestedModelName = typeof req.body?.modelName === 'string' ? req.body.modelName.trim().slice(0, 120) : '';
+        const assistantDocId = assistantMessageId || messageId || null;
 
         if (!sessionId) {
             return res.status(400).json({ success: false, message: 'Hiányzó sessionId' });
@@ -475,15 +663,36 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         const sessionDoc = await sessionRef.get();
         const sessionData = sessionDoc.exists ? sessionDoc.data() : {};
 
-        const modelId = sessionData.modelId || 'claude_sonnet';
-        const modelName = sessionData.modelName || 'Claude Sonnet 4';
+        const sessionModelId = typeof sessionData.modelId === 'string' ? sessionData.modelId.trim() : '';
+        const modelId = requestedModelId || sessionModelId;
+        if (!modelId) {
+            activeStreams.delete(streamKey);
+            return res.status(400).json({ success: false, message: 'Hiányzó modelId: a chat kérésnek meg kell adnia a kiválasztott modellt.' });
+        }
+        const modelName = requestedModelName || sessionData.modelName || modelId;
 
         const modelConfig = getModelConfig(modelId);
         if (!modelConfig) {
+            activeStreams.delete(streamKey);
             return res.status(400).json({ success: false, message: `Ismeretlen modell: ${modelId}` });
         }
 
+        if (attachedImage && !modelConfig.supportsVision) {
+            activeStreams.delete(streamKey);
+            return res.status(400).json({ success: false, message: 'This model does not accept images.' });
+        }
+
         const { apiModel, provider, defaultSystemPrompt } = modelConfig;
+        if (requestedModelId && requestedModelId !== sessionModelId) {
+            await sessionRef.set({
+                sessionId,
+                modelId,
+                modelName,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true });
+            sessionData.modelId = modelId;
+            sessionData.modelName = modelName;
+        }
 
         const messagesRef = sessionRef.collection('messages');
         const messagesSnap = await messagesRef.orderBy('timestamp', 'asc').get();
@@ -554,10 +763,11 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         async function saveResponse(aiContent, aiUsage, modelForLog, providerForLog) {
             if (isResponseSaved) return;
             isResponseSaved = true;
+            const safeAiContent = stripAssistantThinking(aiContent);
 
             const aiMsgData = {
                 role: 'assistant',
-                content: aiContent,
+                content: safeAiContent,
                 model: modelForLog,
                 modelId: modelForLog,
                 modelName,
@@ -566,8 +776,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 ...(aiUsage.total_tokens ? { usage: aiUsage } : {}),
             };
 
-            if (assistantMessageId) {
-                await messagesRef.doc(assistantMessageId).set(aiMsgData, { merge: true });
+            if (assistantDocId) {
+                await messagesRef.doc(assistantDocId).set(aiMsgData, { merge: true });
             } else {
                 await messagesRef.add(aiMsgData);
             }
@@ -588,7 +798,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 userId,
                 sessionId,
                 modelId: modelForLog,
-                allMessages: [...baseMessages, { role: 'assistant', content: aiContent }],
+                allMessages: [...baseMessages, { role: 'assistant', content: safeAiContent }],
                 sessionData: {
                     ...sessionData,
                     messageCount: actualMessageCount,
@@ -617,6 +827,18 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             let totalContent = '';
 
             let usageInfo = { input_tokens: 0, output_tokens: 0 };
+            let anthropicStreamClosed = false;
+            const writeAnthropicSse = (payload) => {
+                if (anthropicStreamClosed || res.writableEnded || res.destroyed) return false;
+                res.write(`data: ${JSON.stringify(payload)}\n\n`);
+                return true;
+            };
+            const finishAnthropicSse = () => {
+                if (anthropicStreamClosed) return;
+                anthropicStreamClosed = true;
+                activeStreams.delete(streamKey);
+                if (!res.writableEnded && !res.destroyed) res.end();
+            };
 
             try {
                 const stream = anthropic.messages.stream({
@@ -634,8 +856,9 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 });
 
                 stream.on('text', (text) => {
+                    if (anthropicStreamClosed || res.writableEnded || res.destroyed) return;
                     totalContent += text;
-                    res.write(`data: ${JSON.stringify({ delta: text })}\n\n`);
+                    writeAnthropicSse({ delta: text });
                 });
 
                 stream.on('message_stop', (message) => {
@@ -645,12 +868,13 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 });
 
                 stream.on('end', async () => {
+                    if (anthropicStreamClosed || res.writableEnded || res.destroyed) return;
                     if (totalContent.length > 0) {
                         try {
                             // Check if summary will be triggered
                             const totalMessages = (baseMessages?.length || 0) + 1;
                             if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
-                                res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                                writeAnthropicSse({ summaryStarted: true });
                             }
 
                             const finalUsage = {
@@ -666,36 +890,35 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                                 ...finalUsage
                             });
                             const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'anthropic');
-                            res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
+                            writeAnthropicSse({ summaryRefreshed: summaryResult?.summaryRefreshed || false });
                         } catch (e) {
                             console.error('[Chat] Anthropic mentés sikertelen:', e.message);
 
                         }
                     }
-                    activeStreams.delete(streamKey);
-                    res.write('data: [DONE]\n\n');
-                    res.end();
+                    if (!anthropicStreamClosed && !res.writableEnded && !res.destroyed) res.write('data: [DONE]\n\n');
+                    finishAnthropicSse();
                 });
 
                 stream.on('error', (err) => {
-                    activeStreams.delete(streamKey);
+                    if (anthropicStreamClosed) return;
                     if (err.name === 'AbortError') {
                         console.log('[Anthropic] Stream leállítva.');
                     } else {
                         console.error('Anthropic stream hiba:', err);
-                        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                        writeAnthropicSse({ error: err.message || 'Anthropic stream hiba' });
                     }
-                    if (!res.writableEnded) res.end();
+                    finishAnthropicSse();
                 });
 
             } catch (err) {
-                activeStreams.delete(streamKey);
                 console.error('Anthropic setup hiba:', err);
                 if (!res.headersSent) {
+                    activeStreams.delete(streamKey);
                     res.status(500).json({ success: false, message: err.message });
                 } else {
-                    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-                    res.end();
+                    writeAnthropicSse({ error: err.message || 'Anthropic setup hiba' });
+                    finishAnthropicSse();
                 }
             }
             return;
@@ -1147,7 +1370,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 .filter((m) => m.role !== 'system')
                 .map((m) => ({
                     role: m.role === 'assistant' ? 'model' : 'user',
-                    parts: [{ text: Array.isArray(m.content) ? JSON.stringify(m.content) : String(m.content) }],
+                    parts: toGeminiParts(m.content),
                 }));
 
             res.setHeader('Content-Type', 'text/event-stream');
@@ -1160,6 +1383,8 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             let totalContent = '';
             let usageInfo = null;
 
+            const maxAttempts = modelId === 'gemini-2.5-pro' ? 4 : 2;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
             try {
                 streamResp = await axios.post(
                     `https://generativelanguage.googleapis.com/v1beta/models/${apiModel}:streamGenerateContent?alt=sse`,
@@ -1182,7 +1407,46 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         signal,
                     }
                 );
+                break;
             } catch (err) {
+                const details = await getAxiosErrorDetails(err);
+                const canRetry = details.status === 429 && attempt < maxAttempts;
+                if (canRetry) {
+                    const fallbackWaitMs = Math.min(12000, (1200 * (2 ** (attempt - 1))) + Math.floor(Math.random() * 500));
+                    const waitMs = getRetryAfterMs(err.response?.headers, fallbackWaitMs);
+                    console.warn('[Gemini] 429, retrying chat request', {
+                        model: apiModel,
+                        attempt,
+                        nextAttempt: attempt + 1,
+                        waitMs,
+                        code: details.code,
+                    });
+                    if (!res.writableEnded) {
+                        res.write(`data: ${JSON.stringify({
+                            retry: true,
+                            provider: 'gemini',
+                            attempt: attempt + 1,
+                            maxAttempts,
+                            waitMs,
+                            code: details.code,
+                            message: details.message,
+                        })}\n\n`);
+                    }
+                    await sleep(waitMs);
+                    continue;
+                }
+                if (details.status === 429) {
+                    activeStreams.delete(streamKey);
+                    const codeText = details.code ? ` (${details.code})` : '';
+                    const userMessage = `Gemini HTTP 429${codeText}: The global quota or token rate limit for ${apiModel} has been reached. Please try another model or try again later.`;
+                    console.error('[Gemini] Chat request rate limited:', {
+                        model: apiModel,
+                        code: details.code,
+                        message: details.message,
+                    });
+                    res.write(`data: ${JSON.stringify({ error: userMessage })}\n\n`);
+                    return res.end();
+                }
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
                     console.log('[Gemini] Stream leállítva.');
                     return;
@@ -1190,6 +1454,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 console.error('Gemini kapcsolódási hiba:', err.message);
                 res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
                 return res.end();
+            }
             }
 
             let clientConnected = true;
@@ -1295,7 +1560,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                         top_p: Math.min(Math.max(0, top_p), 1),
                         stream: true,
                         stream_options: { include_usage: true },
-                        chat_template_kwargs: { enable_thinking: true }
+                        chat_template_kwargs: { enable_thinking: false }
                     },
                     {
                         headers: {
@@ -1413,6 +1678,210 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             return;
         }
 
+        // -- ModelScope chat (OpenAI-compatible) ------------------------------
+        else if (provider === 'modelscope-chat') {
+            if (!process.env.MODELSCOPE_API_KEY) {
+                return res.status(500).json({ success: false, message: 'MODELSCOPE_API_KEY nincs beallitva' });
+            }
+
+            const chatMsgs = normalizeMessages(context);
+
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
+
+            let streamResp;
+            let totalContent = '';
+            let usageInfo = null;
+
+            const modelScopeBody = {
+                model: apiModel,
+                messages: chatMsgs,
+                temperature: Math.min(Math.max(0, temperature), 2),
+                max_tokens: safeMax,
+                top_p: Math.min(Math.max(0, top_p), 1),
+                stream: true,
+            };
+            const modelScopeConfig = {
+                headers: {
+                    Authorization: `Bearer ${process.env.MODELSCOPE_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    Accept: 'text/event-stream',
+                },
+                responseType: 'stream',
+                timeout: 300000,
+                signal,
+            };
+
+            const maxAttempts = 5;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                try {
+                    streamResp = await axios.post(
+                        'https://api-inference.modelscope.ai/v1/chat/completions',
+                        modelScopeBody,
+                        modelScopeConfig
+                    );
+                    break;
+                } catch (err) {
+                    if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+                        console.log('[ModelScope] Stream leallitva.');
+                        return;
+                    }
+
+                    const details = await getAxiosErrorDetails(err);
+                    const canRetry = details.status === 429 && attempt < maxAttempts;
+                    if (canRetry) {
+                        const fallbackWaitMs = Math.min(12000, (1000 * (2 ** (attempt - 1))) + Math.floor(Math.random() * 500));
+                        const waitMs = getRetryAfterMs(err.response?.headers, fallbackWaitMs);
+                        console.warn('[ModelScope] 429, retrying chat request', {
+                            model: apiModel,
+                            attempt,
+                            nextAttempt: attempt + 1,
+                            waitMs,
+                            code: details.code,
+                        });
+                        if (!res.writableEnded) {
+                            res.write(`data: ${JSON.stringify({
+                                retry: true,
+                                provider: 'modelscope-chat',
+                                attempt: attempt + 1,
+                                maxAttempts,
+                                waitMs,
+                                code: details.code,
+                                message: details.message,
+                            })}\n\n`);
+                        }
+                        await sleep(waitMs);
+                        continue;
+                    }
+
+                    activeStreams.delete(streamKey);
+                    const statusText = details.status ? `HTTP ${details.status}` : 'request failed';
+                    const codeText = details.code ? ` (${details.code})` : '';
+                    const userMessage = `ModelScope ${statusText}${codeText}: ${details.message}`;
+                    console.error('[ModelScope] Chat request failed:', {
+                        model: apiModel,
+                        status: details.status,
+                        code: details.code,
+                        message: details.message,
+                    });
+                    res.write(`data: ${JSON.stringify({ error: userMessage })}\n\n`);
+                    return res.end();
+                }
+            }
+
+            const keepAlive = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, 15000);
+            let clientConnected = true;
+            let hasReasoningStarted = false;
+
+            const closeReasoningBlock = () => {
+                if (!hasReasoningStarted) return '';
+                hasReasoningStarted = false;
+                return '\n```\n';
+            };
+
+            req.on('close', () => {
+                clientConnected = false;
+                clearInterval(keepAlive);
+                if (!res.writableEnded) streamResp.data.destroy();
+                saveResponse(totalContent, {}, modelId, 'modelscope-chat').catch(e => console.error('[Chat] ModelScope abort-mentes sikertelen:', e.message));
+            });
+
+            let buf = '';
+            streamResp.data.on('data', (chunk) => {
+                if (!clientConnected) return;
+                buf += chunk.toString('utf8');
+                const lines = buf.split('\n');
+                buf = lines.pop();
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const raw = trimmed.slice(6);
+                    if (raw === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(raw);
+                        if (parsed.error) {
+                            const message = parsed.error.message || 'ModelScope stream hiba';
+                            res.write(`data: ${JSON.stringify({ error: message })}\n\n`);
+                            continue;
+                        }
+
+                        const deltaObj = parsed.choices?.[0]?.delta || {};
+                        const reasoningChunk = deltaObj.reasoning_content;
+                        const answerChunk = deltaObj.content;
+                        let deltaOut = '';
+
+                        if (reasoningChunk !== undefined && reasoningChunk !== null && reasoningChunk !== '') {
+                            if (!hasReasoningStarted) {
+                                hasReasoningStarted = true;
+                                deltaOut += '```thinking\n';
+                            }
+                            deltaOut += reasoningChunk;
+                        }
+
+                        if (answerChunk !== undefined && answerChunk !== null && answerChunk !== '') {
+                            deltaOut += closeReasoningBlock();
+                            deltaOut += answerChunk;
+                        }
+
+                        if (deltaOut && clientConnected) {
+                            totalContent += deltaOut;
+                            res.write(`data: ${JSON.stringify({ delta: deltaOut })}\n\n`);
+                        }
+
+                        if (parsed.usage) {
+                            usageInfo = parsed.usage;
+                        }
+                    } catch { }
+                }
+            });
+
+            streamResp.data.on('end', async () => {
+                if (hasReasoningStarted) {
+                    const closing = closeReasoningBlock();
+                    totalContent += closing;
+                    if (!res.writableEnded) res.write(`data: ${JSON.stringify({ delta: closing })}\n\n`);
+                }
+
+                if (totalContent.length > 0) {
+                    try {
+                        const totalMessages = (baseMessages?.length || 0) + 1;
+                        if (totalMessages - (sessionData.summarizedMessageCount || 0) >= SUMMARY_TRIGGER_COUNT) {
+                            res.write(`data: ${JSON.stringify({ summaryStarted: true })}\n\n`);
+                        }
+
+                        const finalUsage = usageInfo || {
+                            prompt_tokens: 0,
+                            completion_tokens: Math.ceil(totalContent.length / 4),
+                            total_tokens: Math.ceil(totalContent.length / 4)
+                        };
+                        await logUsage(req.userId, 'chat', { model: apiModel, provider: 'modelscope-chat', ...finalUsage });
+                        const summaryResult = await saveResponse(totalContent, finalUsage, modelId, 'modelscope-chat');
+                        res.write(`data: ${JSON.stringify({ summaryRefreshed: summaryResult?.summaryRefreshed || false })}\n\n`);
+                    } catch (e) {
+                        console.error('[Chat] ModelScope mentes sikertelen:', e.message);
+                    }
+                }
+
+                activeStreams.delete(streamKey);
+                clearInterval(keepAlive);
+                res.write('data: [DONE]\n\n');
+                res.end();
+            });
+
+            streamResp.data.on('error', (err) => {
+                activeStreams.delete(streamKey);
+                clearInterval(keepAlive);
+                console.error('ModelScope stream hiba:', err.message);
+                res.write(`data: ${JSON.stringify({ error: 'Stream megszakadt' })}\n\n`);
+                res.end();
+            });
+
+            return;
+        }
+
         // ── OpenRouter ────────────────────────────────────────────────────────
         else if (provider === 'openrouter') {
             if (!process.env.OPENROUTER_API_KEY) {
@@ -1461,8 +1930,18 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     console.log('[OpenRouter] Stream leállítva.');
                     return;
                 }
-                console.error('OpenRouter kapcsolódási hiba:', err.message);
-                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                activeStreams.delete(streamKey);
+                const details = await getAxiosErrorDetails(err);
+                const statusText = details.status ? `HTTP ${details.status}` : 'request failed';
+                const codeText = details.code ? ` (${details.code})` : '';
+                const userMessage = `OpenRouter ${statusText}${codeText}: ${details.message}`;
+                console.error('[OpenRouter] Chat request failed:', {
+                    model: apiModel,
+                    status: details.status,
+                    code: details.code,
+                    message: details.message,
+                });
+                res.write(`data: ${JSON.stringify({ error: userMessage })}\n\n`);
                 return res.end();
             }
 
@@ -1486,6 +1965,11 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     if (raw === '[DONE]') continue;
                     try {
                         const parsed = JSON.parse(raw);
+                        if (parsed.error) {
+                            const message = parsed.error.message || parsed.error || 'OpenRouter stream hiba';
+                            res.write(`data: ${JSON.stringify({ error: message })}\n\n`);
+                            continue;
+                        }
                         const delta = parsed.choices?.[0]?.delta?.content || '';
                         if (delta && clientConnected) {
                             totalContent += delta;
@@ -1565,11 +2049,12 @@ router.post('/chat/finalize', verifyFirebaseToken, async (req, res) => {
             .collection('messages')
             .doc(messageId);
 
-        const charCount = content?.length || 0;
+        const safeContent = stripAssistantThinking(content);
+        const charCount = safeContent.length || 0;
         const estimatedTokens = Math.ceil(charCount / 4);
 
         await msgRef.set({
-            content: content || "",
+            content: safeContent,
             usage: {
                 output_tokens: estimatedTokens,
                 total_tokens: estimatedTokens
@@ -2680,7 +3165,8 @@ router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImag
         const startedAt = Date.now();
         emitUpscaleSse({ type: 'status', status: 'SUBMITTING', progress: 4, elapsed: 0 });
 
-        const submission = await submitDeapiImageUpscale(imageFile, controller.signal, DEAPI_IMAGE_UPSCALE_MODEL);
+        const upscaleModel = await resolveDeapiImageUpscaleModel(DEAPI_IMAGE_UPSCALE_MODEL);
+        const submission = await submitDeapiImageUpscale(imageFile, controller.signal, upscaleModel);
         const requestId = submission?.data?.request_id;
         if (!requestId) {
             throw new Error('A deAPI nem adott vissza request_id-t');
@@ -2731,8 +3217,8 @@ router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImag
         }
 
         const storedImage = await processImageAndUpload(req.userId, imageUrl, {
-            prompt: 'RealESRGAN x4 upscale',
-            modelId: DEAPI_IMAGE_UPSCALE_MODEL,
+            prompt: `${upscaleModel} upscale`,
+            modelId: upscaleModel,
             provider: 'deapi-upscale',
             aspect_ratio: inputMeta.width && inputMeta.height ? `${inputMeta.width}:${inputMeta.height}` : 'upscale',
             width,
@@ -2777,7 +3263,7 @@ router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImag
 
         await logUsage(req.userId, 'image-upscale', {
             provider: 'deapi',
-            model: DEAPI_IMAGE_UPSCALE_MODEL,
+            model: upscaleModel,
             requestId,
             imageId,
             width,
@@ -2898,7 +3384,7 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
         else if (provider === 'deapi') {
             if (!process.env.DEAPI_API_KEY) return res.status(500).json({ success: false, message: 'DEAPI_API_KEY nincs beallitva' });
 
-            const selectedDeapiTtsModel = findLocalDeapiTtsModel(model);
+            const selectedDeapiTtsModel = await findDeapiTtsModel(model);
             if (!selectedDeapiTtsModel) {
                 return res.status(400).json({ success: false, message: `Ismeretlen deAPI TTS modell slug: ${model}` });
             }
@@ -3252,8 +3738,69 @@ function getDeapiClient() {
 }
 
 const DEAPI_ALLOWED_TXT2MUSIC_MODELS = [
-    { slug: 'AceStep_1_5_XL_Turbo_INT8', name: 'Ace Step 1.5 XL Turbo INT8', info: { defaults: {}, limits: {} } },
-    { slug: 'AceStep_1_5_Base', name: 'Ace Step 1.5 Base', info: { defaults: {}, limits: {} } },
+    {
+        slug: 'AceStep_1_5_Turbo',
+        name: 'ACE-Step 1.5 Turbo',
+        info: {
+            defaults: { inference_steps: 8, guidance_scale: 1, duration: 30, format: 'mp3' },
+            limits: {
+                min_caption: 3,
+                max_caption: 300,
+                min_duration: 10,
+                max_duration: 300,
+                min_steps: 8,
+                max_steps: 8,
+                min_guidance: 1,
+                max_guidance: 1,
+                min_bpm: 50,
+                max_bpm: 200,
+                min_ref_audio_duration: 5,
+                max_ref_audio_duration: 60,
+            },
+        },
+    },
+    {
+        slug: 'AceStep_1_5_XL_Turbo_INT8',
+        name: 'ACE-Step 1.5 XL Turbo INT8',
+        info: {
+            defaults: { inference_steps: 8, guidance_scale: 1, duration: 30, format: 'mp3' },
+            limits: {
+                min_caption: 3,
+                max_caption: 300,
+                min_duration: 10,
+                max_duration: 300,
+                min_steps: 8,
+                max_steps: 8,
+                min_guidance: 1,
+                max_guidance: 1,
+                min_bpm: 50,
+                max_bpm: 200,
+                min_ref_audio_duration: 5,
+                max_ref_audio_duration: 60,
+            },
+        },
+    },
+    {
+        slug: 'AceStep_1_5_Base',
+        name: 'ACE-Step 1.5 Base',
+        info: {
+            defaults: { inference_steps: 60, guidance_scale: 9, duration: 60, format: 'mp3' },
+            limits: {
+                min_caption: 3,
+                max_caption: 300,
+                min_duration: 30,
+                max_duration: 300,
+                min_steps: 5,
+                max_steps: 100,
+                min_guidance: 3,
+                max_guidance: 20,
+                min_bpm: 50,
+                max_bpm: 200,
+                min_ref_audio_duration: 5,
+                max_ref_audio_duration: 60,
+            },
+        },
+    },
 ];
 
 const DEAPI_ALLOWED_TXT2AUDIO_MODELS = [
@@ -3312,9 +3859,94 @@ const DEAPI_TTS_MODES = ['custom_voice', 'voice_clone', 'voice_design'];
 const DEAPI_TTS_FORMATS = ['mp3', 'wav', 'flac'];
 const DEAPI_TTS_SAMPLE_RATES = [16000, 22050, 24000, 44100, 48000];
 const DEAPI_IMAGE_UPSCALE_MODEL = 'RealESRGAN_x4';
+const DEAPI_MODEL_CACHE_TTL_MS = Math.max(60000, Number(process.env.DEAPI_MODEL_CACHE_TTL_MS || 5 * 60 * 1000));
+const deapiModelCache = new Map();
 
 function normalizeDeapiModelSlug(slug = '') {
     return String(slug || '').trim().toLowerCase();
+}
+
+function normalizeDeapiModelRecord(model = {}) {
+    return {
+        ...model,
+        name: model.name || model.slug,
+        slug: model.slug,
+        info: {
+            defaults: model.info?.defaults || {},
+            limits: model.info?.limits || {},
+            modes: model.info?.modes,
+            features: model.info?.features || {},
+        },
+        languages: model.languages ?? null,
+    };
+}
+
+function mergeDeapiModelLists(liveModels = [], fallbackModels = []) {
+    const merged = [];
+    const fallbackBySlug = new Map(
+        fallbackModels
+            .map(normalizeDeapiModelRecord)
+            .filter((model) => model.slug)
+            .map((model) => [normalizeDeapiModelSlug(model.slug), model])
+    );
+    const seen = new Set();
+
+    for (const liveModel of liveModels.map(normalizeDeapiModelRecord).filter((model) => model.slug)) {
+        const key = normalizeDeapiModelSlug(liveModel.slug);
+        const fallback = fallbackBySlug.get(key);
+        merged.push({
+            ...fallback,
+            ...liveModel,
+            info: {
+                defaults: {
+                    ...(fallback?.info?.defaults || {}),
+                    ...(liveModel.info?.defaults || {}),
+                },
+                limits: {
+                    ...(fallback?.info?.limits || {}),
+                    ...(liveModel.info?.limits || {}),
+                },
+                modes: liveModel.info?.modes || fallback?.info?.modes,
+                features: {
+                    ...(fallback?.info?.features || {}),
+                    ...(liveModel.info?.features || {}),
+                },
+            },
+        });
+        seen.add(key);
+    }
+
+    for (const fallback of fallbackBySlug.values()) {
+        if (!seen.has(normalizeDeapiModelSlug(fallback.slug))) {
+            merged.push(fallback);
+        }
+    }
+
+    return merged;
+}
+
+async function fetchDeapiModelsByInferenceType(inferenceType, fallbackModels = []) {
+    const cacheKey = String(inferenceType || '').trim();
+    const cached = deapiModelCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < DEAPI_MODEL_CACHE_TTL_MS) {
+        return mergeDeapiModelLists(cached.models, fallbackModels);
+    }
+
+    try {
+        const client = getDeapiClient();
+        const response = await client.get('/api/v2/models', {
+            params: {
+                'filter[inference_types]': cacheKey,
+                per_page: 100,
+            },
+        });
+        const liveModels = Array.isArray(response.data?.data) ? response.data.data : [];
+        deapiModelCache.set(cacheKey, { fetchedAt: Date.now(), models: liveModels });
+        return mergeDeapiModelLists(liveModels, fallbackModels);
+    } catch (err) {
+        console.warn(`[deAPI] ${cacheKey} model lista nem toltheto V2-bol, helyi fallback hasznalva:`, err.response?.data || err.message);
+        return mergeDeapiModelLists([], fallbackModels);
+    }
 }
 
 function getLocalDeapiMusicModels() {
@@ -3887,11 +4519,33 @@ function handleDeapiImageUpload(req, res, next) {
 }
 
 async function fetchDeapiMusicModels() {
-    return getLocalDeapiMusicModels();
+    return fetchDeapiModelsByInferenceType('txt2music', getLocalDeapiMusicModels());
 }
 
 async function fetchDeapiTtsModels() {
-    return getLocalDeapiTtsModels();
+    return fetchDeapiModelsByInferenceType('txt2audio', getLocalDeapiTtsModels());
+}
+
+async function findDeapiMusicModel(slug = '') {
+    const normalizedSlug = normalizeDeapiModelSlug(slug);
+    const models = await fetchDeapiMusicModels();
+    return models.find((model) => normalizeDeapiModelSlug(model.slug) === normalizedSlug) || null;
+}
+
+async function findDeapiTtsModel(slug = '') {
+    const normalizedSlug = normalizeDeapiModelSlug(slug);
+    const models = await fetchDeapiTtsModels();
+    return models.find((model) => normalizeDeapiModelSlug(model.slug) === normalizedSlug) || null;
+}
+
+async function resolveDeapiImageUpscaleModel(preferredModel = DEAPI_IMAGE_UPSCALE_MODEL) {
+    const fallbackModels = [
+        { slug: DEAPI_IMAGE_UPSCALE_MODEL, name: 'RealESRGAN x4', info: { defaults: {}, limits: {} } },
+    ];
+    const models = await fetchDeapiModelsByInferenceType('img-upscale', fallbackModels);
+    const normalizedPreferred = normalizeDeapiModelSlug(preferredModel);
+    const selected = models.find((model) => normalizeDeapiModelSlug(model.slug) === normalizedPreferred) || models[0];
+    return selected?.slug || preferredModel;
 }
 
 async function submitDeapiTextToMusic(payload, signal, referenceAudioFile = null) {
@@ -3912,7 +4566,7 @@ async function submitDeapiTextToMusic(payload, signal, referenceAudioFile = null
     }
 
     try {
-        const response = await client.post('/api/v1/client/txt2music', form, {
+        const response = await client.post('/api/v2/audio/music', form, {
             headers: {
                 ...form.getHeaders(),
                 Accept: 'application/json',
@@ -3945,7 +4599,7 @@ async function submitDeapiTextToAudio(payload, signal, referenceAudioFile = null
     }
 
     try {
-        const response = await client.post('/api/v1/client/txt2audio', form, {
+        const response = await client.post('/api/v2/audio/speech', form, {
             headers: {
                 ...form.getHeaders(),
                 Accept: 'application/json',
@@ -3972,7 +4626,7 @@ async function submitDeapiImageUpscale(imageFile, signal, model = DEAPI_IMAGE_UP
     form.append('model', model);
 
     try {
-        const response = await client.post('/api/v1/client/img-upscale', form, {
+        const response = await client.post('/api/v2/images/upscales', form, {
             headers: {
                 ...form.getHeaders(),
                 Accept: 'application/json',
@@ -4109,7 +4763,7 @@ async function pollDeapiResult(requestId, signal, onStatus = null, options = {})
 
         let response;
         try {
-            response = await client.get(`/api/v1/client/request-status/${requestId}`, { signal });
+            response = await client.get(`/api/v2/jobs/${requestId}`, { signal });
         } catch (err) {
             throw normalizeDeapiError(err);
         }
@@ -4138,11 +4792,11 @@ async function pollDeapiResult(requestId, signal, onStatus = null, options = {})
             return data;
         }
         if (['error', 'failed', 'cancelled', 'canceled'].includes(status)) {
-            throw new Error(data.error || response.data?.message || `${label} hibaval leallt`);
+            throw new Error(data.error_message || data.error || response.data?.message || `${label} hibaval leallt`);
         }
     }
 
-    throw new Error(`${label} ${maxPolls} status polling utan sem keszult el. A napi request-status limit vedelme miatt leallitottuk a varakozast.`);
+    throw new Error(`${label} ${maxPolls} status polling utan sem keszult el. A napi deAPI jobs polling vedelme miatt leallitottuk a varakozast.`);
 }
 
 router.get('/deapi/music-models', verifyFirebaseToken, audioLimiter, async (req, res) => {
@@ -4448,7 +5102,7 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
                 return res.status(400).json({ success: false, message: 'A deAPI lyrics mezĹ‘ nem lehet ĂĽres. Auto-lyrics mĂłdban elĹ‘bb generĂˇlni kell dalszĂ¶veget.' });
             }
 
-            const selectedDeapiModel = findLocalDeapiMusicModel(safeModel);
+            const selectedDeapiModel = await findDeapiMusicModel(safeModel);
             if (!selectedDeapiModel) {
                 return res.status(400).json({ success: false, message: `Ismeretlen deAPI modell slug: ${safeModel}` });
             }
@@ -4503,7 +5157,7 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
                 });
             const safeKeyscale = String(keyscale || '').trim() || null;
             const safeTimeSignature = timesignature === null || timesignature === '' ? null : normalizeDeapiMusicNumber(timesignature, { min: 2, max: 6, fallback: null, integer: true });
-            const safeVocalLanguage = 'unknown';
+            const safeVocalLanguage = String(vocal_language || '').trim() || null;
             const safeLyricsMode = ['instrumental', 'auto-lyrics', 'lyrics'].includes(String(lyrics_mode || '').trim())
                 ? String(lyrics_mode).trim()
                 : safeLyrics === '[Instrumental]' ? 'instrumental' : 'lyrics';

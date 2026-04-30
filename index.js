@@ -13,6 +13,7 @@ import { v2 as cloudinary } from "cloudinary";
 import aiRoutes from './ai-routes.js';
 import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
 import { createMarketplaceRouter } from './src/routes/marketplace.routes.js';
+import { createReportRouter } from './src/routes/report.routes.js';
 import { createTripoRouter } from './src/routes/tripo.routes.js';
 import { startTaskRecovery, stopTaskRecovery } from './src/services/taskRecoveryService.js';
 
@@ -36,6 +37,7 @@ app.use("/api/tripo/webhook", express.raw({
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/api', aiRoutes);     // Add routes after middlewares
 app.use('/api', createMarketplaceRouter(verifyFirebaseToken));
+app.use('/api', createReportRouter(verifyFirebaseToken));
 
 // ==================== CLOUDINARY CONFIG ====================
 
@@ -1723,7 +1725,17 @@ startTaskRecovery();
 
 // ==================== SERVER START ====================
 
-const server = app.listen(3001, () => console.log("🚀 Backend fut a 3001-es porton (Nodemailer + Speakeasy)"));
+const PORT = Number(process.env.PORT || 3001);
+const server = app.listen(PORT, () => console.log(`🚀 Backend fut a ${PORT}-es porton (Nodemailer + Speakeasy)`));
+
+server.on("error", (error) => {
+  stopTaskRecovery();
+  if (error.code === "EADDRINUSE") {
+    console.error(`Backend inditas sikertelen: a ${PORT}-es port mar hasznalatban van. Allitsd le a masik backend folyamatot, vagy inditsd masik PORT ertekkel.`);
+    process.exit(1);
+  }
+  throw error;
+});
 
 // Graceful shutdown — stop background recovery
 process.on("SIGINT", () => { stopTaskRecovery(); server.close(); });
