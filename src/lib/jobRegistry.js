@@ -6,13 +6,26 @@ export const activeJobs = new Map();
 /**
  * Registers a new active job with an AbortController and a timeout.
  * @param {string} jobId Unique identifier for the job
+ * @param {string} userId Owner user ID for authorization
  * @param {AbortController} controller AbortController to signal cancellation
  * @param {number} timeoutMs Timeout in milliseconds (default 10 minutes)
  */
-export function registerJob(jobId, controller, timeoutMs = 600000) {
+export function registerJob(jobId, userId, controller, timeoutMs = 600000) {
     if (!jobId) return;
 
-    // Clear any existing job with the same ID (unlikely but safe)
+    if (userId && typeof userId === 'object' && typeof userId.abort === 'function') {
+        timeoutMs = typeof controller === 'number' ? controller : timeoutMs;
+        controller = userId;
+        userId = null;
+    }
+
+    const existingJob = activeJobs.get(jobId);
+    if (existingJob?.userId && userId && existingJob.userId !== userId) {
+        console.warn(`[JobRegistry] Refusing to replace job ${jobId} owned by a different user.`);
+        return;
+    }
+
+    // Clear any existing job with the same ID for the same owner (unlikely but safe)
     unregisterJob(jobId);
 
     const timeoutId = setTimeout(() => {
@@ -21,7 +34,7 @@ export function registerJob(jobId, controller, timeoutMs = 600000) {
         activeJobs.delete(jobId);
     }, timeoutMs);
 
-    activeJobs.set(jobId, { controller, timeoutId });
+    activeJobs.set(jobId, { userId: userId || null, controller, timeoutId });
 }
 
 /**

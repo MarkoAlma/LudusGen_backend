@@ -21,10 +21,30 @@ dotenv.config();
 
 const app = express();          // Initialize app first
 
+const DEFAULT_DEV_ORIGINS = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5174',
+  'http://localhost:5179',
+  'http://127.0.0.1:5179',
+];
+const configuredCorsOrigins = (process.env.CORS_ORIGINS || process.env.FRONTEND_URL || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const allowedCorsOrigins = new Set([
+  ...configuredCorsOrigins,
+  ...(process.env.NODE_ENV === 'production' ? [] : DEFAULT_DEV_ORIGINS),
+]);
 
 // Middlewares
 app.use(cors({
-  origin: true, // Allow all for development flexibility
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedCorsOrigins.has(origin)) return callback(null, true);
+    return callback(new Error(`CORS origin not allowed: ${origin}`));
+  },
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
@@ -1057,7 +1077,7 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     if (displayName !== undefined && (!displayName || displayName.trim().length < 1)) {
       return res.status(400).json({
         success: false,
-        message: "A név legalább 2 karakter hosszú legyen"
+        message: "Name must be at least 2 characters long"
       });
     }
 
@@ -1070,7 +1090,7 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({
         success: false,
-        message: "Nincs frissítendő adat"
+        message: "No data to update"
       });
     }
 

@@ -99,6 +99,32 @@ class StorageService {
   }
 
   /**
+   * Upload a file from disk to B2 via stream.
+   * @param {string} filePath
+   * @param {string} key
+   * @param {string} contentType
+   */
+  async uploadFileFromPath(filePath, key, contentType) {
+    try {
+      const { client, bucket } = this.getStorage();
+      const fs = await import("node:fs");
+      const fileStream = fs.createReadStream(filePath);
+      
+      await client.send(new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: fileStream,
+        ContentType: contentType,
+      }));
+      console.log(`[StorageService] Uploaded ${key} from path`);
+      return key;
+    } catch (err) {
+      console.error(`[StorageService] Stream upload failed for ${key}:`, err.message);
+      throw err;
+    }
+  }
+
+  /**
    * Check if an object exists in B2.
    * @param {string} key
    */
