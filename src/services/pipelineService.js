@@ -3,7 +3,13 @@ import { randomUUID } from "crypto";
 import { getTripoClient } from "../lib/tripoClient.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
 import { analyticsService } from "./analyticsService.js";
+import { createTaskWithBilling, refundCreditReservation } from "./tripoBillingService.js";
 import { DEFAULT_MODEL } from "../config/tripo.config.js";
+import {
+  startPipeline,
+  updatePipeline,
+  finishPipeline,
+} from "./pipelineRecoveryService.js";
 
 /** @type {Map<string, object>} pipelineId → PipelineResult */
 const _pipelines = new Map();
@@ -28,6 +34,15 @@ class PipelineService {
     _pipelines.set(pipelineId, result);
     console.log(`[Pipeline ${pipelineId}] starting (${genType})`);
 
+    // Persist initial state to Firestore so a server crash can be detected
+    // at boot time and credits refunded for each completed step.
+    await startPipeline({
+      pipelineId,
+      userId: req.userId,
+      type: genType,
+      prompt: req.prompt ?? null,
+    });
+
     try {
       /* Step 1 — Generation */
       let currentTaskId = await this._runStep(result, genType, {
@@ -40,7 +55,7 @@ class PipelineService {
         pbr:             true,
         texture_quality: "detailed",
         ...(req.callback_url && { callback_url: req.callback_url }),
-      }, client);
+      }, client, req.userId);
 
       /* Step 2 — Smart Low Poly (optional) */
       if (req.run_smart_low_poly && req.smart_low_poly_faces) {
@@ -50,7 +65,7 @@ class PipelineService {
             original_model_task_id: currentTaskId,
             face_limit: req.smart_low_poly_faces,
             quad: false,
-          }, client);
+          }, client, req.userId);
         } catch (err) {
           console.warn(`[Pipeline ${pipelineId}] smart_low_poly skipped:`, err.message);
           result.steps.push({ type: "smart_low_poly", status: "skipped" });
@@ -64,7 +79,7 @@ class PipelineService {
           const checkId = await this._runStep(result, "animate_prerigcheck", {
             type: "animate_prerigcheck",
             original_model_task_id: currentTaskId,
-          }, client);
+          }, client, req.userId);
           const checkTask = await client.getTask(checkId);
           isAnimatable    = checkTask.output?.is_animatable !== false;
           console.log(`[Pipeline ${pipelineId}] rig check: isAnimatable=${isAnimatable}`);
@@ -80,7 +95,7 @@ class PipelineService {
             original_model_task_id: currentTaskId,
             spec:       req.rig_spec ?? "mixamo",
             out_format: "glb",
-          }, client);
+          }, client, req.userId);
         }
       }
 
@@ -92,7 +107,7 @@ class PipelineService {
             original_model_task_id: currentTaskId,
             animations: req.animations,
             out_format: "glb",
-          }, client);
+          }, client, req.userId);
         } catch (err) {
           console.warn(`[Pipeline ${pipelineId}] retarget skipped:`, err.message);
           result.steps.push({ type: "animate_retarget", status: "skipped" });
@@ -110,7 +125,7 @@ class PipelineService {
           pivot_to_center_bottom:  p.pivot_to_center_bottom,
           scale_factor:            p.scale_factor,
           ...(p.face_limit !== null && { face_limit: p.face_limit }),
-        }, client);
+        }, client, req.userId);
       }
 
       /* Done */
@@ -119,6 +134,10 @@ class PipelineService {
       result.finalModelUrl = out.model ?? out.animated_model ?? out.rigged_model ?? null;
       result.status        = "completed";
       console.log(`[Pipeline ${pipelineId}] completed`);
+
+      // Persist final success state to Firestore
+      await finishPipeline(pipelineId, { status: "completed", finalModelUrl: result.finalModelUrl });
+
       return result;
 
     } catch (err) {
@@ -126,30 +145,49 @@ class PipelineService {
       result.error  = err.message;
       analyticsService.recordTaskError(pipelineId, "text_to_model", err.message);
       console.error(`[Pipeline ${pipelineId}] failed:`, err.message);
+
+      // Persist failure so boot-time recovery doesn't try to refund again
+      await finishPipeline(pipelineId, { status: "failed", error: err.message });
+
       return result;
     }
   }
 
-  async _runStep(result, type, body, client) {
+  async _runStep(result, type, body, client, userId) {
     const step = { type, status: "running", startedAt: Date.now() };
     result.steps.push(step);
+    let reservation = null;
+    let taskId = null;
     try {
-      const taskId = await client.createTask(body);
+      const billedTask = await createTaskWithBilling({ userId, body });
+      taskId = billedTask.taskId;
+      reservation = billedTask.reservation;
       step.taskId  = taskId;
-      analyticsService.recordTaskStart(taskId, type);
+
+      // Persist step start (includes taskId so crash recovery can refund it)
+      await updatePipeline(result.pipelineId, { steps: result.steps }).catch(() => {});
+
       const poll = await client.pollTask(taskId, {
         onProgress: (p, s) => console.log(`[Pipeline step=${type} task=${taskId}] ${s} ${p}%`),
       });
-      if (!poll.success) throw new Error(`Step "${type}" task ${taskId} status=${poll.status}`);
+      if (!poll.success) {
+        await refundCreditReservation(reservation, `pipeline_${type}_${poll.status}`, taskId);
+        throw new Error(`Step "${type}" task ${taskId} status=${poll.status}`);
+      }
       step.status     = "success";
       step.modelUrl   = poll.modelUrl;
       step.finishedAt = Date.now();
       analyticsService.recordTaskEnd(taskId, "success", step.finishedAt - step.startedAt);
+
+      // Persist step completion
+      await updatePipeline(result.pipelineId, { steps: result.steps }).catch(() => {});
+
       return taskId;
     } catch (err) {
       step.status     = "failed";
       step.error      = err.message;
       step.finishedAt = Date.now();
+      await updatePipeline(result.pipelineId, { steps: result.steps }).catch(() => {});
       throw err;
     }
   }

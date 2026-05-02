@@ -2,6 +2,7 @@
 import { getTripoClient } from "../lib/tripoClient.js";
 import { analyticsService } from "./analyticsService.js";
 import { LOD_PRESETS } from "../config/tripo.config.js";
+import { createTaskWithBilling, refundCreditReservation } from "./tripoBillingService.js";
 
 class LodService {
   /**
@@ -10,7 +11,7 @@ class LodService {
    * @param {{ label: string, face_limit: number, quad?: boolean, format?: string }[]} [levels]
    * @param {boolean} [exportZip]
    */
-  async generateChain(sourceTaskId, levels = LOD_PRESETS, exportZip = false) {
+  async generateChain(sourceTaskId, levels = LOD_PRESETS, exportZip = false, userId = null) {
     const client = getTripoClient();
     console.log(`[LOD] generating ${levels.length} levels from task=${sourceTaskId}`);
 
@@ -19,7 +20,7 @@ class LodService {
     }));
 
     const results = await Promise.allSettled(
-      levels.map((spec, i) => this._runLevel(sourceTaskId, lodLevels[i], spec, client)),
+      levels.map((spec, i) => this._runLevel(sourceTaskId, lodLevels[i], spec, client, userId)),
     );
 
     results.forEach((r, i) => {
@@ -36,21 +37,23 @@ class LodService {
     return { sourceTaskId, levels: lodLevels, ...(zipUrl && { zipUrl }) };
   }
 
-  async _runLevel(sourceTaskId, lod, spec, client) {
+  async _runLevel(sourceTaskId, lod, spec, client, userId = null) {
     const startMs = Date.now();
-    const taskId  = await client.createTask({
+    const body = {
       type:                    "convert_model",
       original_model_task_id: sourceTaskId,
       format:                  spec.format ?? "glb",
       quad:                    spec.quad   ?? false,
       face_limit:              spec.face_limit,
-    });
-    analyticsService.recordTaskStart(taskId, "convert_model");
+    };
+    const billedTask = await createTaskWithBilling({ userId, body });
+    const taskId = billedTask.taskId;
     console.log(`[LOD] ${lod.label} task=${taskId} (face_limit=${spec.face_limit})`);
 
     const result = await client.pollTask(taskId);
     if (!result.success) {
       analyticsService.recordTaskEnd(taskId, result.status, Date.now() - startMs);
+      await refundCreditReservation(billedTask.reservation, `lod_convert_model_${result.status}`, taskId);
       throw new Error(`LOD ${lod.label} task ${taskId} status=${result.status}`);
     }
     analyticsService.recordTaskEnd(taskId, "success", Date.now() - startMs);

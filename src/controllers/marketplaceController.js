@@ -707,9 +707,26 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
   const targetKey = keyFor(userId, "3d", fileName, "assets");
   await storageService.uploadFile(buffer, targetKey, contentType);
 
+  // Try to grab the Tripo-generated preview image as the marketplace card thumbnail.
+  // tripo_history entries store preview_image_url / preview_image_urls in params.
+  let thumbKey = null;
+  const previewImageUrl =
+    data.params?.preview_image_url ||
+    (Array.isArray(data.params?.preview_image_urls) && data.params.preview_image_urls[0]) ||
+    null;
+  if (previewImageUrl) {
+    try {
+      const { buffer: imgBuf } = await downloadExternalAsset(previewImageUrl);
+      thumbKey = await createImageThumb(imgBuf, userId, `preview_${sourceId}`);
+    } catch (err) {
+      console.warn(`[Marketplace] 3D preview thumb failed for ${sourceId}:`, err.message);
+    }
+  }
+
   return {
     storage: {
       key: targetKey,
+      thumbKey,
       fileName: safeFileName(fileName.endsWith(`.${ext}`) ? fileName : `${fileName}.${ext}`),
       contentType,
       size: buffer.length,

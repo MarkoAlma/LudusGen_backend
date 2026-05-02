@@ -1,14 +1,54 @@
 // src/controllers/webhookController.js
 import { webhookService } from "../services/webhookService.js";
-import { refundCredits, hasBeenCharged } from "../services/creditService.js";
+import { findDebitTransactionForTask, refundCredits } from "../services/creditService.js";
 import { getTripoClient } from "../lib/tripoClient.js";
 import admin from "firebase-admin";
 import { storageService } from "../services/storageService.js";
 import axios from "axios";
 import { extractModelUrl } from "../utils/tripoUtils.js";
 import { isFailedLikeTripoTaskStatus, normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
+import { TASK_TYPE_TO_MODE, HISTORY_TTL_MS } from "../config/tripo.config.js";
+
+// Task types that are expected to produce a downloadable model URL on success.
+const MODEL_PRODUCING_TYPES = new Set([
+  "text_to_model",
+  "image_to_model",
+  "multiview_to_model",
+  "refine_model",
+  "stylize_model",
+  "texture_model",
+  "convert_model",
+  "smart_low_poly",
+  "mesh_segmentation",
+  "mesh_completion",
+  "animate_rig",
+  "animate_retarget",
+  "import_model",
+]);
 
 const HISTORY_COLLECTION = "tripo_history";
+
+export function parseWebhookPayload(body, rawBody = null) {
+  if (body && typeof body === "object" && !Buffer.isBuffer(body)) {
+    return body;
+  }
+
+  const raw = Buffer.isBuffer(rawBody)
+    ? rawBody
+    : Buffer.isBuffer(body)
+      ? body
+      : null;
+
+  if (!raw) {
+    throw new Error("Invalid webhook payload");
+  }
+
+  try {
+    return JSON.parse(raw.toString("utf8"));
+  } catch {
+    throw new Error("Invalid webhook JSON payload");
+  }
+}
 
 export async function handleWebhook(req, res) {
   // Signature verification — raw body must be captured by express.raw() middleware
@@ -22,7 +62,7 @@ export async function handleWebhook(req, res) {
   }
 
   try {
-    const payload = req.body;
+    const payload = parseWebhookPayload(req.body, rawBody);
     if (!payload.task_id || !payload.status) {
       res.status(400).json({ success: false, message: "Invalid webhook payload: task_id and status required" });
       return;
@@ -63,21 +103,15 @@ export async function handleWebhook(req, res) {
 async function saveCompletedTaskToHistory(taskId, payload) {
   const db = admin.firestore();
 
-  // Look up userId from credit_history
-  const snap = await db.collectionGroup("transactions")
-    .where("taskId", "==", taskId)
-    .where("type", "==", "debit")
-    .limit(1)
-    .get();
-
-  if (snap.empty) {
+  // Look up userId from credit_history or the durable pending billing link map.
+  const debit = await findDebitTransactionForTask(taskId);
+  if (!debit) {
     console.log(`[WebhookController] No credit charge found for task ${taskId}, skipping history save`);
     return;
   }
 
-  const doc = snap.docs[0];
-  const data = doc.data();
-  const userId = doc.ref.parent.parent.id;
+  const data = debit.data;
+  const userId = debit.userId;
 
   // Check if history entry already exists (idempotency)
   const existing = await db.collection(HISTORY_COLLECTION)
@@ -112,32 +146,36 @@ async function saveCompletedTaskToHistory(taskId, payload) {
 
 
   if (!modelUrl) {
-    console.log(`[WebhookController] No model URL for completed task ${taskId}`);
+    console.warn(`[WebhookController] Task ${taskId} (type: ${taskType}) succeeded but no model URL found in output.`);
+
+    // For model-producing task types, this means delivery failed — refund.
+    if (MODEL_PRODUCING_TYPES.has(taskType)) {
+      // Mark any pending history doc as failed.
+      const failSnap = await db.collection(HISTORY_COLLECTION)
+        .where("taskId", "==", taskId)
+        .where("userId", "==", userId)
+        .limit(1)
+        .get();
+      if (!failSnap.empty) {
+        await failSnap.docs[0].ref.set(
+          { status: "failed", failReason: "success_no_output" },
+          { merge: true },
+        );
+      }
+      try {
+        await refundCredits(userId, data.amount, taskId, "webhook_success_no_output");
+        console.log(`[WebhookController] Refunded ${data.amount} credits for task ${taskId} (success but no model URL)`);
+      } catch (refundErr) {
+        console.error(`[WebhookController] Refund failed for task ${taskId}:`, refundErr.message);
+      }
+    }
     return;
   }
 
-  // Determine mode from task type
-  const typeMap = {
-    text_to_model: "generate",
-    image_to_model: "generate",
-    multiview_to_model: "generate",
-    generate_image: "image",
-    generate_multiview_image: "multiview_image",
-    edit_multiview_image: "multiview_image",
-    refine_model: "refine",
-    stylize_model: "stylize",
-    texture_model: "texture",
-    convert_model: "retopo",
-    smart_low_poly: "retopo",
-    mesh_segmentation: "segment",
-    mesh_completion: "fill_parts",
-    animate_rig: "animate",
-    animate_retarget: "animate",
-  };
-  const mode = typeMap[taskType] ?? "generate";
+  // Determine mode from task type (shared map from tripo.config.js)
+  const mode = TASK_TYPE_TO_MODE[taskType] ?? "generate";
 
   const now = Date.now();
-  const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
   const docRef = await db.collection(HISTORY_COLLECTION).add({
     userId,
@@ -231,23 +269,15 @@ async function processRefundForTask(taskId, status, payload) {
     return;
   }
 
-  // Look up userId from credit_history
-  const db = admin.firestore();
-  const snap = await db.collectionGroup("transactions")
-    .where("taskId", "==", taskId)
-    .where("type", "==", "debit")
-    .limit(1)
-    .get();
-
-  if (snap.empty) {
+  // Look up userId from credit_history or the durable pending billing link map.
+  const debit = await findDebitTransactionForTask(taskId);
+  if (!debit) {
     console.log(`[WebhookController] No credit charge found for task ${taskId}, skipping refund`);
     return;
   }
 
-  const doc = snap.docs[0];
-  const data = doc.data();
-  // The document path is: credit_history/{userId}/transactions/{txId}
-  const userId = doc.ref.parent.parent.id;
+  const data = debit.data;
+  const userId = debit.userId;
 
   console.log(`[WebhookController] Processing refund for task ${taskId}, user ${userId}, amount ${data.amount}`);
 

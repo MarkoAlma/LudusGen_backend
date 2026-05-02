@@ -33,15 +33,32 @@ export async function generateCharacter(req, res) {
 
 /* ─── Get pipeline status ─────────────────────────────────────────────── */
 export async function getPipeline(req, res) {
+  // Fast path: in-memory Map (set during this server's lifetime)
   const result = pipelineService.get(req.params.pipelineId);
-  if (!result) {
-    res.status(404).json({ success: false, message: "Pipeline not found" });
+  if (result) {
+    res.json({ success: true, ...result });
     return;
   }
-  res.json({ success: true, ...result });
+
+  // Fallback: Firestore for pipelines started by a previous server instance
+  // (e.g. after nodemon restart during a long-running pipeline)
+  try {
+    const admin = (await import("firebase-admin")).default;
+    const snap = await admin.firestore()
+      .collection("tripo_pipelines")
+      .doc(req.params.pipelineId)
+      .get();
+    if (snap.exists) {
+      res.json({ success: true, fromFirestore: true, ...snap.data() });
+      return;
+    }
+  } catch (err) {
+    console.warn("[pipelineController] getPipeline Firestore fallback error:", err.message);
+  }
+
+  res.status(404).json({ success: false, message: "Pipeline not found" });
 }
 
-/* ─── Estimate pipeline cost ──────────────────────────────────────────── */
 export async function estimatePipeline(req, res) {
   try {
     const estimate = estimatePipelineCost(req.body);

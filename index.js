@@ -16,6 +16,7 @@ import { createMarketplaceRouter } from './src/routes/marketplace.routes.js';
 import { createReportRouter } from './src/routes/report.routes.js';
 import { createTripoRouter } from './src/routes/tripo.routes.js';
 import { startTaskRecovery, stopTaskRecovery } from './src/services/taskRecoveryService.js';
+import { recoverStalePipelines } from './src/services/pipelineRecoveryService.js';
 
 dotenv.config();
 
@@ -1723,6 +1724,12 @@ app.use("/api", tripoRouter);
 
 // 5. Background task recovery — polls pending tasks and saves to history
 startTaskRecovery();
+
+// 6. Pipeline crash recovery — marks stale in-progress pipelines as failed
+// and refunds credits for each completed step.
+recoverStalePipelines().catch((err) =>
+  console.error("[PipelineRecovery] Boot-time pipeline recovery failed:", err.message)
+);
 
 // ==================== SERVER START ====================
 

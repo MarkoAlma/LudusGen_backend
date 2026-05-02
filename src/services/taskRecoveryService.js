@@ -9,10 +9,30 @@
 // On failure, credits are refunded.
 
 import { getTripoClient } from "../lib/tripoClient.js";
-import { refundCredits } from "./creditService.js";
+import { findDebitTransactionForTask, refundCredits } from "./creditService.js";
 import admin from "firebase-admin";
 import { extractModelUrl } from "../utils/tripoUtils.js";
 import { isFailedLikeTripoTaskStatus, normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
+import { TASK_TYPE_TO_MODE, HISTORY_TTL_MS } from "../config/tripo.config.js";
+
+// Task types that are expected to produce a downloadable model URL on success.
+// If Tripo reports success but no URL is found, treat it as a billable failure
+// (credit was already debited — refund and mark failed).
+const MODEL_PRODUCING_TYPES = new Set([
+  "text_to_model",
+  "image_to_model",
+  "multiview_to_model",
+  "refine_model",
+  "stylize_model",
+  "texture_model",
+  "convert_model",
+  "smart_low_poly",
+  "mesh_segmentation",
+  "mesh_completion",
+  "animate_rig",
+  "animate_retarget",
+  "import_model",
+]);
 
 const HISTORY_COLLECTION = "tripo_history";
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -20,31 +40,11 @@ const POLL_INTERVAL_MS = 5_000; // check every 5 seconds
 const MAX_POLL_MS = 600_000; // 10 minutes max per task
 const CLEANUP_INTERVAL_MS = 60_000; // cleanup completed tasks every minute
 
-const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /** @type {Map<string, { taskId: string, userId: string, type: string, modelVersion: string, texture: boolean, pbr: boolean, startedAt: number }>} */
 const pendingTasks = new Map();
 const recentTaskMeta = new Map();
 
-/* ─── Type → mode mapping (same as webhookController) ─────────────────── */
-const TYPE_TO_MODE = {
-  text_to_model: "generate",
-  image_to_model: "generate",
-  multiview_to_model: "generate",
-  import_model: "upload",
-  generate_image: "image",
-  generate_multiview_image: "multiview_image",
-  edit_multiview_image: "multiview_image",
-  refine_model: "refine",
-  stylize_model: "stylize",
-  texture_model: "texture",
-  convert_model: "retopo",
-  smart_low_poly: "retopo",
-  mesh_segmentation: "segment",
-  mesh_completion: "fill_parts",
-  animate_rig: "animate",
-  animate_retarget: "animate",
-};
 
 /* ─── Register a task for background tracking ─────────────────────────── */
 function inferTaskTypeFromHistory(data = {}) {
@@ -58,8 +58,12 @@ async function restorePendingHistoryTasks() {
   const db = admin.firestore();
   const snap = await db.collection(HISTORY_COLLECTION)
     .where("status", "==", "pending")
-    .limit(200)
+    .limit(500)
     .get();
+
+  if (snap.docs.length >= 500) {
+    console.warn("[TaskRecovery] restorePendingHistoryTasks hit the 500-doc limit — some pending tasks may not have been restored.");
+  }
 
   let restored = 0;
   for (const doc of snap.docs) {
@@ -107,6 +111,49 @@ export function registerTask(taskId, userId, type, modelVersion, prompt = null, 
 
 export function getRegisteredTaskMeta(taskId) {
   return pendingTasks.get(taskId) ?? recentTaskMeta.get(taskId) ?? null;
+}
+
+function omitUndefinedValues(obj) {
+  return Object.fromEntries(Object.entries(obj).filter(([, value]) => value !== undefined));
+}
+
+export async function persistPendingRecoveryTask({
+  taskId,
+  userId,
+  body = {},
+  prompt = null,
+} = {}) {
+  if (!taskId || !userId) return;
+
+  const type = body.type ?? "unknown";
+  const mode = TASK_TYPE_TO_MODE[type] ?? "generate";
+  const now = Date.now();
+  const params = omitUndefinedValues({
+    model_version: body.model_version ?? null,
+    mode,
+    type,
+    texture: body.texture === true,
+    pbr: body.pbr === true,
+    originalModelTaskId: body.original_model_task_id ?? body.original_model_id,
+    originalTaskId: body.original_task_id,
+    draftModelTaskId: body.draft_model_task_id,
+    preprocessTaskId: body.preprocessTaskId,
+    preprocessTaskType: body.preprocessTaskType,
+    generate_parts: body.generate_parts === true ? true : undefined,
+  });
+
+  await admin.firestore().collection(HISTORY_COLLECTION).doc(`tripo_${taskId}`).set({
+    userId,
+    prompt: prompt ?? body.prompt ?? type,
+    status: "pending",
+    source: type === "import_model" ? "upload" : "tripo",
+    mode,
+    taskId,
+    params,
+    ts: now,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: now + HISTORY_TTL_MS,
+  }, { merge: true });
 }
 
 /* ─── Unregister a task (called when frontend successfully polls it) ──── */
@@ -223,6 +270,36 @@ async function saveToHistory(entry, taskData) {
 
   if (!modelUrl) {
     console.warn(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) succeeded but no model URL found in output:`, JSON.stringify(out));
+
+    // For task types that should always produce a model URL, a missing URL at
+    // "success" means delivery failed. Refund the credit and mark the history
+    // doc as failed so the user can see what happened.
+    if (MODEL_PRODUCING_TYPES.has(entry.type)) {
+      // Mark the pending history doc as failed (best-effort).
+      const failSnap = await db.collection(HISTORY_COLLECTION)
+        .where("taskId", "==", entry.taskId)
+        .where("userId", "==", entry.userId)
+        .limit(1)
+        .get();
+      if (!failSnap.empty) {
+        await failSnap.docs[0].ref.set(
+          { status: "failed", failReason: "success_no_output" },
+          { merge: true },
+        );
+      }
+      // Issue refund.
+      const debit = await findDebitTransactionForTask(entry.taskId, entry.userId);
+      if (debit) {
+        try {
+          await refundCredits(entry.userId, debit.data.amount, entry.taskId, "recovery_success_no_output");
+          console.log(`[TaskRecovery] Refunded ${debit.data.amount} credits for task ${entry.taskId} (success but no model URL)`);
+        } catch (refundErr) {
+          console.error(`[TaskRecovery] Refund failed for task ${entry.taskId}:`, refundErr.message);
+        }
+      } else {
+        console.warn(`[TaskRecovery] No debit found to refund for task ${entry.taskId}`);
+      }
+    }
     return;
   }
 
@@ -235,7 +312,7 @@ async function saveToHistory(entry, taskData) {
   const existingDoc = existing.docs[0] ?? null;
   const existingData = existingDoc?.data() ?? null;
 
-  const mode = TYPE_TO_MODE[entry.type] ?? "generate";
+  const mode = TASK_TYPE_TO_MODE[entry.type] ?? "generate";
   const now = Date.now();
   const taskInput = taskData.input ?? taskData.request ?? {};
 
@@ -280,8 +357,6 @@ async function saveToHistory(entry, taskData) {
     }, { merge: true });
   }
   console.log(`[TaskRecovery] Saved ${urlsToSave.length} model(s) for task ${entry.taskId} to history for user ${entry.userId}`);
-
-  console.log(`[TaskRecovery] Saved task ${entry.taskId} to history for user ${entry.userId}`);
 }
 
 /* ─── Handle failed/cancelled task — refund credits ───────────────────── */
@@ -309,29 +384,12 @@ async function handleFailedTask(entry, taskData) {
     null;
   console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. error=${taskError ?? "unknown"} code=${taskErrorCode ?? "unknown"} rawOutput:`, JSON.stringify(taskData.rawOutput ?? taskData.output ?? {}));
 
-  // Look up the charged amount from credit_history
-  // NOTE: collectionGroup with multiple where() requires a composite index.
-  // Instead, query by taskId only and filter type in-memory to avoid index setup.
-  const db = admin.firestore();
-  const snap = await db.collection("credit_history")
-    .doc(userId)
-    .collection("transactions")
-    .where("taskId", "==", taskId)
-    .limit(10)
-    .get();
-
-  if (snap.empty) {
-    console.log(`[TaskRecovery] No credit charge found for failed task ${taskId}`);
-    return;
-  }
-
-  // Find the debit transaction in-memory
-  const debitDoc = snap.docs.find(d => d.data().type === "debit");
-  if (!debitDoc) {
+  const debit = await findDebitTransactionForTask(taskId, userId);
+  if (!debit) {
     console.log(`[TaskRecovery] No debit transaction found for failed task ${taskId}`);
     return;
   }
-  const data = debitDoc.data();
+  const data = debit.data;
 
   // Check for NSFW/content policy — no refund
   const errorMsg = String(taskError ?? "").toLowerCase();

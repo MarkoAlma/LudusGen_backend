@@ -5,11 +5,17 @@
 // Start with: node src/workers/tripoWorker.js
 
 import { Worker } from "bullmq";
-import { QUEUE_NAMES } from "../config/tripo.config.js";
+import { DEFAULT_MODEL, QUEUE_NAMES } from "../config/tripo.config.js";
 import { getTripoClient } from "../lib/tripoClient.js";
 import { taskService } from "../services/taskService.js";
 import { analyticsService } from "../services/analyticsService.js";
 import { webhookService } from "../services/webhookService.js";
+import { linkTaskIdToTransaction, refundCredits } from "../services/creditService.js";
+import {
+  persistPendingRecoveryTask,
+  registerTask as registerForRecovery,
+  startTaskRecovery,
+} from "../services/taskRecoveryService.js";
 
 /* ─── Redis connection (same as queues.js) ────────────────────────────── */
 function getRedisOpts() {
@@ -28,9 +34,44 @@ function getRedisOpts() {
   }
 }
 
+function getWorkerTaskPrompt(taskBody = {}) {
+  return taskBody.prompt ?? taskBody._sourceName ?? taskBody.type ?? "tripo_task";
+}
+
+async function registerWorkerTaskForRecovery(job, taskId, billing) {
+  const taskBody = job.data.taskBody ?? {};
+  const userId = billing?.userId ?? job.data.userId ?? null;
+  if (!taskId || !userId) return;
+
+  const prompt = getWorkerTaskPrompt(taskBody);
+  try {
+    await persistPendingRecoveryTask({
+      taskId,
+      userId,
+      body: taskBody,
+      prompt,
+    });
+  } catch (err) {
+    console.warn(`[Worker] pending recovery persist failed for task=${taskId}:`, err.message);
+  }
+
+  registerForRecovery(
+    taskId,
+    userId,
+    taskBody.type,
+    taskBody.model_version ?? DEFAULT_MODEL,
+    prompt,
+    {
+      texture: taskBody.texture === true,
+      pbr: taskBody.pbr === true,
+    },
+  );
+}
+
 /* ─── Worker processor ────────────────────────────────────────────────── */
 async function processJob(job) {
   const { taskBody, callbackUrl, pipelineId, pipelineStep, batchId, batchIndex } = job.data;
+  const billing = job.data.billing ?? null;
   const client  = getTripoClient();
   const startMs = Date.now();
 
@@ -39,16 +80,33 @@ async function processJob(job) {
   await job.updateProgress(0);
 
   /* ── Create Tripo task ─────────────────────────────────────────── */
-  const validatedBody = taskService.validate(taskBody);
-  if (callbackUrl) validatedBody["callback_url"] = callbackUrl;
+  let taskId = job.data._tripoTaskId ?? null;
+  if (!taskId) {
+    const validatedBody = taskService.validate(taskBody);
+    if (callbackUrl) validatedBody["callback_url"] = callbackUrl;
 
-  const taskId = await client.createTask(validatedBody, job.data.idempotencyKey);
-  analyticsService.recordTaskStart(taskId, taskBody.type);
+    taskId = await client.createTask(validatedBody, job.data.idempotencyKey);
 
-  console.log(`[Worker] job=${job.id} → Tripo task=${taskId}`);
+    // Store taskId before any Firestore billing work so retries poll the same provider task.
+    job.data = { ...job.data, _tripoTaskId: taskId };
+    await job.updateData({ ...job.data, _tripoTaskId: taskId });
 
-  // Store taskId in job data so it's accessible on retry
-  await job.updateData({ ...job.data, _tripoTaskId: taskId });
+    analyticsService.recordTaskStart(taskId, taskBody.type);
+    console.log(`[Worker] job=${job.id} -> Tripo task=${taskId}`);
+  } else {
+    console.log(`[Worker] job=${job.id} reusing Tripo task=${taskId}`);
+  }
+
+  await registerWorkerTaskForRecovery(job, taskId, billing);
+
+  if (billing?.userId && billing?.tempTxId) {
+    try {
+      await linkTaskIdToTransaction(billing.userId, billing.tempTxId, taskId);
+    } catch (err) {
+      if (!err.billingLinkMapped) throw err;
+      console.warn(`[Worker] billing link incomplete for task=${taskId}; continuing with durable billing link`);
+    }
+  }
 
   /* ── Poll task ──────────────────────────────────────────────────── */
   const result = await client.pollTask(taskId, {
@@ -65,7 +123,17 @@ async function processJob(job) {
   analyticsService.recordTaskEnd(taskId, result.status, durationMs);
 
   if (!result.success) {
-    throw new Error(`Tripo task ${taskId} ended with status=${result.status}`);
+    if (billing?.userId && billing?.amount > 0) {
+      await refundCredits(billing.userId, billing.amount, taskId, `worker_${result.status}`);
+    }
+    return {
+      taskId,
+      status:    result.status,
+      modelUrl:  null,
+      rawOutput: result.rawOutput,
+      durationMs,
+      failed:    true,
+    };
   }
 
   const jobResult = {
@@ -125,6 +193,8 @@ async function deliverCallback(url, result) {
 
 /* ─── Worker instance ─────────────────────────────────────────────────── */
 export function startWorker(concurrency = 5) {
+  startTaskRecovery();
+
   const worker = new Worker(
     QUEUE_NAMES.TRIPO_TASKS,
     processJob,
@@ -142,7 +212,7 @@ export function startWorker(concurrency = 5) {
     console.log(`[Worker] ✅ job=${job.id} task=${result.taskId} in ${result.durationMs}ms`);
   });
 
-  worker.on("failed", (job, err) => {
+  worker.on("failed", async (job, err) => {
     console.error(`[Worker] ❌ job=${job?.id} attempt=${job?.attemptsMade}:`, err.message);
     if (job) {
       analyticsService.recordTaskError(
@@ -150,6 +220,19 @@ export function startWorker(concurrency = 5) {
         job.data.taskBody.type,
         err.message,
       );
+      const attempts = job.opts?.attempts ?? 1;
+      const isFinalAttempt = job.attemptsMade >= attempts;
+      const billing = job.data.billing ?? null;
+      if (isFinalAttempt && job.data._tripoTaskId) {
+        await registerWorkerTaskForRecovery(job, job.data._tripoTaskId, billing);
+      }
+      if (isFinalAttempt && billing?.userId && billing?.amount > 0 && billing?.tempTxId && !job.data._tripoTaskId) {
+        try {
+          await refundCredits(billing.userId, billing.amount, billing.tempTxId, "worker_create_failed");
+        } catch (refundErr) {
+          console.error(`[Worker] refund failed for job=${job.id}:`, refundErr.message);
+        }
+      }
     }
   });
 

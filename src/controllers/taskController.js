@@ -5,7 +5,7 @@ import { storageService } from "../services/storageService.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
-import { deductCredits, refundCredits, linkTaskIdToTransaction, hasBeenCharged } from "../services/creditService.js";
+import { deductCredits, refundCredits, linkTaskIdToTransaction, hasBeenCharged, findDebitTransactionForTask } from "../services/creditService.js";
 import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskMeta } from "../services/taskRecoveryService.js";
 import {
   MARKETPLACE_COLLECTIONS,
@@ -18,6 +18,7 @@ import admin from "firebase-admin";
 import { createHash } from "node:crypto";
 import { registerJob, unregisterJob } from "../lib/jobRegistry.js";
 import { getTaskLookupHttpStatus, isMissingTripoTaskError } from "../lib/tripoTaskErrors.js";
+import { normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -1028,7 +1029,39 @@ export async function streamTask(req, res) {
 export async function cancelTask(req, res) {
   try {
     if (!await requireTaskAccess(req, res)) return;
-    const result = await taskService.cancel(req.params.taskId);
+
+    const { taskId } = req.params;
+    const userId = req.user?.uid;
+
+    // Fetch current task status BEFORE cancelling.
+    // Refund only if the task is still "queued" — Tripo hasn't started
+    // processing it yet so their side hasn't debited their credits either.
+    let statusBeforeCancel = null;
+    try {
+      const currentTask = await getTripoClient().getTask(taskId);
+      statusBeforeCancel = normalizeTripoTaskStatus(currentTask?.status ?? "");
+    } catch (fetchErr) {
+      console.warn(`[TaskController] cancelTask: could not fetch status for ${taskId}:`, fetchErr.message);
+      // Status unknown — proceed with cancel but skip refund to be safe.
+    }
+
+    const result = await taskService.cancel(taskId);
+
+    if (statusBeforeCancel === "queued" && userId) {
+      // Task was still queued — Tripo hadn't started billing. Refund the user.
+      try {
+        const debit = await findDebitTransactionForTask(taskId, userId);
+        if (debit?.data?.amount > 0) {
+          await refundCredits(userId, debit.data.amount, taskId, "cancel_while_queued");
+          console.log(`[TaskController] Refunded ${debit.data.amount} credits for queued task ${taskId} (user ${userId})`);
+        }
+      } catch (refundErr) {
+        console.error(`[TaskController] Refund after cancel failed for task ${taskId}:`, refundErr.message);
+      }
+    } else if (statusBeforeCancel && statusBeforeCancel !== "queued") {
+      console.log(`[TaskController] Task ${taskId} was already ${statusBeforeCancel} when cancelled — no refund (Tripo credits consumed)`);
+    }
+
     res.json({ success: true, cancelled: result.cancelled, message: result.message });
   } catch (err) {
     console.warn("[TaskController] cancelTask:", err.message);
@@ -1036,7 +1069,6 @@ export async function cancelTask(req, res) {
   }
 }
 
-/* ─── Task: acknowledge (stop background poll) ────────────────────────── */
 export async function acknowledgeTask(req, res) {
   try {
     const { taskId } = req.params;

@@ -7,6 +7,40 @@ import admin from "firebase-admin";
 
 const CREDIT_HISTORY_COLLECTION = "credit_history";
 const USERS_COLLECTION = "users";
+const BILLING_LINKS_COLLECTION = "tripo_billing_links";
+
+export function makeCreditTransactionDocId(type, taskId) {
+  const normalizedType = String(type || "").trim();
+  const normalizedTaskId = String(taskId || "").trim();
+  if (!normalizedType) throw new Error("transaction type required");
+  if (!normalizedTaskId) throw new Error("taskId required");
+
+  const safeTaskId = normalizedTaskId
+    .replace(/[^a-zA-Z0-9_.-]/g, "_")
+    .slice(0, 420);
+  return `${normalizedType}_${safeTaskId}`;
+}
+
+function makeBillingLinkDocId(taskId) {
+  return makeCreditTransactionDocId("link", taskId);
+}
+
+async function markBillingLink(linkRef, patch) {
+  try {
+    await linkRef.set({
+      ...patch,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch (err) {
+    console.warn(`[CreditService] Billing link status update failed for ${linkRef.id}:`, err.message);
+  }
+}
+
+function assertValidCreditAmount(amount) {
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new Error(`Invalid credit amount: ${amount}`);
+  }
+}
 
 /**
  * Deduct credits from a user's balance.
@@ -21,12 +55,20 @@ const USERS_COLLECTION = "users";
  */
 export async function deductCredits(userId, amount, taskId, taskType) {
   if (amount <= 0) return { success: true, remaining: await getUserBalance(userId) };
+  assertValidCreditAmount(amount);
 
   const db = admin.firestore();
   const userRef = db.collection(USERS_COLLECTION).doc(userId);
+  const txRef = db
+    .collection(CREDIT_HISTORY_COLLECTION)
+    .doc(userId)
+    .collection("transactions")
+    .doc(makeCreditTransactionDocId("debit", taskId));
 
-  // Idempotency check: if this taskId already has a debit entry, skip
-  const existingTx = await db
+  // Legacy idempotency check: query-based lookup OUTSIDE the transaction.
+  // Firestore transactions only guarantee isolation for document-path reads;
+  // where-queries inside a transaction are NOT safely isolated.
+  const legacySnap = await db
     .collection(CREDIT_HISTORY_COLLECTION)
     .doc(userId)
     .collection("transactions")
@@ -34,18 +76,24 @@ export async function deductCredits(userId, amount, taskId, taskType) {
     .where("type", "==", "debit")
     .limit(1)
     .get();
-
-  if (!existingTx.empty) {
-    console.log(`[CreditService] Deduction already exists for task ${taskId}, skipping`);
-    const doc = existingTx.docs[0].data();
-    return { success: true, remaining: doc.balanceAfter };
+  if (!legacySnap.empty) {
+    const legacyData = legacySnap.docs[0].data();
+    console.log(`[CreditService] Legacy deduction already exists for task ${taskId}, skipping`);
+    return { success: true, remaining: legacyData.balanceAfter ?? 0 };
   }
 
   let remaining = 0;
 
   await db.runTransaction(async (tx) => {
-    const userDoc = await tx.get(userRef);
+    // Primary idempotency: doc-ID based check — safe inside a transaction.
+    const existingTx = await tx.get(txRef);
+    if (existingTx.exists) {
+      console.log(`[CreditService] Deduction already exists for task ${taskId}, skipping`);
+      remaining = existingTx.data().balanceAfter ?? 0;
+      return;
+    }
 
+    const userDoc = await tx.get(userRef);
     if (!userDoc.exists) {
       throw new Error("User document not found");
     }
@@ -62,14 +110,6 @@ export async function deductCredits(userId, amount, taskId, taskType) {
 
     const newBalance = currentBalance - amount;
     tx.update(userRef, { credits: newBalance });
-
-    // Log transaction
-    const txRef = db
-      .collection(CREDIT_HISTORY_COLLECTION)
-      .doc(userId)
-      .collection("transactions")
-      .doc();
-
     tx.set(txRef, {
       type: "debit",
       amount,
@@ -99,12 +139,19 @@ export async function deductCredits(userId, amount, taskId, taskType) {
  */
 export async function refundCredits(userId, amount, taskId, reason) {
   if (amount <= 0) return { success: true, remaining: await getUserBalance(userId) };
+  assertValidCreditAmount(amount);
 
   const db = admin.firestore();
   const userRef = db.collection(USERS_COLLECTION).doc(userId);
+  const txRef = db
+    .collection(CREDIT_HISTORY_COLLECTION)
+    .doc(userId)
+    .collection("transactions")
+    .doc(makeCreditTransactionDocId("refund", taskId));
 
-  // Idempotency check: if this taskId already has a refund entry, skip
-  const existingTx = await db
+  // Legacy idempotency check OUTSIDE the transaction (query-based reads are
+  // not safely isolated inside a Firestore transaction).
+  const legacySnap = await db
     .collection(CREDIT_HISTORY_COLLECTION)
     .doc(userId)
     .collection("transactions")
@@ -112,18 +159,24 @@ export async function refundCredits(userId, amount, taskId, reason) {
     .where("type", "==", "refund")
     .limit(1)
     .get();
-
-  if (!existingTx.empty) {
-    console.log(`[CreditService] Refund already exists for task ${taskId}, skipping`);
-    const doc = existingTx.docs[0].data();
-    return { success: true, remaining: doc.balanceAfter };
+  if (!legacySnap.empty) {
+    const legacyData = legacySnap.docs[0].data();
+    console.log(`[CreditService] Legacy refund already exists for task ${taskId}, skipping`);
+    return { success: true, remaining: legacyData.balanceAfter ?? 0 };
   }
 
   let remaining = 0;
 
   await db.runTransaction(async (tx) => {
-    const userDoc = await tx.get(userRef);
+    // Primary idempotency: doc-ID based check — safe inside a transaction.
+    const existingTx = await tx.get(txRef);
+    if (existingTx.exists) {
+      console.log(`[CreditService] Refund already exists for task ${taskId}, skipping`);
+      remaining = existingTx.data().balanceAfter ?? 0;
+      return;
+    }
 
+    const userDoc = await tx.get(userRef);
     if (!userDoc.exists) {
       throw new Error("User document not found");
     }
@@ -133,14 +186,6 @@ export async function refundCredits(userId, amount, taskId, reason) {
     const newBalance = currentBalance + amount;
 
     tx.update(userRef, { credits: newBalance });
-
-    // Log transaction
-    const txRef = db
-      .collection(CREDIT_HISTORY_COLLECTION)
-      .doc(userId)
-      .collection("transactions")
-      .doc();
-
     tx.set(txRef, {
       type: "refund",
       amount,
@@ -168,6 +213,40 @@ export async function refundCredits(userId, amount, taskId, reason) {
  */
 export async function linkTaskIdToTransaction(userId, tempTaskId, realTaskId) {
   const db = admin.firestore();
+  const linkRef = db.collection(BILLING_LINKS_COLLECTION).doc(makeBillingLinkDocId(realTaskId));
+  await linkRef.set({
+    userId,
+    tempTaskId,
+    realTaskId,
+    status: "pending",
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  const directRef = db.collection(CREDIT_HISTORY_COLLECTION)
+    .doc(userId)
+    .collection("transactions")
+    .doc(makeCreditTransactionDocId("debit", tempTaskId));
+  const directDoc = await directRef.get();
+  if (directDoc.exists) {
+    try {
+      await directRef.update({
+        taskId: realTaskId,
+        pendingTaskId: tempTaskId,
+        linkedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (err) {
+      err.billingLinkMapped = true;
+      throw err;
+    }
+    await markBillingLink(linkRef, {
+      status: "linked",
+      linkedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`[CreditService] Linked temp ID ${tempTaskId} to real taskId ${realTaskId}`);
+    return;
+  }
+
   const snap = await db.collection(CREDIT_HISTORY_COLLECTION)
     .doc(userId)
     .collection("transactions")
@@ -176,12 +255,83 @@ export async function linkTaskIdToTransaction(userId, tempTaskId, realTaskId) {
     .get();
 
   if (snap.empty) {
-    console.warn(`[CreditService] No transaction found with temp ID ${tempTaskId} for user ${userId}`);
-    return;
+    await markBillingLink(linkRef, {
+      status: "missing_debit",
+      error: "debit_not_found",
+    });
+    const err = new Error(`No debit transaction found with temp ID ${tempTaskId} for user ${userId}`);
+    err.billingLinkMapped = true;
+    throw err;
   }
 
-  await snap.docs[0].ref.update({ taskId: realTaskId });
+  try {
+    await snap.docs[0].ref.update({
+      taskId: realTaskId,
+      pendingTaskId: tempTaskId,
+      linkedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (err) {
+    err.billingLinkMapped = true;
+    throw err;
+  }
+  await markBillingLink(linkRef, {
+    status: "linked",
+    linkedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
   console.log(`[CreditService] Linked temp ID ${tempTaskId} to real taskId ${realTaskId}`);
+}
+
+async function getDebitTransactionForUserTask(db, userId, taskId) {
+  const snap = await db
+    .collection(CREDIT_HISTORY_COLLECTION)
+    .doc(userId)
+    .collection("transactions")
+    .where("taskId", "==", taskId)
+    .where("type", "==", "debit")
+    .limit(1)
+    .get();
+
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  return { doc, data: doc.data(), userId };
+}
+
+export async function findDebitTransactionForTask(taskId, userId = null) {
+  const db = admin.firestore();
+
+  if (userId) {
+    const userDebit = await getDebitTransactionForUserTask(db, userId, taskId);
+    if (userDebit) return { ...userDebit, refundTaskId: taskId };
+  } else {
+    const snap = await db.collectionGroup("transactions")
+      .where("taskId", "==", taskId)
+      .where("type", "==", "debit")
+      .limit(1)
+      .get();
+
+    if (!snap.empty) {
+      const doc = snap.docs[0];
+      return {
+        doc,
+        data: doc.data(),
+        userId: doc.ref.parent.parent.id,
+        refundTaskId: taskId,
+      };
+    }
+  }
+
+  const linkDoc = await db.collection(BILLING_LINKS_COLLECTION).doc(makeBillingLinkDocId(taskId)).get();
+  if (!linkDoc.exists) return null;
+
+  const link = linkDoc.data();
+  const linkedUserId = link.userId;
+  const tempTaskId = link.tempTaskId;
+  if (!linkedUserId || !tempTaskId) return null;
+  if (userId && linkedUserId !== userId) return null;
+
+  const pendingDebit = await getDebitTransactionForUserTask(db, linkedUserId, tempTaskId);
+  if (!pendingDebit) return null;
+  return { ...pendingDebit, refundTaskId: taskId, pendingTaskId: tempTaskId };
 }
 
 /**
