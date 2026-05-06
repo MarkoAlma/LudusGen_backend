@@ -63,16 +63,40 @@ function getFrontendUrl() {
 
   const normalizedUrl = (configuredUrl || fallbackUrl).replace(/\/+$/, '');
   if (
-    configuredUrl
-    && isLocalUrl(normalizedUrl)
-    && process.env.NODE_ENV !== 'development'
+    isLocalUrl(normalizedUrl)
     && process.env.ALLOW_LOCAL_FRONTEND_URL !== 'true'
   ) {
-    console.warn(`[Email] Ignoring local FRONTEND_URL for email links: ${normalizedUrl}`);
+    console.warn(`[Email] Ignoring local frontend URL for auth email links: ${normalizedUrl}`);
     return DEFAULT_PRODUCTION_FRONTEND_URL;
   }
 
   return normalizedUrl;
+}
+
+function normalizeAuthActionLink(actionLink) {
+  const frontendUrl = getFrontendUrl();
+
+  try {
+    const linkUrl = new URL(actionLink);
+    const appUrl = new URL(frontendUrl);
+
+    if (isLocalUrl(linkUrl.href) && process.env.ALLOW_LOCAL_FRONTEND_URL !== 'true') {
+      linkUrl.protocol = appUrl.protocol;
+      linkUrl.host = appUrl.host;
+      linkUrl.username = '';
+      linkUrl.password = '';
+    }
+
+    const continueUrl = linkUrl.searchParams.get('continueUrl');
+    if (!continueUrl || isLocalUrl(continueUrl)) {
+      linkUrl.searchParams.set('continueUrl', frontendUrl);
+    }
+
+    return linkUrl.toString();
+  } catch (error) {
+    console.warn('[Email] Could not normalize Firebase auth action link:', getSafeErrorMessage(error));
+    return actionLink;
+  }
 }
 
 function getMailFrom() {
@@ -586,9 +610,9 @@ app.post("/api/register-user", async (req, res) => {
     console.log("✅ Firebase Auth user created:", userRecord.uid);
 
     // 2. Email verifikációs link generálása
-    const verificationLink = await admin.auth().generateEmailVerificationLink(email, {
+    const verificationLink = normalizeAuthActionLink(await admin.auth().generateEmailVerificationLink(email, {
       url: getFrontendUrl(),
-    });
+    }));
 
     console.log("📧 Email verification link generated");
 
@@ -1682,9 +1706,9 @@ app.post('/api/forgot-password', async (req, res) => {
     }
 
     // 2. Firebase generálja a reset linket (automatikusan kezeli a tokent)
-    const resetLink = await admin.auth().generatePasswordResetLink(email, {
+    const resetLink = normalizeAuthActionLink(await admin.auth().generatePasswordResetLink(email, {
       url: getFrontendUrl(),
-    });
+    }));
 
     // 3. Küldd ki az emailt a konfigurált email providerrel
     await withTimeout(
