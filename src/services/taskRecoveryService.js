@@ -6,10 +6,9 @@
 // This runs independently of webhooks (which may not be reachable on localhost).
 // When a task is created, its ID is registered here. A periodic poller checks
 // each registered task. On success, the model is saved to trellis_history.
-// On failure, credits are refunded.
+// Recovery never refunds credits because it cannot prove provider-side billing.
 
 import { getTripoClient } from "../lib/tripoClient.js";
-import { findDebitTransactionForTask, refundCredits } from "./creditService.js";
 import admin from "firebase-admin";
 import { extractModelUrl } from "../utils/tripoUtils.js";
 import { isFailedLikeTripoTaskStatus, normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
@@ -17,7 +16,7 @@ import { TASK_TYPE_TO_MODE, HISTORY_TTL_MS } from "../config/tripo.config.js";
 
 // Task types that are expected to produce a downloadable model URL on success.
 // If Tripo reports success but no URL is found, treat it as a billable failure
-// (credit was already debited — refund and mark failed).
+// (credit was already debited, so recovery marks failed without refunding).
 const MODEL_PRODUCING_TYPES = new Set([
   "text_to_model",
   "image_to_model",
@@ -39,11 +38,137 @@ const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
 const POLL_INTERVAL_MS = 5_000; // check every 5 seconds
 const MAX_POLL_MS = 600_000; // 10 minutes max per task
 const CLEANUP_INTERVAL_MS = 60_000; // cleanup completed tasks every minute
+const MAX_CONSECUTIVE_ERRORS = Math.max(1, Number(process.env.TRIPO_RECOVERY_MAX_CONSECUTIVE_ERRORS || 20));
+const GLOBAL_OUTAGE_ERROR_STREAK = Math.max(1, Number(process.env.TRIPO_RECOVERY_GLOBAL_OUTAGE_STREAK || 5));
+const HEALTH_CHECK_COOLDOWN_MS = Math.max(5_000, Number(process.env.TRIPO_RECOVERY_HEALTH_COOLDOWN_MS || 30_000));
 
 
 /** @type {Map<string, { taskId: string, userId: string, type: string, modelVersion: string, texture: boolean, pbr: boolean, startedAt: number }>} */
 const pendingTasks = new Map();
 const recentTaskMeta = new Map();
+/** @type {Map<string, { consecutiveErrors: number, lastError: string | null, lastErrorAt: number | null, lastSuccessAt: number | null }>} */
+const taskRecoveryStats = new Map();
+let consecutiveGlobalPollErrors = 0;
+let tripoUnavailableUntil = 0;
+let tripoHealthLastError = null;
+let tripoHealthLastLogAt = 0;
+
+function getTaskRecoveryStats(taskId) {
+  if (!taskRecoveryStats.has(taskId)) {
+    taskRecoveryStats.set(taskId, {
+      consecutiveErrors: 0,
+      lastError: null,
+      lastErrorAt: null,
+      lastSuccessAt: null,
+    });
+  }
+  return taskRecoveryStats.get(taskId);
+}
+
+function clearTaskRecoveryStats(taskId) {
+  taskRecoveryStats.delete(taskId);
+}
+
+function noteTaskPollSuccess(taskId) {
+  const stats = getTaskRecoveryStats(taskId);
+  stats.consecutiveErrors = 0;
+  stats.lastError = null;
+  stats.lastErrorAt = null;
+  stats.lastSuccessAt = Date.now();
+  consecutiveGlobalPollErrors = 0;
+  tripoHealthLastError = null;
+}
+
+function noteTaskPollError(taskId, err) {
+  const stats = getTaskRecoveryStats(taskId);
+  stats.consecutiveErrors += 1;
+  stats.lastError = err?.message ?? "unknown_error";
+  stats.lastErrorAt = Date.now();
+  consecutiveGlobalPollErrors += 1;
+  return stats;
+}
+
+async function applyTripoHealthGuard(triggerErr = null) {
+  const now = Date.now();
+  if (now < tripoUnavailableUntil) return false;
+
+  try {
+    await getTripoClient().getBalance();
+    consecutiveGlobalPollErrors = 0;
+    tripoHealthLastError = null;
+    tripoUnavailableUntil = 0;
+    console.log("[TaskRecovery] Tripo health check OK (balance endpoint reachable)");
+    return true;
+  } catch (err) {
+    tripoUnavailableUntil = now + HEALTH_CHECK_COOLDOWN_MS;
+    tripoHealthLastError = err?.message ?? triggerErr?.message ?? "health_check_failed";
+    tripoHealthLastLogAt = 0;
+    console.warn(
+      `[TaskRecovery] Tripo health check failed, pausing recovery polling for ${Math.round(HEALTH_CHECK_COOLDOWN_MS / 1000)}s: ${tripoHealthLastError}`,
+    );
+    return false;
+  }
+}
+
+function toMillis(value) {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.getTime();
+  if (typeof value?.toMillis === "function") {
+    const millis = value.toMillis();
+    return Number.isFinite(millis) ? millis : null;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+async function markHistoryTaskFailed(entry, {
+  failReason,
+  taskStatus = null,
+  errorMessage = null,
+  errorCode = null,
+} = {}) {
+  if (!entry?.taskId || !entry?.userId) return false;
+
+  const patch = {
+    status: "failed",
+    failReason: failReason || "recovery_failed",
+    recoveryStoppedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    ...(taskStatus != null && { taskStatus }),
+    ...(errorMessage != null && { recoveryError: errorMessage }),
+    ...(errorCode != null && { recoveryErrorCode: errorCode }),
+  };
+
+  try {
+    const db = admin.firestore();
+    const snap = await db.collection(HISTORY_COLLECTION)
+      .where("taskId", "==", entry.taskId)
+      .where("userId", "==", entry.userId)
+      .limit(25)
+      .get();
+
+    if (snap.empty) {
+      await db.collection(HISTORY_COLLECTION).doc(`tripo_${entry.taskId}`).set({
+        userId: entry.userId,
+        taskId: entry.taskId,
+        source: entry.type === "import_model" ? "upload" : "tripo",
+        mode: TASK_TYPE_TO_MODE[entry.type] ?? "generate",
+        ...patch,
+      }, { merge: true });
+      return true;
+    }
+
+    await Promise.all(snap.docs.map((doc) => doc.ref.set(patch, { merge: true })));
+    return true;
+  } catch (err) {
+    console.error(`[TaskRecovery] Failed to mark history as failed for task ${entry.taskId}:`, err.message);
+    return false;
+  }
+}
 
 
 /* ─── Register a task for background tracking ─────────────────────────── */
@@ -82,6 +207,7 @@ async function restorePendingHistoryTasks() {
       {
         texture: data?.params?.texture === true,
         pbr: data?.params?.pbr === true,
+        startedAt: toMillis(data.ts) ?? toMillis(data.createdAt) ?? Date.now(),
       },
     );
     restored += 1;
@@ -102,10 +228,11 @@ export function registerTask(taskId, userId, type, modelVersion, prompt = null, 
     prompt,
     texture: extra.texture === true,
     pbr: extra.pbr === true,
-    startedAt: Date.now(),
+    startedAt: toMillis(extra.startedAt) ?? Date.now(),
   };
   pendingTasks.set(taskId, meta);
   recentTaskMeta.set(taskId, meta);
+  getTaskRecoveryStats(taskId);
   console.log(`[TaskRecovery] Registered task ${taskId} for user ${userId}${prompt ? ` (${prompt})` : ''}`);
 }
 
@@ -159,6 +286,7 @@ export async function persistPendingRecoveryTask({
 /* ─── Unregister a task (called when frontend successfully polls it) ──── */
 export function unregisterTask(taskId) {
   pendingTasks.delete(taskId);
+  clearTaskRecoveryStats(taskId);
 }
 
 /* ─── Start the background poller ─────────────────────────────────────── */
@@ -177,41 +305,92 @@ export function startTaskRecovery() {
     if (pendingTasks.size === 0) return;
 
     const now = Date.now();
+    if (now < tripoUnavailableUntil) {
+      if (now - tripoHealthLastLogAt > 10_000) {
+        const waitSec = Math.max(1, Math.ceil((tripoUnavailableUntil - now) / 1000));
+        console.warn(
+          `[TaskRecovery] Skipping poll cycle while Tripo is marked unavailable (${waitSec}s left). lastError=${tripoHealthLastError ?? "unknown"}`,
+        );
+        tripoHealthLastLogAt = now;
+      }
+      return;
+    }
+
     const toPoll = [...pendingTasks.values()];
 
     for (const entry of toPoll) {
       // Timeout check
       if (now - entry.startedAt > MAX_POLL_MS) {
         console.log(`[TaskRecovery] Task ${entry.taskId} timed out after ${MAX_POLL_MS / 1000}s`);
+        const markedFailed = await markHistoryTaskFailed(entry, {
+          failReason: "stale_recovery_timeout",
+          taskStatus: "recovery_timeout",
+          errorMessage: `No terminal Tripo status within ${MAX_POLL_MS / 1000}s`,
+        });
+        if (!markedFailed) continue;
         pendingTasks.delete(entry.taskId);
+        clearTaskRecoveryStats(entry.taskId);
         continue;
       }
 
       try {
         const taskData = await getTripoClient().getTask(entry.taskId);
+        noteTaskPollSuccess(entry.taskId);
         const status = normalizeTripoTaskStatus(taskData.status);
 
         if (status === "success") {
-          await saveToHistory(entry, taskData);
+          const saved = await saveToHistory(entry, taskData);
+          if (saved === false) continue;
           pendingTasks.delete(entry.taskId);
+          clearTaskRecoveryStats(entry.taskId);
         } else if (isFailedLikeTripoTaskStatus(taskData.status)) {
-          await handleFailedTask(entry, taskData);
+          const markedFailed = await handleFailedTask(entry, taskData);
+          if (!markedFailed) continue;
           pendingTasks.delete(entry.taskId);
+          clearTaskRecoveryStats(entry.taskId);
           // "queued" or "running" — keep polling
         }
       } catch (err) {
+        const erroredStats = noteTaskPollError(entry.taskId, err);
         console.error(`[TaskRecovery] Poll error for task ${entry.taskId}:`, err.message);
+
+        if (erroredStats.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          console.warn(
+            `[TaskRecovery] Task ${entry.taskId} exceeded max consecutive poll errors (${MAX_CONSECUTIVE_ERRORS}). Marking failed.`,
+          );
+          const markedFailed = await handleFailedTask(entry, {
+            status: "recovery_poll_error_exhausted",
+            error_message: err.message,
+            rawOutput: null,
+          });
+          if (!markedFailed) continue;
+          pendingTasks.delete(entry.taskId);
+          clearTaskRecoveryStats(entry.taskId);
+          continue;
+        }
+
+        if (consecutiveGlobalPollErrors >= GLOBAL_OUTAGE_ERROR_STREAK) {
+          const healthy = await applyTripoHealthGuard(err);
+          if (!healthy) break;
+        }
       }
     }
   }, POLL_INTERVAL_MS);
 
   // Cleanup old entries periodically
-  cleanupInterval = setInterval(() => {
+  cleanupInterval = setInterval(async () => {
     const now = Date.now();
     for (const [taskId, entry] of pendingTasks) {
       if (now - entry.startedAt > MAX_POLL_MS) {
         console.log(`[TaskRecovery] Cleaning up timed-out task ${taskId}`);
+        const markedFailed = await markHistoryTaskFailed(entry, {
+          failReason: "stale_recovery_timeout",
+          taskStatus: "recovery_timeout",
+          errorMessage: `No terminal Tripo status within ${MAX_POLL_MS / 1000}s`,
+        });
+        if (!markedFailed) continue;
         pendingTasks.delete(taskId);
+        clearTaskRecoveryStats(taskId);
       }
     }
     for (const [taskId, entry] of recentTaskMeta) {
@@ -232,6 +411,11 @@ export function stopTaskRecovery() {
     clearInterval(cleanupInterval);
     cleanupInterval = null;
   }
+  taskRecoveryStats.clear();
+  consecutiveGlobalPollErrors = 0;
+  tripoUnavailableUntil = 0;
+  tripoHealthLastError = null;
+  tripoHealthLastLogAt = 0;
   console.log("[TaskRecovery] Background task recovery stopped");
 }
 
@@ -243,7 +427,7 @@ async function saveToHistory(entry, taskData) {
   // prerigcheck only returns is_animatable — no model to save
   if (entry.type === "animate_prerigcheck") {
     console.log(`[TaskRecovery] prerigcheck task ${entry.taskId} completed (is_animatable=${out.is_animatable}) — no model to save`);
-    return;
+    return true;
   }
 
   const animatedModels = Array.isArray(out.animated_models) && out.animated_models.length > 0
@@ -272,35 +456,17 @@ async function saveToHistory(entry, taskData) {
     console.warn(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) succeeded but no model URL found in output:`, JSON.stringify(out));
 
     // For task types that should always produce a model URL, a missing URL at
-    // "success" means delivery failed. Refund the credit and mark the history
-    // doc as failed so the user can see what happened.
+    // "success" means delivery failed. Recovery records the failure only.
     if (MODEL_PRODUCING_TYPES.has(entry.type)) {
-      // Mark the pending history doc as failed (best-effort).
-      const failSnap = await db.collection(HISTORY_COLLECTION)
-        .where("taskId", "==", entry.taskId)
-        .where("userId", "==", entry.userId)
-        .limit(1)
-        .get();
-      if (!failSnap.empty) {
-        await failSnap.docs[0].ref.set(
-          { status: "failed", failReason: "success_no_output" },
-          { merge: true },
-        );
-      }
-      // Issue refund.
-      const debit = await findDebitTransactionForTask(entry.taskId, entry.userId);
-      if (debit) {
-        try {
-          await refundCredits(entry.userId, debit.data.amount, entry.taskId, "recovery_success_no_output");
-          console.log(`[TaskRecovery] Refunded ${debit.data.amount} credits for task ${entry.taskId} (success but no model URL)`);
-        } catch (refundErr) {
-          console.error(`[TaskRecovery] Refund failed for task ${entry.taskId}:`, refundErr.message);
-        }
-      } else {
-        console.warn(`[TaskRecovery] No debit found to refund for task ${entry.taskId}`);
-      }
+      const markedFailed = await markHistoryTaskFailed(entry, {
+        failReason: "success_no_output",
+        taskStatus: "success",
+        errorMessage: "Tripo returned success without a downloadable model URL",
+      });
+      if (!markedFailed) return false;
+      console.log(`[TaskRecovery] Refund skipped for task ${entry.taskId}: recovery cannot verify provider-side credit consumption`);
     }
-    return;
+    return true;
   }
 
   // Reuse pending history rows when they already exist for this task
@@ -357,9 +523,10 @@ async function saveToHistory(entry, taskData) {
     }, { merge: true });
   }
   console.log(`[TaskRecovery] Saved ${urlsToSave.length} model(s) for task ${entry.taskId} to history for user ${entry.userId}`);
+  return true;
 }
 
-/* ─── Handle failed/cancelled task — refund credits ───────────────────── */
+/* ─── Handle failed/cancelled task — record failure only ──────────────── */
 async function handleFailedTask(entry, taskData) {
   const taskId = entry.taskId;
   const userId = entry.userId;
@@ -384,26 +551,15 @@ async function handleFailedTask(entry, taskData) {
     null;
   console.error(`[TaskRecovery] Task ${taskId} (${entry.type}) failed. error=${taskError ?? "unknown"} code=${taskErrorCode ?? "unknown"} rawOutput:`, JSON.stringify(taskData.rawOutput ?? taskData.output ?? {}));
 
-  const debit = await findDebitTransactionForTask(taskId, userId);
-  if (!debit) {
-    console.log(`[TaskRecovery] No debit transaction found for failed task ${taskId}`);
-    return;
-  }
-  const data = debit.data;
-
-  // Check for NSFW/content policy — no refund
-  const errorMsg = String(taskError ?? "").toLowerCase();
-  if (errorMsg.includes("nsfw") || errorMsg.includes("content policy") || errorMsg.includes("safety") || errorMsg.includes("moderat")) {
-    console.log(`[TaskRecovery] No refund for task ${taskId}: NSFW/content policy violation`);
-    return;
-  }
-
-  try {
-    await refundCredits(userId, data.amount, taskId, `recovery_${taskData.status}`);
-    console.log(`[TaskRecovery] Refunded ${data.amount} credits for failed task ${taskId}`);
-  } catch (err) {
-    console.error(`[TaskRecovery] Refund failed for task ${taskId}:`, err.message);
-  }
+  const markedFailed = await markHistoryTaskFailed(entry, {
+    failReason: taskError || taskData.status || "unknown_failure",
+    taskStatus: taskData.status ?? null,
+    errorMessage: taskError,
+    errorCode: taskErrorCode,
+  });
+  if (!markedFailed) return false;
+  console.log(`[TaskRecovery] Refund skipped for task ${taskId}: recovery cannot verify provider-side credit consumption`);
+  return true;
 }
 
 /* ─── Get pending task count (for debugging) ──────────────────────────── */

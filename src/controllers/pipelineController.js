@@ -24,7 +24,7 @@ export async function generateCharacter(req, res) {
   });
 
   // Fire-and-forget
-  pipelineService.generateCharacter({ ...body, pipelineId }).then(result => {
+  pipelineService.generateCharacter({ ...body, pipelineId, userId: req.user?.uid }).then(result => {
     console.log(`[Pipeline ${result.pipelineId}] final status=${result.status}`);
   }).catch(err => {
     console.error("[pipelineController] generateCharacter error:", err.message);
@@ -92,6 +92,7 @@ export async function generateLod(req, res) {
       source_task_id,
       levels ?? LOD_PRESETS.map(l => ({ label: l.label, face_limit: l.face_limit })),
       export_zip ?? false,
+      req.user?.uid,
     );
     res.json({ success: true, ...result });
   } catch (err) {

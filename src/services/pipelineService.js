@@ -146,7 +146,7 @@ class PipelineService {
       analyticsService.recordTaskError(pipelineId, "text_to_model", err.message);
       console.error(`[Pipeline ${pipelineId}] failed:`, err.message);
 
-      // Persist failure so boot-time recovery doesn't try to refund again
+      // Persist failure so boot-time recovery does not revisit it.
       await finishPipeline(pipelineId, { status: "failed", error: err.message });
 
       return result;
@@ -164,7 +164,7 @@ class PipelineService {
       reservation = billedTask.reservation;
       step.taskId  = taskId;
 
-      // Persist step start (includes taskId so crash recovery can refund it)
+      // Persist step start so crash recovery can mark stale pipelines accurately.
       await updatePipeline(result.pipelineId, { steps: result.steps }).catch(() => {});
 
       const poll = await client.pollTask(taskId, {

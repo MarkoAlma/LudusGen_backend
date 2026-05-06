@@ -1,21 +1,20 @@
 // src/services/pipelineRecoveryService.js
 //
 // Persists pipeline state to Firestore so that server restarts don't silently
-// lose in-progress pipelines and leave users' credits unreturned.
+// lose in-progress pipelines.
 //
 // Lifecycle:
 //   1. startPipeline()   — creates a "running" doc in Firestore
 //   2. updatePipeline()  — updates step list + status during execution
 //   3. On server boot:   recoverStalePipelines() marks any "running" docs
-//      as "failed" and refunds each step's debited credits.
+//      as "failed". Recovery does not refund credits.
 
 import admin from "firebase-admin";
-import { findDebitTransactionForTask, refundCredits } from "./creditService.js";
 
 const PIPELINE_COLLECTION = "tripo_pipelines";
 
 // How long before a "running" pipeline is considered stale on boot (15 min).
-// Pipelines that finish in < 15 min won't be wrongly refunded.
+// Pipelines that finish in < 15 min won't be wrongly marked failed.
 const STALE_THRESHOLD_MS = 15 * 60 * 1000;
 
 // ─── Write helpers ────────────────────────────────────────────────────────────
@@ -84,14 +83,12 @@ export async function recoverStalePipelines() {
 
   if (snap.empty) return;
 
-  console.log(`[PipelineRecovery] Found ${snap.size} stale pipeline(s) — marking failed and refunding`);
+  console.log(`[PipelineRecovery] Found ${snap.size} stale pipeline(s) - marking failed without refunding`);
 
   for (const doc of snap.docs) {
     const data = doc.data();
     const pipelineId = data.pipelineId;
-    const userId = data.userId;
 
-    // Mark failed
     try {
       await doc.ref.update({
         status: "failed",
@@ -99,23 +96,9 @@ export async function recoverStalePipelines() {
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
+      console.log(`[PipelineRecovery] Refund skipped for crashed pipeline ${pipelineId}: recovery cannot verify provider-side credit consumption`);
     } catch (err) {
       console.warn(`[PipelineRecovery] Failed to mark pipeline ${pipelineId} as failed:`, err.message);
-    }
-
-    // Refund every step that has a taskId
-    const steps = Array.isArray(data.steps) ? data.steps : [];
-    for (const step of steps) {
-      if (!step.taskId) continue;
-      try {
-        const debit = await findDebitTransactionForTask(step.taskId, userId);
-        if (debit) {
-          await refundCredits(userId, debit.data.amount, step.taskId, `pipeline_crash_${step.type}`);
-          console.log(`[PipelineRecovery] Refunded ${debit.data.amount} credits for step ${step.type} (task ${step.taskId}) in crashed pipeline ${pipelineId}`);
-        }
-      } catch (err) {
-        console.error(`[PipelineRecovery] Refund failed for step ${step.type} task ${step.taskId}:`, err.message);
-      }
     }
   }
 }

@@ -34,6 +34,10 @@ app.use("/api/tripo/webhook", express.raw({
   type: "application/json",
   verify: (req, _res, buf) => { req.rawBody = buf; }
 }));
+app.use("/api/sprite/webhook", express.raw({
+  type: "application/json",
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
 
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/api', aiRoutes);     // Add routes after middlewares
