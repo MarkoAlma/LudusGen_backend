@@ -302,6 +302,40 @@ export class TripoClient {
     };
   }
 
+  async uploadFileObjectFromPath(filePath, filename, mimeType, format) {
+    const uploadFormat = format ?? formatFromFilename(filename);
+    if (!uploadFormat) throw new Error("Cannot determine Tripo upload format");
+    const sts = await this.getUploadStsToken(uploadFormat);
+    const region = inferS3Region(sts.s3_host);
+    const endpoint = sts.s3_host ? `https://${sts.s3_host}` : undefined;
+    const s3 = new S3Client({
+      region,
+      ...(endpoint && { endpoint }),
+      credentials: {
+        accessKeyId: sts.sts_ak,
+        secretAccessKey: sts.sts_sk,
+        sessionToken: sts.session_token,
+      },
+    });
+
+    const fs = await import("node:fs");
+    const fileStream = fs.createReadStream(filePath);
+
+    await s3.send(new PutObjectCommand({
+      Bucket: sts.resource_bucket,
+      Key: sts.resource_uri,
+      Body: fileStream,
+      ContentType: mimeType || contentTypeForFormat(uploadFormat),
+    }));
+
+    return {
+      bucket: sts.resource_bucket,
+      key: sts.resource_uri,
+      format: uploadFormat,
+      s3Host: sts.s3_host,
+    };
+  }
+
   async createPresignedUploadTarget({ filename, mimeType, format, expiresIn = 900 } = {}) {
     const uploadFormat = format ?? formatFromFilename(filename);
     if (!uploadFormat) throw new Error("Cannot determine Tripo upload format");

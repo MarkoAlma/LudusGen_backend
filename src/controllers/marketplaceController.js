@@ -59,8 +59,8 @@ const DEFAULT_CONTENT_TYPES = {
 
 function normalizeAssetType(value) {
   const type = String(value || "").trim().toLowerCase();
-  if (["image", "images", "kep", "kepek"].includes(type)) return "image";
-  if (["audio", "sound", "hang", "music"].includes(type)) return "audio";
+  if (["image", "images", "asset", "assets"].includes(type)) return "image";
+  if (["audio", "sound", "voice", "music"].includes(type)) return "audio";
   if (["3d", "model", "models", "model3d"].includes(type)) return "3d";
   return "";
 }
@@ -523,8 +523,8 @@ async function createImageThumb(buffer, userId, sourceName) {
 async function startTripoImportForUpload(file, userId) {
   const ext = getExt(file.originalname);
   try {
-    const uploadedObject = await getTripoClient().uploadFileObject(
-      file.buffer,
+    const uploadedObject = await getTripoClient().uploadFileObjectFromPath(
+      file.path,
       file.originalname,
       file.mimetype || contentTypeFor(ext),
       ext,
@@ -548,7 +548,7 @@ async function startTripoImportForUpload(file, userId) {
       compatible: false,
       importStatus: "pending",
       importTaskId: taskId,
-      message: "Tripo import ellenorzes elindult",
+      message: "Tripo import verification started",
     };
   } catch (err) {
     return {
@@ -601,7 +601,7 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
   const snap = await ref.get();
 
   if (!snap.exists) {
-    throw Object.assign(new Error("Forras elem nem talalhato"), { status: 404 });
+    throw Object.assign(new Error("Source item not found"), { status: 404 });
   }
 
   const data = snap.data();
@@ -860,18 +860,18 @@ export async function getMarketplaceAsset(req, res) {
     const ownedIds = await getOwnedAssetIds(viewerId);
     const ref = admin.firestore().collection(MARKETPLACE_COLLECTIONS.assets).doc(req.params.id);
     const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Asset not found" });
 
     let data = snap.data();
     if (data.status !== "published") {
-      if (!viewerId) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
+      if (!viewerId) return res.status(404).json({ success: false, message: "Asset not found" });
       const isOwner = data.ownerId === viewerId;
       const purchase = !isOwner ? await getVerifiedMarketplacePurchase(admin.firestore(), {
         buyerId: viewerId,
         assetId: req.params.id,
         asset: data,
       }) : null;
-      if (!isOwner && !purchase) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
+      if (!isOwner && !purchase) return res.status(404).json({ success: false, message: "Asset not found" });
     }
 
     data = await ensureImageMetadata(ref, data);
@@ -892,10 +892,15 @@ export async function getMarketplaceAsset(req, res) {
 }
 
 export async function uploadMarketplaceAsset(req, res) {
+  const fs = await import("node:fs/promises");
+  let filePath = null;
+
   try {
     const userId = req.user?.uid || req.userId;
     const file = req.file;
     if (!file) return res.status(400).json({ success: false, message: "Missing file" });
+
+    filePath = file.path;
 
     const assetType = normalizeAssetType(req.body.assetType) || inferAssetType(file);
     const config = TYPE_CONFIG[assetType];
@@ -909,19 +914,27 @@ export async function uploadMarketplaceAsset(req, res) {
 
     const storageKey = keyFor(userId, assetType, file.originalname, "uploads");
     const contentType = file.mimetype || contentTypeFor(ext);
-    await storageService.uploadFile(file.buffer, storageKey, contentType);
+    
+    // Stream directly from disk to S3
+    await storageService.uploadFileFromPath(filePath, storageKey, contentType);
 
     let thumbKey = null;
     let metadata = null;
     let preview = null;
+    
     if (assetType === "image") {
-      metadata = await getImageMetadata(file.buffer);
-      thumbKey = await createImageThumb(file.buffer, userId, file.originalname);
+      // For images, we can load them into memory since they are max 50MB
+      const buffer = await fs.readFile(filePath);
+      metadata = await getImageMetadata(buffer);
+      thumbKey = await createImageThumb(buffer, userId, file.originalname);
     } else if (assetType === "audio") {
-      preview = await createWatermarkedAudioPreview(file.buffer, userId, file.originalname);
+      // Audio is max 100MB, acceptable for short-lived buffer or ffmpeg
+      const buffer = await fs.readFile(filePath);
+      preview = await createWatermarkedAudioPreview(buffer, userId, file.originalname);
       thumbKey = preview.key;
     }
 
+    // 3D files can be up to 250MB, so we pass the file path stream to Tripo
     const tripo = assetType === "3d"
       ? await startTripoImportForUpload(file, userId)
       : { compatible: false, importStatus: "not_applicable" };
@@ -945,6 +958,11 @@ export async function uploadMarketplaceAsset(req, res) {
   } catch (err) {
     console.error("[Marketplace] upload error:", err);
     res.status(500).json({ success: false, message: err.message || "Upload failed" });
+  } finally {
+    if (filePath) {
+      const fs = await import("node:fs/promises");
+      await fs.unlink(filePath).catch(() => {});
+    }
   }
 }
 
@@ -1007,7 +1025,7 @@ export async function createMarketplaceAsset(req, res) {
     const asset = {
       ownerId: userId,
       ownerEmail: req.userEmail || req.user?.email || userData.email || "",
-      ownerName: userData.displayName || userData.name || req.user?.email || "LudusGen alkoto",
+      ownerName: userData.displayName || userData.name || req.user?.email || "LudusGen creator",
       ownerAvatar: userData.profilePicture || "",
       title,
       description,
@@ -1062,7 +1080,7 @@ export async function updateMarketplaceAsset(req, res) {
     const userId = req.user?.uid || req.userId;
     const ref = admin.firestore().collection(MARKETPLACE_COLLECTIONS.assets).doc(req.params.id);
     const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Asset not found" });
     const data = snap.data();
     if (data.ownerId !== userId) return res.status(403).json({ success: false, message: "Only the uploader can edit this asset" });
 
@@ -1097,7 +1115,7 @@ export async function deleteMarketplaceAsset(req, res) {
     const userId = req.user?.uid || req.userId;
     const ref = admin.firestore().collection(MARKETPLACE_COLLECTIONS.assets).doc(req.params.id);
     const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ success: false, message: "Asset nem talalhato" });
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Asset not found" });
 
     const data = snap.data();
     if (data.ownerId !== userId) {
@@ -1114,7 +1132,7 @@ export async function deleteMarketplaceAsset(req, res) {
     res.json({
       success: true,
       id: req.params.id,
-      message: "Asset torolve a marketplace listarol",
+      message: "Asset removed from marketplace list",
     });
   } catch (err) {
     console.error("[Marketplace] delete error:", err);
@@ -1154,7 +1172,7 @@ export async function downloadMarketplaceAsset(req, res) {
         assetId: req.params.id,
         asset,
       });
-      if (!purchase) return res.status(403).json({ success: false, message: "Elobb meg kell vasarolnod az assetet" });
+      if (!purchase) return res.status(403).json({ success: false, message: "You must purchase the asset first" });
     }
 
     const key = asset.storage?.key || asset.storageKey;

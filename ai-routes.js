@@ -188,6 +188,7 @@ const deapiImageUpload = multer({
 const MINIMAX_MUSIC_SAMPLE_RATES = [16000, 24000, 32000, 44100];
 const MINIMAX_MUSIC_BITRATES = [32000, 64000, 128000, 256000];
 const MINIMAX_MUSIC_FORMATS = ['mp3', 'wav', 'pcm'];
+const DEAPI_MUSIC_FORMATS = ['mp3', 'wav', 'flac'];
 
 dotenv.config();
 
@@ -207,10 +208,12 @@ router.post('/cancel-job', verifyFirebaseToken, (req, res) => {
     if (!jobId) return res.status(400).json({ success: false, message: 'Hiányzó jobId' });
     const job = activeJobs.get(jobId);
     if (job) {
+        if (!job.userId || job.userId !== req.userId) {
+            return res.status(403).json({ success: false, message: 'Nincs jogosultsag a folyamat megszakitasahoz' });
+        }
         console.log(`[Cancel] User requested cancellation for job: ${jobId}`);
         job.controller.abort();
-        clearTimeout(job.timeoutId);
-        activeJobs.delete(jobId);
+        unregisterJob(jobId);
         return res.json({ success: true, message: 'Folyamat megszakítva' });
     }
     return res.status(404).json({ success: false, message: 'Folyamat nem található vagy már véget ért' });
@@ -369,6 +372,69 @@ function dataUrlToGeminiInlineData(dataUrl) {
     };
 }
 
+const CHAT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const CHAT_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const CHAT_IMAGE_SHARP_FORMATS = new Set(['jpeg', 'png', 'webp', 'gif']);
+
+function parseChatImageDataUrl(dataUrl, { maxBytes = CHAT_IMAGE_MAX_BYTES } = {}) {
+    if (typeof dataUrl !== 'string') return { ok: false, message: 'Ervenytelen kep adat' };
+
+    const match = dataUrl.match(/^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+    if (!match) return { ok: false, message: 'Ervenytelen kep data URL' };
+
+    const mimeType = match[1].toLowerCase();
+    if (!CHAT_IMAGE_MIME_TYPES.has(mimeType)) {
+        return { ok: false, message: 'Csak JPG, PNG, WebP vagy GIF kep csatolhato' };
+    }
+
+    const base64 = match[2].replace(/\s+/g, '');
+    const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+    const estimatedBytes = Math.floor((base64.length * 3) / 4) - padding;
+    if (!base64 || estimatedBytes <= 0) return { ok: false, message: 'Ures kep csatolmany' };
+    if (estimatedBytes > maxBytes) {
+        return { ok: false, message: `A kep merete legfeljebb ${Math.round(maxBytes / 1024 / 1024)} MB lehet` };
+    }
+
+    const buffer = Buffer.from(base64, 'base64');
+    if (!buffer.length) return { ok: false, message: 'A kep nem dekodolhato' };
+    if (buffer.length > maxBytes) {
+        return { ok: false, message: `A kep merete legfeljebb ${Math.round(maxBytes / 1024 / 1024)} MB lehet` };
+    }
+
+    return {
+        ok: true,
+        mimeType,
+        base64,
+        buffer,
+        dataUrl: `data:${mimeType};base64,${base64}`,
+    };
+}
+
+async function validateChatAttachedImage(dataUrl) {
+    const parsed = parseChatImageDataUrl(dataUrl);
+    if (!parsed.ok) return parsed;
+
+    try {
+        const metadata = await sharp(parsed.buffer).metadata();
+        if (!CHAT_IMAGE_SHARP_FORMATS.has(String(metadata.format || '').toLowerCase())) {
+            return { ok: false, message: 'A kep fajlformatuma nem tamogatott' };
+        }
+        if (!metadata.width || !metadata.height) {
+            return { ok: false, message: 'A kep merete nem olvashato' };
+        }
+        return {
+            ok: true,
+            dataUrl: parsed.dataUrl,
+            mimeType: parsed.mimeType,
+            width: metadata.width,
+            height: metadata.height,
+            bytes: parsed.buffer.length,
+        };
+    } catch {
+        return { ok: false, message: 'A csatolt kep nem ervenyes kepfajl' };
+    }
+}
+
 function toGeminiParts(content) {
     if (!Array.isArray(content)) {
         return [{ text: String(content) }];
@@ -435,6 +501,131 @@ function getModelConfig(modelId) {
         'google-gemma-3-27b-it': { apiModel: 'google/gemma-3-27b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
     };
     return MODEL_MAP[modelId] || null;
+}
+
+const IMAGE_MODEL_REGISTRY = Object.freeze({
+    'cf-sdxl': { id: 'cf-sdxl', provider: 'cloudflare', apiId: '@cf/stabilityai/stable-diffusion-xl-base-1.0' },
+    'nvidia-sd3-medium': { id: 'nvidia-sd3-medium', provider: 'nvidia-image', apiId: 'stabilityai/stable-diffusion-3-medium' },
+    'nvidia-flux-dev': { id: 'nvidia-flux-dev', provider: 'nvidia-image', apiId: 'black-forest-labs/flux.1-dev' },
+    'z-image-turbo': { id: 'z-image-turbo', provider: 'modelscope', apiId: 'Tongyi-MAI/Z-Image-Turbo' },
+    'qwen-image-2512': { id: 'qwen-image-2512', provider: 'modelscope', apiId: 'Qwen/Qwen-Image-2512' },
+    'flux2-klein-base-9B': { id: 'flux2-klein-base-9B', provider: 'modelscope', apiId: 'flux-community/FLUX.2-klein-base-9B' },
+    'sd3-medium': { id: 'sd3-medium', provider: 'modelscope', apiId: 'MusePublic/stable-diffusion-3-medium' },
+    'qwen-image-edit': { id: 'qwen-image-edit', provider: 'modelscope', apiId: 'Qwen/Qwen-Image-Edit-2511', needsInputImage: true },
+    'flux-1-edit': { id: 'flux-1-edit', provider: 'modelscope', apiId: 'MusePublic/FLUX.1-Kontext-Dev', needsInputImage: true },
+});
+
+const TTS_MODEL_REGISTRY = Object.freeze({
+    nvidia_magpie_tts: {
+        id: 'nvidia_magpie_tts',
+        provider: 'nvidia-riva',
+        apiModel: 'magpie-tts-multilingual',
+        voices: [
+            'Magpie-Multilingual.EN-US.Aria',
+            'Magpie-Multilingual.EN-US.Mia',
+            'Magpie-Multilingual.EN-US.James',
+            'Magpie-Multilingual.DE-DE.Karl',
+            'Magpie-Multilingual.ES-ES.Alba',
+            'Magpie-Multilingual.FR-FR.Lea',
+            'Magpie-Multilingual.ZH-CN.Mei',
+        ],
+        languages: ['en-US', 'de-DE', 'es-ES', 'fr-FR', 'zh-CN', 'ja-JP'],
+    },
+    deapi_kokoro_tts: {
+        id: 'deapi_kokoro_tts',
+        provider: 'deapi',
+        apiId: 'txt2audio',
+        apiModel: 'Kokoro',
+        allowedDeapiModels: ['Kokoro'],
+        allowedModes: ['custom_voice'],
+    },
+    deapi_chatterbox_tts: {
+        id: 'deapi_chatterbox_tts',
+        provider: 'deapi',
+        apiId: 'txt2audio',
+        apiModel: 'Chatterbox',
+        allowedDeapiModels: ['Chatterbox'],
+        allowedModes: ['custom_voice'],
+    },
+    deapi_qwen3_tts: {
+        id: 'deapi_qwen3_tts',
+        provider: 'deapi',
+        apiId: 'txt2audio',
+        apiModel: 'Qwen3_TTS_12Hz_1_7B_CustomVoice',
+        allowedDeapiModels: [
+            'Qwen3_TTS_12Hz_1_7B_CustomVoice',
+            'Qwen3_TTS_12Hz_1_7B_VoiceDesign',
+            'Qwen3_TTS_12Hz_1_7B_Base',
+        ],
+        allowedModes: ['custom_voice', 'voice_design', 'voice_clone'],
+    },
+    openai_tts_1: { id: 'openai_tts_1', provider: 'openai', apiModel: 'tts-1' },
+    openai_tts_1_hd: { id: 'openai_tts_1_hd', provider: 'openai', apiModel: 'tts-1-hd' },
+    elevenlabs_multilingual_v2: { id: 'elevenlabs_multilingual_v2', provider: 'elevenlabs', apiModel: 'eleven_multilingual_v2' },
+});
+
+const MUSIC_MODEL_REGISTRY = Object.freeze({
+    deapi_acestep_1_5_xl_turbo_int8: {
+        id: 'deapi_acestep_1_5_xl_turbo_int8',
+        provider: 'deapi',
+        apiId: 'txt2music',
+        deapiModel: 'AceStep_1_5_XL_Turbo_INT8',
+    },
+    deapi_acestep_1_5_base: {
+        id: 'deapi_acestep_1_5_base',
+        provider: 'deapi',
+        apiId: 'txt2music',
+        deapiModel: 'AceStep_1_5_Base',
+    },
+    minimax_music_01: {
+        id: 'minimax_music_01',
+        provider: 'minimax',
+        apiId: 'music-01',
+    },
+});
+
+function cleanRequestString(value) {
+    return typeof value === 'string' ? value.trim() : '';
+}
+
+function resolveImageGenerationModel({ modelId, provider, apiId } = {}) {
+    const safeModelId = cleanRequestString(modelId);
+    if (safeModelId) return IMAGE_MODEL_REGISTRY[safeModelId] || null;
+
+    const safeProvider = cleanRequestString(provider);
+    const safeApiId = cleanRequestString(apiId);
+    return Object.values(IMAGE_MODEL_REGISTRY)
+        .find((entry) => entry.provider === safeProvider && entry.apiId === safeApiId) || null;
+}
+
+function resolveTtsGenerationModel({ modelId, provider, model, apiId } = {}) {
+    const safeModelId = cleanRequestString(modelId);
+    if (safeModelId) return TTS_MODEL_REGISTRY[safeModelId] || null;
+
+    const safeProvider = cleanRequestString(provider);
+    const safeModel = cleanRequestString(model);
+    const safeApiId = cleanRequestString(apiId);
+    return Object.values(TTS_MODEL_REGISTRY).find((entry) => {
+        if (entry.provider !== safeProvider) return false;
+        if (entry.provider === 'deapi') {
+            return entry.apiId === safeApiId && entry.allowedDeapiModels?.includes(safeModel);
+        }
+        return entry.apiModel === safeModel;
+    }) || null;
+}
+
+function resolveMusicGenerationModel({ modelId, provider, apiId, model } = {}) {
+    const safeModelId = cleanRequestString(modelId);
+    if (safeModelId) return MUSIC_MODEL_REGISTRY[safeModelId] || null;
+
+    const safeProvider = cleanRequestString(provider);
+    const safeApiId = cleanRequestString(apiId);
+    const safeModel = cleanRequestString(model);
+    return Object.values(MUSIC_MODEL_REGISTRY).find((entry) => {
+        if (entry.provider !== safeProvider || entry.apiId !== safeApiId) return false;
+        if (entry.provider === 'deapi') return entry.deapiModel === safeModel;
+        return true;
+    }) || null;
 }
 
 // ── Rolling Context Summary konstansok ───────────────────────────────────────
@@ -709,11 +900,13 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         const requestedModelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim() : '';
         const requestedModelName = typeof req.body?.modelName === 'string' ? req.body.modelName.trim().slice(0, 120) : '';
         const assistantDocId = assistantMessageId || messageId || null;
+        const messageText = typeof message === 'string' ? message.trim() : '';
+        const hasAttachedImage = typeof attachedImage === 'string' && attachedImage.trim();
 
         if (!sessionId) {
             return res.status(400).json({ success: false, message: 'Hiányzó sessionId' });
         }
-        if (!message || (typeof message !== 'string' && !attachedImage)) {
+        if (!messageText && !hasAttachedImage) {
             return res.status(400).json({ success: false, message: 'Hiányzó üzenet' });
         }
 
@@ -751,9 +944,19 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             return res.status(400).json({ success: false, message: `Ismeretlen modell: ${modelId}` });
         }
 
-        if (attachedImage && !modelConfig.supportsVision) {
+        if (hasAttachedImage && !modelConfig.supportsVision) {
             activeStreams.delete(streamKey);
             return res.status(400).json({ success: false, message: 'This model does not accept images.' });
+        }
+
+        let safeAttachedImage = null;
+        if (hasAttachedImage) {
+            const imageValidation = await validateChatAttachedImage(attachedImage);
+            if (!imageValidation.ok) {
+                activeStreams.delete(streamKey);
+                return res.status(400).json({ success: false, message: imageValidation.message });
+            }
+            safeAttachedImage = imageValidation.dataUrl;
         }
 
         const { apiModel, provider, defaultSystemPrompt } = modelConfig;
@@ -776,22 +979,22 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             content: docSnap.data().content,
         }));
 
-        const newMessage = attachedImage
+        const newMessage = safeAttachedImage
             ? {
                 role: 'user',
                 content: [
-                    { type: 'image_url', image_url: { url: attachedImage } },
-                    { type: 'text', text: message },
+                    { type: 'image_url', image_url: { url: safeAttachedImage } },
+                    ...(messageText ? [{ type: 'text', text: messageText }] : []),
                 ],
             }
-            : { role: 'user', content: message };
+            : { role: 'user', content: messageText };
 
         const lastStoredMessage = storedMessages[storedMessages.length - 1];
         const userAlreadySaved =
             lastStoredMessage &&
             lastStoredMessage.role === 'user' &&
             typeof lastStoredMessage.content === 'string' &&
-            lastStoredMessage.content === message;
+            lastStoredMessage.content === messageText;
 
         const baseMessages = userAlreadySaved ? storedMessages : [...storedMessages, newMessage];
         let context = buildContext(
@@ -808,7 +1011,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
         // ── Title generálás (csak az első üzenetnél) ──
         if (!sessionData.title) {
-            const firstUserText = typeof message === 'string' ? message : '[kép]';
+            const firstUserText = messageText || '[kep]';
             console.log(`[Title] Generating for session ${sessionId}, message: "${firstUserText.slice(0, 60)}"`);
             const generatedTitle = await generateSessionTitle(firstUserText);
             console.log(`[Title] Generated: "${generatedTitle}"`);
@@ -862,7 +1065,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 sessionId,
                 modelId: modelForLog,
                 modelName,
-                lastMessage: typeof message === 'string' ? message.slice(0, 100) : '[kép]',
+                lastMessage: messageText ? messageText.slice(0, 100) : '[kep]',
                 lastRole: 'assistant',
                 updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 messageCount: actualMessageCount,
@@ -2708,9 +2911,24 @@ router.post('/texture-paint-edit', verifyFirebaseToken, imageLimiter, async (req
 // 2.  KÉPGENERÁLÁS  —  POST /api/generate-image
 // ════════════════════════════════════════════════════
 router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, res) => {
+    let imageSseStarted = false;
+    const sseStart = (res) => {
+        if (imageSseStarted) return;
+        imageSseStarted = true;
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+    };
+    const sseEmit = (res, data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
     try {
         const {
-            apiId, prompt, negative_prompt, provider,
+            apiId: requestedApiId,
+            prompt,
+            negative_prompt,
+            provider: requestedProvider,
+            modelId: requestedModelId,
             prompt_extend,
             image_size = { width: 1024, height: 1024 },
             num_inference_steps = 28,
@@ -2721,23 +2939,21 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             jobId,
         } = req.body;
 
-        const controller = new AbortController();
-        registerJob(jobId, controller, 600000); // 10 minutes timeout
-
         if (!prompt?.trim()) {
             return res.status(400).json({ success: false, message: 'Hiányzó prompt' });
         }
 
-        let imageSseStarted = false;
-        const sseStart = (res) => {
-            if (imageSseStarted) return;
-            imageSseStarted = true;
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
-            res.flushHeaders();
-        };
-        const sseEmit = (res, data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+        const imageModel = resolveImageGenerationModel({
+            modelId: requestedModelId,
+            provider: requestedProvider,
+            apiId: requestedApiId,
+        });
+        if (!imageModel) {
+            return res.status(400).json({ success: false, message: 'Ismeretlen vagy nem engedelyezett kepmodell' });
+        }
+        const { provider, apiId } = imageModel;
+        const controller = new AbortController();
+        registerJob(jobId, req.userId, controller, 600000); // 10 minutes timeout
 
         const emitImageError = (message) => {
             sseStart(res);
@@ -2808,7 +3024,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             if (images.length === 0) throw new Error('A Gemini nem adott vissza kepet.');
             await logUsage(req.userId, 'image', { provider: 'google-image', apiId, numImages: images.length });
             for (const img of images) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'google-image', aspect_ratio, width: img.width, height: img.height });
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'google-image', aspect_ratio, width: img.width, height: img.height });
             }
             unregisterJob(jobId);
             sseStart(res);
@@ -2834,6 +3050,16 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 : input_image ? [input_image] : [];
 
             const isEditModel = rawInputImages.length > 0;
+            if (imageModel.needsInputImage && !isEditModel) {
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'Ehhez a kepmodellhez bemeneti kep szukseges' });
+                return res.end();
+            }
+            if (!imageModel.needsInputImage && isEditModel) {
+                sseStart(res);
+                sseEmit(res, { type: 'error', message: 'Ez a kepmodell nem fogad bemeneti kepet' });
+                return res.end();
+            }
 
             let imageUrlsForApi = [];
             let tempB2Keys = [];
@@ -2969,7 +3195,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 const finalImages = [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }];
                 await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
                 for (const img of finalImages) {
-                    processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
+                    processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
                 }
                 sseStart(res);
                 sseEmit(res, { type: 'done', images: finalImages });
@@ -3033,7 +3259,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             await cleanupB2();
             await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
             for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
             }
             unregisterJob(jobId);
             sseEmit(res, { type: 'done', images: finalImages });
@@ -3069,7 +3295,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             const finalImages = [{ url: `data:${contentType};base64,${base64}`, width: image_size.width || 1024, height: image_size.height || 1024 }];
             await logUsage(req.userId, 'image', { provider: 'cloudflare', apiId, numImages: 1 });
             for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'cloudflare', aspect_ratio, width: img.width, height: img.height });
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'cloudflare', aspect_ratio, width: img.width, height: img.height });
             }
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
@@ -3117,7 +3343,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             const finalImages = [{ url: `data:image/png;base64,${base64Image}`, width: image_size.width || 1024, height: image_size.height || 1024 }];
             await logUsage(req.userId, 'image', { provider: 'nvidia-image', apiId, numImages: 1 });
             for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'nvidia-image', aspect_ratio, width: img.width, height: img.height });
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'nvidia-image', aspect_ratio, width: img.width, height: img.height });
             }
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
@@ -3152,7 +3378,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
             await logUsage(req.userId, 'image', { apiId, numImages: num_images });
             for (const img of images) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: apiId, provider: 'fal', aspect_ratio, width: img.width, height: img.height });
+                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'fal', aspect_ratio, width: img.width, height: img.height });
             }
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
@@ -3198,7 +3424,7 @@ router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImag
 
     const { jobId } = req.body || {};
     const controller = new AbortController();
-    registerJob(jobId, controller, 600000);
+    registerJob(jobId, req.userId, controller, 600000);
 
     try {
         if (!process.env.DEAPI_API_KEY) {
@@ -3376,8 +3602,10 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
 
     try {
         const {
-            model = 'tts-1',
-            provider = 'openai',
+            model: requestedModel = 'tts-1',
+            provider: requestedProvider = 'openai',
+            modelId: requestedModelId = '',
+            apiId: requestedApiId = '',
             text,
             voice = 'nova',
             speed = 1.0,
@@ -3389,21 +3617,39 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
             ref_text = '',
             instruct = '',
         } = req.body;
-        const controller = new AbortController();
-        registerJob(jobId, controller, 600000);
+        const safeText = String(text || '').trim();
+        if (!safeText) return res.status(400).json({ success: false, message: 'Hianyzo szoveg' });
 
-        if (!text?.trim()) return res.status(400).json({ success: false, message: 'Hiányzó szöveg' });
-        if (provider !== 'deapi' && text.length > 4096) return res.status(400).json({ success: false, message: 'Max 4096 karakter' });
+        const ttsModel = resolveTtsGenerationModel({
+            modelId: requestedModelId,
+            provider: requestedProvider,
+            model: requestedModel,
+            apiId: requestedApiId,
+        });
+        if (!ttsModel) {
+            return res.status(400).json({ success: false, message: 'Ismeretlen vagy nem engedelyezett TTS modell' });
+        }
+        const provider = ttsModel.provider;
+        const model = provider === 'deapi'
+            ? (cleanRequestString(requestedModel) || ttsModel.apiModel)
+            : ttsModel.apiModel;
+
+        if (provider !== 'deapi' && safeText.length > 4096) return res.status(400).json({ success: false, message: 'Max 4096 karakter' });
+
+        const controller = new AbortController();
+        registerJob(jobId, req.userId, controller, 600000);
 
         const parsedSpeed = Number(speed);
         const safeSpeed = Number.isFinite(parsedSpeed) ? Math.min(Math.max(0.25, parsedSpeed), 4.0) : 1.0;
         const safeFormat = ['mp3', 'opus', 'aac', 'flac'].includes(String(format || '').trim()) ? String(format).trim() : 'mp3';
         let audioUrl = '';
+        let archiveVoice = voice;
 
         if (provider === 'openai') {
             if (!process.env.OPENAI_API_KEY) return res.status(500).json({ success: false, message: 'OPENAI_API_KEY nincs beállítva' });
             const safeVoice = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'].includes(voice) ? voice : 'nova';
-            const resp = await openai.audio.speech.create({ model, voice: safeVoice, input: text.trim(), speed: safeSpeed, response_format: safeFormat }, { signal: controller.signal });
+            archiveVoice = safeVoice;
+            const resp = await openai.audio.speech.create({ model, voice: safeVoice, input: safeText, speed: safeSpeed, response_format: safeFormat }, { signal: controller.signal });
             const mimeTypes = { mp3: 'audio/mpeg', opus: 'audio/ogg', aac: 'audio/aac', flac: 'audio/flac' };
             const buffer = Buffer.from(await resp.arrayBuffer());
             audioUrl = `data:${mimeTypes[safeFormat]};base64,${buffer.toString('base64')}`;
@@ -3413,7 +3659,16 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
             if (!process.env.NVIDIA_API_KEY) return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
 
             const FUNCTION_ID = '877104f7-e885-42b9-8de8-f6e4c6303969';
-            const { voice = 'Magpie-Multilingual.EN-US.Aria', language_code = 'en-US' } = req.body;
+            const { voice: requestedRivaVoice = 'Magpie-Multilingual.EN-US.Aria', language_code: requestedLanguageCode = 'en-US' } = req.body;
+            const requestedVoiceName = cleanRequestString(requestedRivaVoice);
+            const safeRivaVoice = ttsModel.voices.some((baseVoice) =>
+                requestedVoiceName === baseVoice || requestedVoiceName.startsWith(`${baseVoice}.`)
+            )
+                ? requestedVoiceName
+                : ttsModel.voices[0];
+            const requestedLanguage = cleanRequestString(requestedLanguageCode);
+            const language_code = ttsModel.languages.includes(requestedLanguage) ? requestedLanguage : 'en-US';
+            archiveVoice = safeRivaVoice;
 
             const client = createRivaClient();
             const meta = new grpc.Metadata();
@@ -3421,7 +3676,7 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
             meta.add('function-id', FUNCTION_ID);
 
             const audioBuffer = await new Promise((resolve, reject) => {
-                const call = client.synthesize({ text: text.trim(), language_code, voice_name: voice, encoding: 'LINEAR_PCM', sample_rate_hz: 22050 }, meta, (err, response) => {
+                const call = client.synthesize({ text: safeText, language_code, voice_name: safeRivaVoice, encoding: 'LINEAR_PCM', sample_rate_hz: 22050 }, meta, (err, response) => {
                     if (err) {
                         if (err.code === 1) reject(new Error('AbortError')); // gRPC CANCELLED
                         else reject(new Error(`gRPC hiba: ${err.message}`));
@@ -3441,6 +3696,9 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
 
         else if (provider === 'deapi') {
             if (!process.env.DEAPI_API_KEY) return res.status(500).json({ success: false, message: 'DEAPI_API_KEY nincs beallitva' });
+            if (!ttsModel.allowedDeapiModels?.includes(model)) {
+                return res.status(400).json({ success: false, message: 'A valasztott TTS modellhez ez a deAPI slug nem engedelyezett' });
+            }
 
             const selectedDeapiTtsModel = await findDeapiTtsModel(model);
             if (!selectedDeapiTtsModel) {
@@ -3451,6 +3709,9 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
             const modelLimits = selectedDeapiTtsModel.info?.limits || {};
             const allowedModes = selectedDeapiTtsModel.info?.modes || ['custom_voice'];
             const safeMode = DEAPI_TTS_MODES.includes(String(mode || '').trim()) ? String(mode).trim() : 'custom_voice';
+            if (!ttsModel.allowedModes?.includes(safeMode)) {
+                return res.status(400).json({ success: false, message: 'A valasztott TTS modellhez ez a mod nem engedelyezett' });
+            }
             const safeVoice = String(voice || defaults.voice || '').trim();
             const safeLang = normalizeDeapiTtsLanguage(selectedDeapiTtsModel.slug, lang, defaults.lang || 'en-us');
             const safeDeapiFormat = DEAPI_TTS_FORMATS.includes(String(format || '').trim()) ? String(format).trim() : (defaults.format || 'mp3');
@@ -3472,10 +3733,10 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
             const safeInstruct = String(instruct || '').trim();
             const referenceAudioFile = req.file || null;
 
-            if (Number.isFinite(minTextLength) && text.trim().length < minTextLength) {
+            if (Number.isFinite(minTextLength) && safeText.length < minTextLength) {
                 return res.status(400).json({ success: false, message: `${selectedDeapiTtsModel.name} minimum ${minTextLength} karakteres szoveget ker` });
             }
-            if (Number.isFinite(maxTextLength) && text.trim().length > maxTextLength) {
+            if (Number.isFinite(maxTextLength) && safeText.length > maxTextLength) {
                 return res.status(400).json({ success: false, message: `${selectedDeapiTtsModel.name} maximum ${maxTextLength} karakteres szoveget fogad` });
             }
 
@@ -3503,7 +3764,7 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
             }
 
             const submissionPayload = {
-                text: text.trim(),
+                text: safeText,
                 model: selectedDeapiTtsModel.slug,
                 mode: safeMode,
                 lang: safeLang,
@@ -3556,7 +3817,7 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
 
             const archiveItem = await persistGeneratedAudio(req.userId, audioUrl, {
                 type: 'tts',
-                text: text.trim(),
+                text: safeText,
                 provider: 'deapi',
                 model: selectedDeapiTtsModel.slug,
                 ttsMode: safeMode,
@@ -3577,7 +3838,7 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
                 task: 'txt2audio',
                 model: selectedDeapiTtsModel.slug,
                 mode: safeMode,
-                chars: text.length,
+                chars: safeText.length,
                 audioId: archiveItem?.id || null,
                 requestId,
             });
@@ -3602,10 +3863,11 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
         else if (provider === 'elevenlabs') {
             if (!process.env.ELEVENLABS_API_KEY) return res.status(500).json({ success: false, message: 'ELEVENLABS_API_KEY nincs beállítva' });
             const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+            archiveVoice = voiceId;
             const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
                 method: 'POST',
                 headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
-                body: JSON.stringify({ text: text.trim(), model_id: model, voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.0, use_speaker_boost: true } }),
+                body: JSON.stringify({ text: safeText, model_id: model, voice_settings: { stability: 0.75, similarity_boost: 0.85, style: 0.0, use_speaker_boost: true } }),
                 signal: controller.signal,
             });
             if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err?.detail?.message || `ElevenLabs hiba: ${resp.status}`); }
@@ -3621,10 +3883,10 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
         const archivedFileFormat = provider === 'nvidia-riva' ? 'wav' : provider === 'elevenlabs' ? 'mp3' : safeFormat;
         const archiveItem = await persistGeneratedAudio(req.userId, audioUrl, {
             type: 'tts',
-            text: text.trim(),
+            text: safeText,
             provider,
             model: archivedModel,
-            voice,
+            voice: archiveVoice,
             fileFormat: archivedFileFormat,
             sampleRate: provider === 'nvidia-riva' ? 22050 : null,
             stream: false,
@@ -3633,7 +3895,7 @@ router.post('/generate-tts', verifyFirebaseToken, audioLimiter, handleDeapiTtsRe
         await logUsage(req.userId, 'tts', {
             provider,
             model: archivedModel,
-            chars: text.length,
+            chars: safeText.length,
             audioId: archiveItem?.id || null,
         });
         unregisterJob(jobId);
@@ -5102,8 +5364,9 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
 
     try {
         const {
-            apiId,
-            provider,
+            apiId: requestedApiId,
+            provider: requestedProvider,
+            modelId: requestedModelId = '',
             prompt = '',
             lyrics = '',
             lyrics_optimizer = false,
@@ -5111,7 +5374,7 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
             stream = false,
             output_format = 'url',
             audio_setting = {},
-            model = '',
+            model: requestedModel = '',
             caption = '',
             duration = 30,
             inference_steps = 8,
@@ -5125,8 +5388,22 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
             lyrics_mode = null,
             jobId,
         } = req.body;
+        const musicModel = resolveMusicGenerationModel({
+            modelId: requestedModelId,
+            provider: requestedProvider,
+            apiId: requestedApiId,
+            model: requestedModel,
+        });
+        if (!musicModel) {
+            return res.status(400).json({ success: false, message: 'Ismeretlen vagy nem engedelyezett zenemodell' });
+        }
+        const provider = musicModel.provider;
+        const apiId = musicModel.apiId;
+        const model = provider === 'deapi'
+            ? (cleanRequestString(requestedModel) || musicModel.deapiModel)
+            : cleanRequestString(requestedModel);
         const controller = new AbortController();
-        registerJob(jobId, controller, 600000);
+        registerJob(jobId, req.userId, controller, 600000);
 
         if (provider === 'deapi') {
             if (!process.env.DEAPI_API_KEY) {
@@ -5134,6 +5411,9 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
             }
             if (!apiId) {
                 return res.status(400).json({ success: false, message: 'Hiányzó deAPI task azonosító' });
+            }
+            if (model !== musicModel.deapiModel) {
+                return res.status(400).json({ success: false, message: 'A valasztott zenemodellhez ez a deAPI slug nem engedelyezett' });
             }
 
             const referenceAudioFile = req.file || null;
@@ -5204,7 +5484,8 @@ router.post('/generate-music', verifyFirebaseToken, audioLimiter, handleDeapiRef
             const seedText = String(seed ?? '').trim();
             const parsedSeed = Number(seedText);
             const safeSeed = seedText === '' || !Number.isFinite(parsedSeed) ? -1 : Math.trunc(parsedSeed);
-            const safeFormat = String(format || '').trim() || 'flac';
+            const requestedFormat = String(format || '').trim().toLowerCase();
+            const safeFormat = DEAPI_MUSIC_FORMATS.includes(requestedFormat) ? requestedFormat : 'mp3';
             const safeBpm = bpm === null || bpm === ''
                 ? null
                 : normalizeDeapiMusicNumber(bpm, {
@@ -5509,7 +5790,7 @@ router.post('/meshy/text-to-3d', verifyFirebaseToken, genLimiter, async (req, re
     if (prompt.length > 600) return res.status(400).json({ success: false, message: 'Prompt max 600 karakter' });
 
     const controller = new AbortController();
-    registerJob(jobId, controller, 1800000);
+    registerJob(jobId, req.userId, controller, 1800000);
 
     try {
         const { data } = await meshy.post('/openapi/v2/text-to-3d', {
@@ -5539,7 +5820,7 @@ router.post('/meshy/image-to-3d', verifyFirebaseToken, genLimiter, async (req, r
     if (!image_url) return res.status(400).json({ success: false, message: 'image_url megadása kötelező' });
 
     const controller = new AbortController();
-    registerJob(jobId, controller, 1800000);
+    registerJob(jobId, req.userId, controller, 1800000);
 
     try {
         const { data } = await meshy.post('/openapi/v1/image-to-3d', {
@@ -5571,7 +5852,7 @@ router.post('/meshy/refine', verifyFirebaseToken, async (req, res) => {
     if (!preview_task_id) return res.status(400).json({ success: false, message: 'preview_task_id kötelező' });
 
     const controller = new AbortController();
-    registerJob(jobId, controller, 1800000);
+    registerJob(jobId, req.userId, controller, 1800000);
 
     try {
         const { data } = await meshy.post('/openapi/v2/text-to-3d', {
@@ -6022,7 +6303,7 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
 
     const controller = new AbortController();
     // Modell generálásnál 30 perc (1800s) timeout
-    registerJob(jobId, controller, 1800000);
+    registerJob(jobId, req.userId, controller, 1800000);
 
     try {
         const nimResp = await fetch(TRELLIS_NIM_URL, {
