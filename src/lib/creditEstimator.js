@@ -34,6 +34,24 @@ export function estimateCost(req) {
   const mv  = req.model_version ?? DEFAULT_MODEL;
   const key = `${req.type}:${mv}`;
 
+  if (req.type === "texture_model") {
+    return estimateTextureCost(req);
+  }
+
+  if (req.type === "animate_retarget") {
+    const animationCount = Array.isArray(req.animations)
+      ? Math.max(1, req.animations.filter(Boolean).length)
+      : 1;
+    const cost = (CREDIT_COSTS.animate_retarget ?? 10) * animationCount;
+    return {
+      total: cost,
+      breakdown: {
+        animate_retarget: cost,
+        ...(animationCount > 1 && { animation_count: `x${animationCount}` }),
+      },
+    };
+  }
+
   if (req.type === "generate_image") {
     const imageModel = req.model_version || DEFAULT_GENERATE_IMAGE_MODEL_VERSION;
     const cost = getGenerateImageCost(imageModel);

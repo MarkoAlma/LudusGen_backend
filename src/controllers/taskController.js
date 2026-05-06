@@ -5,7 +5,13 @@ import { storageService } from "../services/storageService.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
-import { deductCredits, refundCredits, linkTaskIdToTransaction, hasBeenCharged } from "../services/creditService.js";
+import { refundCredits, hasBeenCharged, findDebitTransactionForTask } from "../services/creditService.js";
+import {
+  reserveCreditsForTask,
+  refundCreditReservation,
+  linkReservationToTask,
+  getCreateFailureRefundReason,
+} from "../services/tripoBillingService.js";
 import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskMeta } from "../services/taskRecoveryService.js";
 import {
   MARKETPLACE_COLLECTIONS,
@@ -18,6 +24,7 @@ import admin from "firebase-admin";
 import { createHash } from "node:crypto";
 import { registerJob, unregisterJob } from "../lib/jobRegistry.js";
 import { getTaskLookupHttpStatus, isMissingTripoTaskError } from "../lib/tripoTaskErrors.js";
+import { normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -76,6 +83,32 @@ function errorPayload(err, message = err.message) {
     ...(err.code && { tripoCode: err.code }),
     ...(err.suggestion && { tripoSuggestion: err.suggestion }),
   };
+}
+
+function handleBillingErrorResponse(res, err) {
+  if (err?.code === "INSUFFICIENT_CREDITS" || err?.code === "INSUFFICIENT_TRIPO_CREDITS") {
+    return res.status(402).json({
+      success: false,
+      message: `Insufficient credits: ${err.available} available, ${err.required} required. Please top up your balance.`,
+      code: "INSUFFICIENT_CREDITS",
+    });
+  }
+
+  console.error("[TaskController] Billing reservation error:", err?.message || err);
+  return res.status(500).json({
+    success: false,
+    message: "Credit reservation failed. Please try again.",
+    code: "BILLING_RESERVATION_FAILED",
+  });
+}
+
+async function refundUncreatedDirectBatchReservations(batchReservations, reason) {
+  const refunds = [];
+  for (const reservation of batchReservations || []) {
+    if (reservation?.taskId) continue;
+    refunds.push(refundCreditReservation(reservation, reason));
+  }
+  return Promise.allSettled(refunds);
 }
 
 function omitUndefined(obj) {
@@ -426,8 +459,8 @@ export async function createTask(req, res) {
   const jobId = req.body.jobId;
   const controller = new AbortController();
   let estimatedCost = 0;
-  let creditsDeducted = false;
-  let tempTxId = null;
+  let creditReservation = null;
+  let batchReservations = [];
   let tripoTaskCreated = false;
 
   try {
@@ -571,35 +604,16 @@ export async function createTask(req, res) {
     console.log(`[TaskController][create] type=${body.type} model=${body.model_version} base_cost=${estimateResult.breakdown.base} tex_addon=${estimateResult.breakdown.texture || 0} total_cost=${estimatedCost}`);
     console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"} cost=${estimatedCost}`);
 
-    if (estimatedCost > 0 && userId) {
-      tempTxId = `pending_${type}_${Date.now()}`;
+    const isDirectImageBatch = !USE_QUEUE && body.type === "image_to_model" && Array.isArray(body.batch_images) && body.batch_images.length > 1;
+    if (!isDirectImageBatch) {
       try {
-        const tripoBalance = await getTripoClient().getBalance();
-        const availableTripo = tripoBalance.balance ?? 0;
-        if (availableTripo < estimatedCost) {
-          console.log(`[TaskController] Tripo balance ${availableTripo} < estimated cost ${estimatedCost} — rejecting`);
-          return res.status(402).json({
-            success: false,
-            message: `Insufficient credits: ${availableTripo} available, ${estimatedCost} required. Please top up your balance.`,
-            code: "INSUFFICIENT_CREDITS",
-          });
-        }
-      } catch (balanceErr) {
-        console.error(`[TaskController] Tripo balance check error:`, balanceErr.message);
-      }
-
-      try {
-        await deductCredits(userId, estimatedCost, tempTxId, type);
-        creditsDeducted = true;
+        creditReservation = await reserveCreditsForTask({
+          userId,
+          amount: estimatedCost,
+          taskType: type,
+        });
       } catch (creditErr) {
-        if (creditErr.code === "INSUFFICIENT_CREDITS") {
-          return res.status(402).json({
-            success: false,
-            message: `Insufficient credits: ${creditErr.available} available, ${creditErr.required} required. Please top up your balance.`,
-            code: "INSUFFICIENT_CREDITS",
-          });
-        }
-        console.error(`[TaskController] Credit deduction error:`, creditErr.message);
+        return handleBillingErrorResponse(res, creditErr);
       }
     }
 
@@ -671,10 +685,7 @@ export async function createTask(req, res) {
               hasTexture,
             });
             if (histType === "refine_model") {
-              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
-                await refundCredits(userId, estimatedCost, tempTxId, "already_refined_source");
-                creditsDeducted = false;
-              }
+              await refundCreditReservation(creditReservation, "already_refined_source");
               return res.status(400).json({
                 success: false,
                 message: "A már refine-olt modelleket nem lehet újra refine-olni.",
@@ -701,10 +712,7 @@ export async function createTask(req, res) {
               if (!upstreamSnap.empty) effectiveParentData = upstreamSnap.docs[0].data();
             }
             if (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType) && !upstreamTaskId) {
-              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
-                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_source");
-                creditsDeducted = false;
-              }
+              await refundCreditReservation(creditReservation, "unsupported_refine_source");
               return res.status(400).json({
                 success: false,
                 message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható. Forrástípus: ${histType}`,
@@ -713,10 +721,7 @@ export async function createTask(req, res) {
             }
             const sourceVersion = getHistoryModelVersion(effectiveParentData);
             if (!isRefineModelVersionSupported(sourceVersion)) {
-              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
-                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_model_version");
-                creditsDeducted = false;
-              }
+              await refundCreditReservation(creditReservation, "unsupported_refine_model_version");
               return res.status(400).json({
                 success: false,
                 message: `Refine csak Tripo v1.4 draft modellel működik. Ez a modell: ${sourceVersion}`,
@@ -796,23 +801,30 @@ export async function createTask(req, res) {
       if (body.batch_images && body.batch_images.length > 1) {
         const { batch_images, ...common } = body;
         const taskIds = [];
+        const directBatchPlans = [];
         for (const token of batch_images) {
           const subBody = {
             ...common,
             file: typeof token === "string" ? { type: "jpg", file_token: token } : token,
           };
+          const subEstimate = estimateCost(subBody);
+          const subReservation = await reserveCreditsForTask({
+            userId,
+            amount: subEstimate.total,
+            taskType: subBody.type,
+          });
+          batchReservations.push(subReservation);
+          directBatchPlans.push({ subBody, subReservation });
+        }
+        for (const plan of directBatchPlans) {
+          const { subBody, subReservation } = plan;
           const taskId = await taskService.create(subBody, {
             callbackUrl: callback_url,
             idempotencyKey: uuid(),
             signal: controller.signal,
           });
           tripoTaskCreated = true;
-          
-          if (userId && tempTxId) {
-            linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
-              console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
-            );
-          }
+          await linkReservationToTask(subReservation, taskId);
           if (userId) {
             await writePendingHistoryTask({
               taskId,
@@ -836,12 +848,7 @@ export async function createTask(req, res) {
         });
         tripoTaskCreated = true;
 
-        // Link real taskId to credit transaction for refunds
-        if (userId && tempTxId) {
-          linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
-            console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
-          );
-        }
+        await linkReservationToTask(creditReservation, taskId);
 
         // Register for background recovery with inherited prompt
         if (userId) {
@@ -868,16 +875,20 @@ export async function createTask(req, res) {
       type,
       userId,
       estimatedCost,
-      creditsDeducted,
+      creditsDeducted: Boolean(creditReservation?.creditsDeducted || batchReservations.some((reservation) => reservation?.creditsDeducted)),
       requestBody: req.body,
       error: err.message,
     });
 
     const refundDeductedCredits = async (reason) => {
-      if (!userId || estimatedCost <= 0 || !creditsDeducted || !tempTxId || tripoTaskCreated) return;
       try {
-        await refundCredits(userId, estimatedCost, tempTxId, reason);
-        creditsDeducted = false;
+        if (batchReservations.length > 0) {
+          await refundUncreatedDirectBatchReservations(batchReservations, reason);
+          return;
+        }
+        if (!tripoTaskCreated) {
+          await refundCreditReservation(creditReservation, reason);
+        }
       } catch (refundErr) {
         console.error(`[TaskController] Refund error (${reason}):`, refundErr.message);
       }
@@ -885,7 +896,7 @@ export async function createTask(req, res) {
 
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
-      if (userId && estimatedCost > 0 && creditsDeducted) {
+      if (userId && estimatedCost > 0) {
         console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
         await refundDeductedCredits("tripo_403_insufficient_credit");
       }
@@ -894,7 +905,7 @@ export async function createTask(req, res) {
     // Tripo 1004 on refine_model = model has no draft output (was generated with texture, or wrong task type)
     let userMessage = err.message;
     if (type === "refine_model" && err.message?.includes("1004")) {
-      if (userId && estimatedCost > 0 && creditsDeducted) {
+      if (userId && estimatedCost > 0) {
         await refundDeductedCredits("refine_no_draft_output");
       }
       userMessage = "Ez a modell nem finomítható. A Refine csak textúra nélkül generált (draft) modelleknél működik. Generálj új modellt textúra nélkül, majd alkalmazd rá a Refine-t.";
@@ -908,7 +919,7 @@ export async function createTask(req, res) {
       userMessage = "A Tripo nem fogadta el a texture pass parametereit. Ellenorizd a texture targetet es a referencia kepet, majd probald ujra.";
     }
 
-    await refundDeductedCredits(type === "texture_model" ? "texture_model_create_failed" : "tripo_create_failed");
+    await refundDeductedCredits(getCreateFailureRefundReason(type, err));
 
     res.status(400).json(errorPayload(err, userMessage));
   } finally {
@@ -1028,7 +1039,39 @@ export async function streamTask(req, res) {
 export async function cancelTask(req, res) {
   try {
     if (!await requireTaskAccess(req, res)) return;
-    const result = await taskService.cancel(req.params.taskId);
+
+    const { taskId } = req.params;
+    const userId = req.user?.uid;
+
+    // Fetch current task status BEFORE cancelling.
+    // Refund only if the task is still "queued" — Tripo hasn't started
+    // processing it yet so their side hasn't debited their credits either.
+    let statusBeforeCancel = null;
+    try {
+      const currentTask = await getTripoClient().getTask(taskId);
+      statusBeforeCancel = normalizeTripoTaskStatus(currentTask?.status ?? "");
+    } catch (fetchErr) {
+      console.warn(`[TaskController] cancelTask: could not fetch status for ${taskId}:`, fetchErr.message);
+      // Status unknown — proceed with cancel but skip refund to be safe.
+    }
+
+    const result = await taskService.cancel(taskId);
+
+    if (statusBeforeCancel === "queued" && userId) {
+      // Task was still queued — Tripo hadn't started billing. Refund the user.
+      try {
+        const debit = await findDebitTransactionForTask(taskId, userId);
+        if (debit?.data?.amount > 0) {
+          await refundCredits(userId, debit.data.amount, taskId, "cancel_while_queued");
+          console.log(`[TaskController] Refunded ${debit.data.amount} credits for queued task ${taskId} (user ${userId})`);
+        }
+      } catch (refundErr) {
+        console.error(`[TaskController] Refund after cancel failed for task ${taskId}:`, refundErr.message);
+      }
+    } else if (statusBeforeCancel && statusBeforeCancel !== "queued") {
+      console.log(`[TaskController] Task ${taskId} was already ${statusBeforeCancel} when cancelled — no refund (Tripo credits consumed)`);
+    }
+
     res.json({ success: true, cancelled: result.cancelled, message: result.message });
   } catch (err) {
     console.warn("[TaskController] cancelTask:", err.message);
@@ -1036,7 +1079,6 @@ export async function cancelTask(req, res) {
   }
 }
 
-/* ─── Task: acknowledge (stop background poll) ────────────────────────── */
 export async function acknowledgeTask(req, res) {
   try {
     const { taskId } = req.params;

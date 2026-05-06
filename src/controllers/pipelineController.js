@@ -24,7 +24,7 @@ export async function generateCharacter(req, res) {
   });
 
   // Fire-and-forget
-  pipelineService.generateCharacter({ ...body, pipelineId }).then(result => {
+  pipelineService.generateCharacter({ ...body, pipelineId, userId: req.user?.uid }).then(result => {
     console.log(`[Pipeline ${result.pipelineId}] final status=${result.status}`);
   }).catch(err => {
     console.error("[pipelineController] generateCharacter error:", err.message);
@@ -33,15 +33,32 @@ export async function generateCharacter(req, res) {
 
 /* ─── Get pipeline status ─────────────────────────────────────────────── */
 export async function getPipeline(req, res) {
+  // Fast path: in-memory Map (set during this server's lifetime)
   const result = pipelineService.get(req.params.pipelineId);
-  if (!result) {
-    res.status(404).json({ success: false, message: "Pipeline not found" });
+  if (result) {
+    res.json({ success: true, ...result });
     return;
   }
-  res.json({ success: true, ...result });
+
+  // Fallback: Firestore for pipelines started by a previous server instance
+  // (e.g. after nodemon restart during a long-running pipeline)
+  try {
+    const admin = (await import("firebase-admin")).default;
+    const snap = await admin.firestore()
+      .collection("tripo_pipelines")
+      .doc(req.params.pipelineId)
+      .get();
+    if (snap.exists) {
+      res.json({ success: true, fromFirestore: true, ...snap.data() });
+      return;
+    }
+  } catch (err) {
+    console.warn("[pipelineController] getPipeline Firestore fallback error:", err.message);
+  }
+
+  res.status(404).json({ success: false, message: "Pipeline not found" });
 }
 
-/* ─── Estimate pipeline cost ──────────────────────────────────────────── */
 export async function estimatePipeline(req, res) {
   try {
     const estimate = estimatePipelineCost(req.body);
@@ -75,6 +92,7 @@ export async function generateLod(req, res) {
       source_task_id,
       levels ?? LOD_PRESETS.map(l => ({ label: l.label, face_limit: l.face_limit })),
       export_zip ?? false,
+      req.user?.uid,
     );
     res.json({ success: true, ...result });
   } catch (err) {
