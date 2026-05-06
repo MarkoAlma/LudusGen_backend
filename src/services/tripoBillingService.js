@@ -4,9 +4,15 @@ import { estimateCost } from "../lib/creditEstimator.js";
 import { getTripoClient } from "../lib/tripoClient.js";
 import { taskService } from "./taskService.js";
 import { deductCredits, refundCredits, linkTaskIdToTransaction } from "./creditService.js";
+import {
+  SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+  TRIPO_API_NO_BALANCE_CODE,
+  TRIPO_API_UNAVAILABLE_CODE,
+  buildTripoAvailability,
+} from "./serviceAvailabilityService.js";
 
 function isInsufficientProviderCredit(err) {
-  return err?.code === "INSUFFICIENT_TRIPO_CREDITS";
+  return err?.code === "INSUFFICIENT_TRIPO_CREDITS" || err?.code === TRIPO_API_NO_BALANCE_CODE;
 }
 
 export function getTaskCreditEstimate(body) {
@@ -22,27 +28,25 @@ export function makePendingCreditTransactionId(taskType) {
 }
 
 export async function ensureProviderCredits(amount) {
-  if (amount <= 0) return;
+  const required = Math.max(Number(amount) || 0, 1);
 
   try {
     const tripoBalance = await getTripoClient().getBalance();
-    const availableTripo = tripoBalance.balance ?? 0;
-    if (availableTripo < amount) {
-      throw Object.assign(
-        new Error(`Insufficient Tripo credits: ${availableTripo} available, ${amount} required`),
-        {
-          code: "INSUFFICIENT_TRIPO_CREDITS",
-          available: availableTripo,
-          required: amount,
-        },
-      );
+    const availability = buildTripoAvailability(tripoBalance, { requiredCredits: required });
+    if (!availability.available) {
+      throw Object.assign(new Error(availability.message), {
+        code: availability.code,
+        available: availability.balance,
+        required,
+      });
     }
   } catch (err) {
     if (isInsufficientProviderCredit(err)) throw err;
-    // Network / timeout errors: log a warning but allow the task to proceed.
-    // The task may still succeed if Tripo has credits; a definitive failure will
-    // be caught by the API response and result in a refund via the error handler.
-    console.warn("[TripoBilling] Provider balance check failed (network/timeout) — proceeding:", err.message);
+    console.warn("[TripoBilling] Provider balance check failed:", err.message);
+    throw Object.assign(new Error(SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE), {
+      code: TRIPO_API_UNAVAILABLE_CODE,
+      cause: err,
+    });
   }
 }
 
@@ -66,11 +70,11 @@ export async function reserveCreditsForTask({
     creditsDeducted: false,
   };
 
-  if (normalizedAmount <= 0 || !userId) return reservation;
-
   if (checkProviderBalance) {
     await ensureProviderCredits(normalizedAmount);
   }
+
+  if (normalizedAmount <= 0 || !userId) return reservation;
 
   reservation.tempTxId = transactionId ?? makePendingCreditTransactionId(taskType);
   await deductCredits(userId, normalizedAmount, reservation.tempTxId, taskType);

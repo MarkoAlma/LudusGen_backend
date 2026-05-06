@@ -104,6 +104,14 @@ import {
 } from './src/services/spriteJobService.js';
 import { postProcessSpriteAssets } from './src/services/spritePostProcessingService.js';
 import { assertMeshyAccess, isMeshyEnabled } from './src/services/meshyAccessService.js';
+import {
+    IMAGE_STUDIO_SUBSCRIPTION_REQUIRED_CODE,
+    SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+    TRELLIS_API_LIMIT_REACHED_CODE,
+    buildImageStudioAvailability,
+    getTrellisAvailabilitySnapshot,
+    recordTrellisCall,
+} from './src/services/serviceAvailabilityService.js';
 
 import { registerJob, unregisterJob, activeJobs } from './src/lib/jobRegistry.js';
 
@@ -2945,6 +2953,15 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
         if (!prompt?.trim()) {
             return res.status(400).json({ success: false, message: 'Hiányzó prompt' });
+        }
+
+        if (process.env.IMAGE_STUDIO_GENERATION_DISABLED !== "false") {
+            const imageAvailability = buildImageStudioAvailability();
+            return res.status(402).json({
+                success: false,
+                ...imageAvailability,
+                code: IMAGE_STUDIO_SUBSCRIPTION_REQUIRED_CODE,
+            });
         }
 
         const imageModel = resolveImageGenerationModel({
@@ -6391,11 +6408,28 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
 // ════════════════════════════════════════════════════
 // TRELLIS — Generálás
 // ════════════════════════════════════════════════════
+router.get('/trellis/availability', verifyFirebaseToken, async (_req, res) => {
+    const availability = getTrellisAvailabilitySnapshot();
+    return res.status(availability.available ? 200 : 503).json({
+        success: true,
+        ...availability,
+    });
+});
+
 router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     const { prompt, seed = 0, slat_cfg_scale = 3, ss_cfg_scale = 7.5, slat_sampling_steps = 25, ss_sampling_steps = 25, jobId } = req.body;
 
     if (!prompt || !String(prompt).trim()) return res.status(400).json({ success: false, message: 'A prompt megadása kötelező' });
     if (String(prompt).length > 1000) return res.status(400).json({ success: false, message: 'A prompt maximum 1000 karakter lehet' });
+
+    const availability = getTrellisAvailabilitySnapshot();
+    if (!availability.available) {
+        return res.status(availability.code === TRELLIS_API_LIMIT_REACHED_CODE ? 429 : 503).json({
+            success: false,
+            ...availability,
+            message: availability.message || SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+        });
+    }
 
     const apiKey = process.env.NVIDIA_API_KEY;
     if (!apiKey) return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
@@ -6414,6 +6448,7 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     registerJob(jobId, req.userId, controller, 1800000);
 
     try {
+        recordTrellisCall();
         const nimResp = await fetch(TRELLIS_NIM_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Connection': 'keep-alive' },
@@ -6459,8 +6494,7 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
         }
         return res.status(500).json({ success: false, message: err.message ?? 'Hálózati hiba' });
     } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-        req.off('close', onClose);
+        unregisterJob(jobId);
     }
 });
 

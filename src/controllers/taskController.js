@@ -25,6 +25,12 @@ import { createHash } from "node:crypto";
 import { registerJob, unregisterJob } from "../lib/jobRegistry.js";
 import { getTaskLookupHttpStatus, isMissingTripoTaskError } from "../lib/tripoTaskErrors.js";
 import { normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
+import {
+  SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+  TRIPO_API_NO_BALANCE_CODE,
+  TRIPO_API_UNAVAILABLE_CODE,
+  buildTripoAvailability,
+} from "../services/serviceAvailabilityService.js";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -86,6 +92,28 @@ function errorPayload(err, message = err.message) {
 }
 
 function handleBillingErrorResponse(res, err) {
+  if (err?.code === TRIPO_API_NO_BALANCE_CODE) {
+    return res.status(402).json({
+      success: false,
+      service: "tripo",
+      available: false,
+      message: err.message,
+      code: err.code,
+      availableCredits: err.available,
+      requiredCredits: err.required,
+    });
+  }
+
+  if (err?.code === TRIPO_API_UNAVAILABLE_CODE) {
+    return res.status(503).json({
+      success: false,
+      service: "tripo",
+      available: false,
+      message: SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+      code: err.code,
+    });
+  }
+
   if (err?.code === "INSUFFICIENT_CREDITS" || err?.code === "INSUFFICIENT_TRIPO_CREDITS") {
     return res.status(402).json({
       success: false,
@@ -894,6 +922,11 @@ export async function createTask(req, res) {
       }
     };
 
+    if (err?.code === TRIPO_API_NO_BALANCE_CODE || err?.code === TRIPO_API_UNAVAILABLE_CODE) {
+      await refundDeductedCredits("tripo_api_unavailable");
+      return handleBillingErrorResponse(res, err);
+    }
+
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
       if (userId && estimatedCost > 0) {
@@ -1117,10 +1150,17 @@ export async function getBalance(req, res) {
   try {
     const client = getTripoClient();
     const data = await client.getBalance();
-    res.json({ success: true, ...data });
+    const availability = buildTripoAvailability(data);
+    res.json({ success: true, ...data, ...availability });
   } catch (err) {
     console.error("[TaskController] balance error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(503).json({
+      success: false,
+      service: "tripo",
+      available: false,
+      message: SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+      code: TRIPO_API_UNAVAILABLE_CODE,
+    });
   }
 }
 
