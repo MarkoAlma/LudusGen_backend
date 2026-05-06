@@ -21,4 +21,19 @@ assert(
   "marketplace list responses should hydrate assets with the current viewer id",
 );
 
+assert(
+  controllerSource.includes("collectHistoryPreviewImageUrls"),
+  "marketplace controller should normalize Tripo preview-image fields before building 3D thumbnails",
+);
+
+assert(
+  controllerSource.includes("const previewFallbackUrl = await resolveMarketplace3dPreviewFallback(data);"),
+  "marketplace assets without stored thumbs should fall back to the history preview image",
+);
+
+assert(
+  controllerSource.includes("data.tripo?.sourceHistoryId || data.source?.id || null"),
+  "3D marketplace preview fallback should resolve the source history record first",
+);
+
 console.log("marketplaceControllerClientAsset assertions passed");

@@ -1311,13 +1311,18 @@ export async function modelProxy(req, res) {
   };
 
   try {
-    let authorizedHistory = null;
-    if (taskIdParam) {
-      authorizedHistory = await getAuthorizedHistoryForModelProxy(taskIdParam, requesterId, url);
-      if (!authorizedHistory) {
-        res.status(403).json({ success: false, message: "Forbidden" });
-        return;
-      }
+    const authorizedHistory = await getAuthorizedHistoryForModelProxy(taskIdParam, requesterId, url);
+    if (!authorizedHistory) {
+      res.status(403).json({ success: false, message: "Forbidden" });
+      return;
+    }
+
+    if (!taskIdParam) {
+      const historyTaskId = authorizedHistory.data?.taskId;
+      const fallbackTaskId = authorizedHistory.doc?.id?.startsWith("tripo_")
+        ? authorizedHistory.doc.id.slice("tripo_".length)
+        : null;
+      taskIdParam = historyTaskId || fallbackTaskId || null;
     }
 
     const sendModelEntry = (entry, cacheHeader = "HIT") => {
