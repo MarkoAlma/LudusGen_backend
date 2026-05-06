@@ -210,7 +210,7 @@ console.log('☁️ Cloudinary configured:', process.env.CLOUDINARY_CLOUD_NAME ?
 // ==================== FIREBASE ADMIN INIT ====================
 try {
   let serviceAccount;
-  
+
   if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
     serviceAccount = {
       projectId: process.env.FIREBASE_PROJECT_ID,
@@ -1326,7 +1326,7 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
 
     res.json({
       success: true,
-      message: "Profil sikeresen frissítve",
+      message: "Profile updated successfully",
       user: {
         ...userData,
         uid: userId,
@@ -1336,7 +1336,7 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     console.error("❌ Update profile error:", error);
     res.status(500).json({
       success: false,
-      message: "Szerver hiba"
+      message: "Server error"
     });
   }
 });
@@ -1350,7 +1350,7 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        message: "Nincs feltöltött fájl"
+        message: "No file uploaded"
       });
     }
 
@@ -1414,14 +1414,14 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 
     res.json({
       success: true,
-      message: "Profilkép sikeresen feltöltve",
+      message: "Profile picture uploaded successfully",
       profilePictureUrl: cloudinaryResult.secure_url
     });
   } catch (error) {
     console.error("❌ Upload profile picture error:", error);
     res.status(500).json({
       success: false,
-      message: error.message || "Szerver hiba"
+      message: error.message || "Server error"
     });
   }
 });
@@ -1544,7 +1544,7 @@ app.post("/api/login-with-2fa-google", async (req, res) => {
     if (!sessionId || !code) {
       return res.status(400).json({
         success: false,
-        message: "SessionId és kód szükséges"
+        message: "SessionId and code are required"
       });
     }
 
@@ -1553,14 +1553,14 @@ app.post("/api/login-with-2fa-google", async (req, res) => {
     if (!session) {
       return res.status(400).json({
         success: false,
-        message: "Lejárt vagy érvénytelen session"
+        message: "Expired or invalid session"
       });
     }
 
     if (session.provider !== 'google') {
       return res.status(400).json({
         success: false,
-        message: "Ez a session nem Google bejelentkezéshez tartozik"
+        message: "This session does not belong to a Google login"
       });
     }
 
@@ -1570,7 +1570,7 @@ app.post("/api/login-with-2fa-google", async (req, res) => {
     if (!twoFAData || !twoFAData.is2FAEnabled) {
       return res.status(400).json({
         success: false,
-        message: "2FA nincs engedélyezve"
+        message: "2FA is not enabled"
       });
     }
 
@@ -1597,21 +1597,21 @@ app.post("/api/login-with-2fa-google", async (req, res) => {
 
       res.json({
         success: true,
-        message: "Sikeres 2FA validáció",
+        message: "Successful 2FA validation",
         customToken: customToken,
         remainingBackupCodes: twoFAData.backupCodes?.length || 0,
       });
     } else {
       res.status(400).json({
         success: false,
-        message: "Érvénytelen kód"
+        message: "Invalid code"
       });
     }
   } catch (error) {
     console.error("❌ Google 2FA login error:", error);
     res.status(500).json({
       success: false,
-      message: "Szerver hiba"
+      message: "Server error"
     });
   }
 });
@@ -1624,7 +1624,7 @@ app.post("/api/validate-google-session", async (req, res) => {
     if (!firebaseIdToken || !email) {
       return res.status(400).json({
         success: false,
-        message: "Firebase token és email szükséges"
+        message: "Firebase token and email required"
       });
     }
 
@@ -1636,7 +1636,7 @@ app.post("/api/validate-google-session", async (req, res) => {
     if (decodedToken.email !== email) {
       return res.status(401).json({
         success: false,
-        message: "Email nem egyezik"
+        message: "Email address does not match"
       });
     }
 
@@ -1645,7 +1645,7 @@ app.post("/api/validate-google-session", async (req, res) => {
     if (!userRecord.emailVerified) {
       return res.status(401).json({
         success: false,
-        message: "Nincs megerősítve az email!"
+        message: "Email not verified"
       });
     }
 
@@ -1697,7 +1697,7 @@ app.post("/api/validate-google-session", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Session létrehozva",
+      message: "Session created",
       sessionId
     });
 
@@ -1705,7 +1705,7 @@ app.post("/api/validate-google-session", async (req, res) => {
     console.error("❌ Google session validation error:", error);
     res.status(500).json({
       success: false,
-      message: "Token érvénytelen"
+      message: "Invalid token"
     });
   }
 });
@@ -1763,7 +1763,7 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
     if (!profilePicture) {
       return res.status(400).json({
         success: false,
-        message: "Nincs profilkép a törléshez"
+        message: "No profile picture to delete"
       });
     }
 
@@ -1791,13 +1791,13 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
 
     res.json({
       success: true,
-      message: "Profilkép sikeresen törölve"
+      message: "Profile picture deleted successfully"
     });
   } catch (error) {
     console.error("❌ Delete profile picture error:", error);
     res.status(500).json({
       success: false,
-      message: "Szerver hiba"
+      message: "Server error"
     });
   }
 });
@@ -1837,7 +1837,7 @@ app.get('/api/get-credits', verifyFirebaseToken, async (req, res) => {
     res.json({ success: true, credits, recentTransactions });
   } catch (error) {
     console.error('❌ get-credits error:', error);
-    res.status(500).json({ success: false, message: 'Szerver hiba' });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1850,7 +1850,7 @@ app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
     // 1. Whitelist ellenőrzés – csak előre definiált csomagok fogadhatók
     const pkg = CREDIT_PACKAGES[packageId];
     if (!pkg) {
-      return res.status(400).json({ success: false, message: 'Érvénytelen kredit csomag' });
+      return res.status(400).json({ success: false, message: 'Invalid credit package' });
     }
 
     const userRef = db.collection('users').doc(userId);
@@ -1878,7 +1878,7 @@ app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
       if (alreadyClaimed) {
         return res.status(403).json({
           success: false,
-          message: 'Az ingyenes Starter csomagot már egyszer felhasználtad',
+          message: 'You have already claimed the free Starter pack',
         });
       }
 
@@ -1901,7 +1901,7 @@ app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
         console.warn(`⚠️ Rate limit hit for user ${userId}: ${paidTxCount} paid transactions in 1 hour`);
         return res.status(429).json({
           success: false,
-          message: 'Túl sok kredit feltöltés egy órán belül. Kérlek próbáld újra később.',
+          message: 'Too many credit top-ups in one hour. Please try again later.',
         });
       }
 
@@ -1930,7 +1930,7 @@ app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
 
   } catch (error) {
     console.error('❌ add-credits error:', error);
-    res.status(500).json({ success: false, message: 'Szerver hiba' });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -1959,7 +1959,7 @@ app.get('/api/credit-history', verifyFirebaseToken, async (req, res) => {
     res.json({ success: true, transactions });
   } catch (error) {
     console.error('❌ credit-history error:', error);
-    res.status(500).json({ success: false, message: 'Szerver hiba' });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
