@@ -45,9 +45,35 @@ const MAIL_PROVIDER = process.env.RESEND_API_KEY ? 'resend' : 'smtp';
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || SMTP_PORT === 465;
+const DEFAULT_PRODUCTION_FRONTEND_URL = 'https://ludusgen.com';
+
+function isLocalUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+  } catch {
+    return false;
+  }
+}
 
 function getFrontendUrl() {
-  return (process.env.FRONTEND_URL || 'http://localhost:5173').trim().replace(/\/+$/, '');
+  const configuredUrl = (process.env.FRONTEND_URL || process.env.PUBLIC_FRONTEND_URL || '').trim();
+  const fallbackUrl = process.env.NODE_ENV === 'development'
+    ? 'http://localhost:5173'
+    : DEFAULT_PRODUCTION_FRONTEND_URL;
+
+  const normalizedUrl = (configuredUrl || fallbackUrl).replace(/\/+$/, '');
+  if (
+    configuredUrl
+    && isLocalUrl(normalizedUrl)
+    && process.env.NODE_ENV !== 'development'
+    && process.env.ALLOW_LOCAL_FRONTEND_URL !== 'true'
+  ) {
+    console.warn(`[Email] Ignoring local FRONTEND_URL for email links: ${normalizedUrl}`);
+    return DEFAULT_PRODUCTION_FRONTEND_URL;
+  }
+
+  return normalizedUrl;
 }
 
 function getMailFrom() {
@@ -259,8 +285,8 @@ async function sendForgotPasswordEmail(email, resetLink, displayName) {
   const mailOptions = {
     from: getMailFrom(),
     to: email,
-    subject: 'Jelszó visszaállítása - LudusGen',
-    text: `Jelszó visszaállítási kérelem érkezett a fiókodhoz. Kattints az alábbi linkre: ${resetLink}`,
+    subject: 'Reset your LudusGen password',
+    text: `Hi${displayName ? ` ${displayName}` : ''},\n\nWe received a request to reset the password for your LudusGen account.\n\nReset your password here: ${resetLink}\n\nIf you did not request this, you can safely ignore this email. The link expires in 1 hour.\n\nThe LudusGen Team`,
     html: `
       <!DOCTYPE html>
       <html>
@@ -276,7 +302,7 @@ async function sendForgotPasswordEmail(email, resetLink, displayName) {
                 <!-- Header -->
                 <tr>
                   <td style="padding: 40px 40px 20px 40px; text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 8px 8px 0 0;">
-                    <h1 style="margin: 0; color: #ffffff; font-size: 28px;">🎮 LudusGen</h1>
+                    <h1 style="margin: 0; color: #ffffff; font-size: 28px;">LudusGen</h1>
                   </td>
                 </tr>
 
@@ -284,15 +310,15 @@ async function sendForgotPasswordEmail(email, resetLink, displayName) {
                 <tr>
                   <td style="padding: 40px;">
                     <h2 style="margin: 0 0 20px 0; color: #333333; font-size: 24px;">
-                      Jelszó visszaállítása 🔐
+                      Reset Your Password
                     </h2>
 
                     <p style="margin: 0 0 20px 0; color: #666666; font-size: 16px; line-height: 1.6;">
-                      Szia${displayName ? ` ${displayName}` : ''}! Jelszó visszaállítási kérelem érkezett a fiókoddal kapcsolatban.
+                      Hi${displayName ? ` ${displayName}` : ''}, we received a request to reset the password for your LudusGen account.
                     </p>
 
                     <p style="margin: 0 0 30px 0; color: #666666; font-size: 16px; line-height: 1.6;">
-                      Kattints az alábbi gombra az új jelszó beállításához:
+                      Click the button below to choose a new password:
                     </p>
 
                     <!-- Button -->
@@ -308,14 +334,14 @@ async function sendForgotPasswordEmail(email, resetLink, displayName) {
                             font-weight: bold;
                             border-radius: 6px;
                           ">
-                            🔑 Jelszó visszaállítása
+                            Reset Password
                           </a>
                         </td>
                       </tr>
                     </table>
 
                     <p style="margin: 30px 0 20px 0; color: #999999; font-size: 14px; line-height: 1.6;">
-                      Ha a gomb nem működik, másold be ezt a linket a böngészőbe:
+                      If the button does not work, copy and paste this link into your browser:
                     </p>
 
                     <p style="margin: 0 0 30px 0; padding: 15px; background-color: #f8f8f8; border-radius: 4px; word-break: break-all; color: #666666; font-size: 13px; font-family: monospace;">
@@ -325,7 +351,7 @@ async function sendForgotPasswordEmail(email, resetLink, displayName) {
                     <hr style="border: none; border-top: 1px solid #eeeeee; margin: 30px 0;">
 
                     <p style="margin: 0; color: #999999; font-size: 13px; line-height: 1.6;">
-                      ⚠️ Ha nem te kérted a jelszó visszaállítását, hagyd figyelmen kívül ezt az emailt. A link 1 óra múlva lejár.
+                      If you did not request a password reset, you can safely ignore this email. This link expires in 1 hour.
                     </p>
                   </td>
                 </tr>
@@ -334,7 +360,7 @@ async function sendForgotPasswordEmail(email, resetLink, displayName) {
                 <tr>
                   <td style="padding: 30px 40px; background-color: #f8f8f8; border-radius: 0 0 8px 8px; text-align: center;">
                     <p style="margin: 0; color: #999999; font-size: 12px;">
-                      © ${new Date().getFullYear()} LudusGen. Minden jog fenntartva.
+                      &copy; ${new Date().getFullYear()} LudusGen. All rights reserved.
                     </p>
                   </td>
                 </tr>
@@ -355,8 +381,8 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
   const mailOptions = {
     from: getMailFrom(),
     to: email,
-    subject: 'Erősítsd meg az email címedet - LudusGen',
-    text: `Üdvözlünk a LudusGen-nél! Kattints az alábbi linkre az email megerősítéséhez: ${verificationLink}`, // ✅ Plaintext verzió
+    subject: 'Verify your LudusGen email address',
+    text: `Hi${displayName ? ` ${displayName}` : ''},\n\nWelcome to LudusGen. Please verify your email address to finish creating your account.\n\nVerify your email here: ${verificationLink}\n\nIf you did not create a LudusGen account, you can safely ignore this email. The link expires in 24 hours.\n\nThe LudusGen Team`,
     html: `
       <!DOCTYPE html>
       <html>
@@ -372,7 +398,7 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
                 <!-- Header -->
                 <tr>
                   <td style="padding: 40px 40px 20px 40px; text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 8px 8px 0 0;">
-                    <h1 style="margin: 0; color: #ffffff; font-size: 28px;">🎮 LudusGen</h1>
+                    <h1 style="margin: 0; color: #ffffff; font-size: 28px;">LudusGen</h1>
                   </td>
                 </tr>
                 
@@ -380,15 +406,15 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
                 <tr>
                   <td style="padding: 40px;">
                     <h2 style="margin: 0 0 20px 0; color: #333333; font-size: 24px;">
-                      Üdvözlünk${displayName ? `, ${displayName}` : ''}! 👋
+                      Welcome${displayName ? `, ${displayName}` : ''}!
                     </h2>
                     
                     <p style="margin: 0 0 20px 0; color: #666666; font-size: 16px; line-height: 1.6;">
-                      Köszönjük, hogy regisztráltál a LudusGen platformra! Már csak egy lépés van hátra.
+                      Thanks for signing up for LudusGen. There is just one step left before your account is ready.
                     </p>
                     
                     <p style="margin: 0 0 30px 0; color: #666666; font-size: 16px; line-height: 1.6;">
-                      Kattints az alábbi gombra az email címed megerősítéséhez:
+                      Click the button below to verify your email address:
                     </p>
                     
                     <!-- Button -->
@@ -404,14 +430,14 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
                             font-weight: bold;
                             border-radius: 6px;
                           ">
-                            ✉️ Email megerősítése
+                            Verify Email
                           </a>
                         </td>
                       </tr>
                     </table>
                     
                     <p style="margin: 30px 0 20px 0; color: #999999; font-size: 14px; line-height: 1.6;">
-                      Ha a gomb nem működik, másold be ezt a linket a böngészőbe:
+                      If the button does not work, copy and paste this link into your browser:
                     </p>
                     
                     <p style="margin: 0 0 30px 0; padding: 15px; background-color: #f8f8f8; border-radius: 4px; word-break: break-all; color: #666666; font-size: 13px; font-family: monospace;">
@@ -421,7 +447,7 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
                     <hr style="border: none; border-top: 1px solid #eeeeee; margin: 30px 0;">
                     
                     <p style="margin: 0; color: #999999; font-size: 13px; line-height: 1.6;">
-                      ⚠️ Ha nem te regisztráltál, hagyd figyelmen kívül ezt az emailt. A link 24 óra múlva lejár.
+                      If you did not create a LudusGen account, you can safely ignore this email. This link expires in 24 hours.
                     </p>
                   </td>
                 </tr>
@@ -430,7 +456,7 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
                 <tr>
                   <td style="padding: 30px 40px; background-color: #f8f8f8; border-radius: 0 0 8px 8px; text-align: center;">
                     <p style="margin: 0; color: #999999; font-size: 12px;">
-                      © ${new Date().getFullYear()} LudusGen. Minden jog fenntartva.
+                      &copy; ${new Date().getFullYear()} LudusGen. All rights reserved.
                     </p>
                   </td>
                 </tr>
@@ -534,21 +560,21 @@ app.post("/api/register-user", async (req, res) => {
     if (!email || !password || !displayName) {
       return res.status(400).json({
         success: false,
-        message: "Email, jelszó és név szükséges"
+        message: "Email, password, and name are required"
       });
     }
 
     if (password.length < 6) {
       return res.status(400).json({
         success: false,
-        message: "A jelszó legalább 6 karakter hosszú legyen"
+        message: "Password must be at least 6 characters long"
       });
     }
 
     if (displayName.trim().length < 1) {
       return res.status(400).json({
         success: false,
-        message: "A név legalább 2 karakter hosszú legyen"
+        message: "Name must not be empty"
       });
     }
 
@@ -589,7 +615,7 @@ app.post("/api/register-user", async (req, res) => {
 
       return res.status(502).json({
         success: false,
-        message: "Az email küldése sikertelen. Próbáld újra később.",
+        message: "Email delivery failed. Please try again later.",
       });
     }
 
@@ -611,7 +637,7 @@ app.post("/api/register-user", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Regisztráció sikeres! Elküldtük az email megerősítő linket.",
+      message: "Registration successful. We sent the email verification link.",
     });
 
   } catch (error) {
@@ -620,20 +646,20 @@ app.post("/api/register-user", async (req, res) => {
     if (error.code === 'auth/email-already-exists') {
       return res.status(400).json({
         success: false,
-        message: "Ez az email cím már regisztrálva van"
+        message: "This email address is already registered"
       });
     }
 
     if (error.code === 'auth/invalid-email') {
       return res.status(400).json({
         success: false,
-        message: "Érvénytelen email cím"
+        message: "Invalid email address"
       });
     }
 
     res.status(500).json({
       success: false,
-      message: error.message || "Regisztrációs hiba"
+      message: error.message || "Registration failed"
     });
   }
 });
@@ -1646,7 +1672,7 @@ app.post('/api/forgot-password', async (req, res) => {
 
   try {
     if (!email) {
-      return res.status(200).json({ message: 'Ha létezik a fiók, kiküldtük az emailt.' });
+      return res.status(200).json({ message: 'If an account exists, we sent the email.' });
     }
 
     console.log('📨 Forgot password requested for:', maskEmail(email));
@@ -1657,12 +1683,12 @@ app.post('/api/forgot-password', async (req, res) => {
       userRecord = await admin.auth().getUserByEmail(email);
     } catch (err) {
       // Ha nem létezik, ne áruljuk el - biztonsági okból
-      return res.status(200).json({ message: 'Ha létezik a fiók, kiküldtük az emailt.' });
+      return res.status(200).json({ message: 'If an account exists, we sent the email.' });
     }
 
     // 2. Firebase generálja a reset linket (automatikusan kezeli a tokent)
     const resetLink = await admin.auth().generatePasswordResetLink(email, {
-      url: getFrontendUrl(), // ide irányít vissza reset után
+      url: getFrontendUrl(),
     });
 
     // 3. Küldd ki az emailt a konfigurált email providerrel
@@ -1674,10 +1700,10 @@ app.post('/api/forgot-password', async (req, res) => {
 
     console.log('📧 Forgot password email sent to:', maskEmail(email));
 
-    res.status(200).json({ message: 'Ha létezik a fiók, kiküldtük az emailt.' });
+    res.status(200).json({ message: 'If an account exists, we sent the email.' });
   } catch (error) {
     console.error('[Email] Forgot password error:', getSafeErrorMessage(error));
-    res.status(502).json({ error: 'Az email szolgáltatás átmenetileg nem elérhető.' });
+    res.status(502).json({ error: 'The email service is temporarily unavailable.' });
   }
 });
 
@@ -1910,7 +1936,7 @@ recoverStalePipelines().catch((err) =>
 // ==================== SERVER START ====================
 
 const PORT = Number(process.env.PORT || 3001);
-const server = app.listen(PORT, () => console.log(`🚀 Backend fut a ${PORT}-es porton (Nodemailer + Speakeasy)`));
+const server = app.listen(PORT, () => console.log(`Backend running on port ${PORT} (Email + Speakeasy)`));
 
 server.on("error", (error) => {
   stopTaskRecovery();
