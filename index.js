@@ -37,12 +37,47 @@ const allowedCorsOrigins = new Set([
   ...configuredCorsOrigins,
   ...(process.env.NODE_ENV === 'production' ? [] : DEFAULT_DEV_ORIGINS),
 ]);
+const EMAIL_SEND_TIMEOUT_MS = Number(process.env.EMAIL_SEND_TIMEOUT_MS || 20000);
+
+function getFrontendUrl() {
+  return (process.env.FRONTEND_URL || 'http://localhost:5173').trim().replace(/\/+$/, '');
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
+function maskEmail(email) {
+  const [name = '', domain = ''] = String(email || '').split('@');
+  if (!domain) return 'unknown';
+  return `${name.slice(0, 2)}***@${domain}`;
+}
+
+const isDevCorsOrigin = (origin) => {
+  if (process.env.NODE_ENV === 'production') return false;
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'http:') return false;
+    if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return true;
+    if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(url.hostname)) return true;
+    if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(url.hostname)) return true;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(url.hostname)) return true;
+  } catch {
+    return false;
+  }
+  return false;
+};
 
 // Middlewares
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
     if (allowedCorsOrigins.has(origin)) return callback(null, true);
+    if (isDevCorsOrigin(origin)) return callback(null, true);
     return callback(new Error(`CORS origin not allowed: ${origin}`));
   },
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -55,6 +90,11 @@ app.use("/api/tripo/webhook", express.raw({
 }));
 
 app.use(bodyParser.json({ limit: '10mb' }));
+
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, service: "ludusgen-backend" });
+});
+
 app.use('/api', aiRoutes);     // Add routes after middlewares
 app.use('/api', createMarketplaceRouter(verifyFirebaseToken));
 app.use('/api', createReportRouter(verifyFirebaseToken));
@@ -102,6 +142,9 @@ const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
   port: 587,
   secure: false, // true for 465, false for other ports
+  connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
+  greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
+  socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 20000),
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASSWORD,
@@ -1510,9 +1553,15 @@ app.post("/api/validate-google-session", async (req, res) => {
 });
 
 app.post('/api/forgot-password', async (req, res) => {
-  const { email } = req.body;
+  const email = String(req.body?.email || '').trim().toLowerCase();
 
   try {
+    if (!email) {
+      return res.status(200).json({ message: 'Ha létezik a fiók, kiküldtük az emailt.' });
+    }
+
+    console.log('📨 Forgot password requested for:', maskEmail(email));
+
     // 1. Ellenőrzd hogy létezik-e a user (Firebase Admin)
     let userRecord;
     try {
@@ -1524,11 +1573,17 @@ app.post('/api/forgot-password', async (req, res) => {
 
     // 2. Firebase generálja a reset linket (automatikusan kezeli a tokent)
     const resetLink = await admin.auth().generatePasswordResetLink(email, {
-      url: `http://localhost:5173`, // ide irányít vissza reset után
+      url: getFrontendUrl(), // ide irányít vissza reset után
     });
 
     // 3. Küldd ki az emailt Nodemailerrel
-    await sendForgotPasswordEmail(email, resetLink, userRecord.displayName);
+    await withTimeout(
+      sendForgotPasswordEmail(email, resetLink, userRecord.displayName),
+      EMAIL_SEND_TIMEOUT_MS,
+      'Forgot password email sending timed out',
+    );
+
+    console.log('📧 Forgot password email sent to:', maskEmail(email));
 
     res.status(200).json({ message: 'Ha létezik a fiók, kiküldtük az emailt.' });
   } catch (error) {
