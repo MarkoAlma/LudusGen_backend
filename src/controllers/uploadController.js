@@ -24,6 +24,14 @@ function inferFormat(filename = "", explicitFormat = "", mimeType = "") {
   return "";
 }
 
+const TRUTHY_VALUES = new Set(["1", "true", "yes", "on"]);
+
+function isLegacyModelStsImportEnabled(env = process.env) {
+  return TRUTHY_VALUES.has(String(env.ENABLE_LEGACY_TRIPO_MODEL_STS_IMPORT || "")
+    .trim()
+    .toLowerCase());
+}
+
 export async function getUploadStsTarget(req, res) {
   try {
     const {
@@ -36,6 +44,13 @@ export async function getUploadStsTarget(req, res) {
     const normalizedKind = String(kind).trim().toLowerCase();
     if (!["image", "model"].includes(normalizedKind)) {
       return res.status(400).json({ success: false, message: "kind must be image or model" });
+    }
+
+    if (normalizedKind === "model" && !isLegacyModelStsImportEnabled()) {
+      return res.status(410).json({
+        success: false,
+        message: "Legacy direct model uploads are disabled. Use /api/tripo/assets/upload instead.",
+      });
     }
 
     const format = inferFormat(filename, explicitFormat, mimeType);

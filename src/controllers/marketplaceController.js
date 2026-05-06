@@ -337,6 +337,176 @@ async function getOwnedAssetIds(userId, { verifyAssets = true } = {}) {
   return ownedIds;
 }
 
+function extractPreviewUrlFromNode(node) {
+  if (!node) return null;
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) {
+    for (const entry of node) {
+      const url = extractPreviewUrlFromNode(entry);
+      if (url) return url;
+    }
+    return null;
+  }
+  if (typeof node !== "object") return null;
+
+  return (
+    node.url ||
+    node.image_url ||
+    node.rendered_image_url ||
+    node.preview_url ||
+    node.file_url ||
+    node.href ||
+    null
+  );
+}
+
+function collectHistoryPreviewImageUrls(historyData = {}) {
+  const params = historyData.params ?? {};
+  const output = historyData.output ?? historyData.rawOutput ?? {};
+  const directUrls = [
+    ...(Array.isArray(historyData.image_urls) ? historyData.image_urls : []),
+    ...(Array.isArray(historyData.previewImageUrls) ? historyData.previewImageUrls : []),
+    ...(Array.isArray(historyData.preview_image_urls) ? historyData.preview_image_urls : []),
+    ...(historyData.previewImageUrl ? [historyData.previewImageUrl] : []),
+    ...(historyData.preview_image_url ? [historyData.preview_image_url] : []),
+    ...(Array.isArray(params.previewImageUrls) ? params.previewImageUrls : []),
+    ...(Array.isArray(params.preview_image_urls) ? params.preview_image_urls : []),
+    ...(params.previewImageUrl ? [params.previewImageUrl] : []),
+    ...(params.preview_image_url ? [params.preview_image_url] : []),
+    ...(Array.isArray(output.previewImageUrls) ? output.previewImageUrls : []),
+    ...(Array.isArray(output.preview_image_urls) ? output.preview_image_urls : []),
+    ...(output.previewImageUrl ? [output.previewImageUrl] : []),
+    ...(output.preview_image_url ? [output.preview_image_url] : []),
+  ].filter(Boolean);
+
+  const derivedUrls = [];
+  const nestedCandidates = [
+    historyData.rendered_image,
+    historyData.rendered_images,
+    historyData.preview_image,
+    historyData.preview_images,
+    params.rendered_image,
+    params.rendered_images,
+    params.preview_image,
+    params.preview_images,
+    output.rendered_image,
+    output.rendered_images,
+    output.preview_image,
+    output.preview_images,
+    output.image,
+    output.images,
+    output.generated_image,
+    output.generated_images,
+    output.multiview_images,
+    output.views,
+  ];
+
+  for (const candidate of nestedCandidates) {
+    if (!candidate) continue;
+    if (Array.isArray(candidate)) {
+      candidate.forEach((entry) => {
+        const url = extractPreviewUrlFromNode(entry);
+        if (url) derivedUrls.push(url);
+      });
+      continue;
+    }
+
+    const url = extractPreviewUrlFromNode(candidate);
+    if (url) derivedUrls.push(url);
+  }
+
+  return [...new Set([...directUrls, ...derivedUrls])];
+}
+
+async function resolveMarketplace3dPreviewFallback(data = {}) {
+  if (data.type !== "3d") return null;
+
+  const sourceHistoryId = data.tripo?.sourceHistoryId || data.source?.id || null;
+  const ownerId = data.ownerId || null;
+  const db = admin.firestore();
+  let historyData = null;
+
+  if (sourceHistoryId) {
+    const historySnap = await db.collection("tripo_history").doc(sourceHistoryId).get();
+    if (historySnap.exists) {
+      const sourceHistory = historySnap.data();
+      if (!ownerId || sourceHistory?.userId === ownerId) {
+        historyData = sourceHistory;
+      }
+    }
+  }
+
+  if (!historyData && data.tripo?.importTaskId && ownerId) {
+    const historySnap = await db
+      .collection("tripo_history")
+      .where("taskId", "==", data.tripo.importTaskId)
+      .limit(10)
+      .get();
+    const succeededHistory = historySnap.docs.find((historyDoc) => {
+      const history = historyDoc.data();
+      return history.userId === ownerId && history.status === "succeeded";
+    });
+    historyData = succeededHistory?.data() || null;
+  }
+
+  if (!historyData) return null;
+  const previewUrls = collectHistoryPreviewImageUrls(historyData);
+  return previewUrls[0] || null;
+}
+
+function getHistorySourceRef(db, assetType, source = {}, tripo = {}) {
+  if (assetType !== "3d") return null;
+  const collectionName = source?.collection || "tripo_history";
+  const sourceId = source?.id || tripo?.sourceHistoryId || null;
+  if (collectionName !== "tripo_history" || !sourceId) return null;
+  return db.collection("tripo_history").doc(sourceId);
+}
+
+async function clearHistoryMarketplaceLock(historyRef) {
+  if (!historyRef) return;
+  await historyRef.set({
+    marketplaceLocked: false,
+    marketplaceAssetId: admin.firestore.FieldValue.delete(),
+    marketplacePublishedAt: admin.firestore.FieldValue.delete(),
+  }, { merge: true });
+}
+
+async function reconcileHistoryMarketplaceLock({ db, historyRef, historyData, ownerId }) {
+  if (!historyRef || !historyData) return historyData;
+  if (historyData.marketplaceLocked !== true) return historyData;
+
+  const listedAssetId = historyData.marketplaceAssetId || null;
+  if (!listedAssetId) {
+    await clearHistoryMarketplaceLock(historyRef);
+    return {
+      ...historyData,
+      marketplaceLocked: false,
+      marketplaceAssetId: null,
+      marketplacePublishedAt: null,
+    };
+  }
+
+  const listedAssetSnap = await db.collection(MARKETPLACE_COLLECTIONS.assets).doc(listedAssetId).get();
+  const listedAsset = listedAssetSnap.exists ? listedAssetSnap.data() : null;
+  const stillPublished = Boolean(
+    listedAsset &&
+    listedAsset.ownerId === ownerId &&
+    listedAsset.status === "published"
+  );
+
+  if (stillPublished) {
+    throw Object.assign(new Error("This history item is already listed on the marketplace"), { status: 409 });
+  }
+
+  await clearHistoryMarketplaceLock(historyRef);
+  return {
+    ...historyData,
+    marketplaceLocked: false,
+    marketplaceAssetId: null,
+    marketplacePublishedAt: null,
+  };
+}
+
 async function assetForClient(doc, ownedIds = new Set(), viewerId = null) {
   let data = doc.data ? doc.data() : doc;
   const id = doc.id || data.id;
@@ -383,8 +553,11 @@ async function assetForClient(doc, ownedIds = new Set(), viewerId = null) {
 
   if (previewKey) {
     asset.previewUrl = await storageService.getSignedUrl(previewKey, 3600);
+  } else if (data.type === "3d") {
+    const previewFallbackUrl = await resolveMarketplace3dPreviewFallback(data);
+    if (previewFallbackUrl) asset.previewUrl = previewFallbackUrl;
   }
-  asset.hasPreview = Boolean(previewKey);
+  asset.hasPreview = Boolean(previewKey || asset.previewUrl);
   asset.owned = viewerOwnsAsset;
   asset.viewerCanAccessFile = viewerCanAccessFile;
   asset.downloadOnly = data.type === "3d" && data.tripo?.compatible !== true;
@@ -604,9 +777,18 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
     throw Object.assign(new Error("Source item not found"), { status: 404 });
   }
 
-  const data = snap.data();
+  let data = snap.data();
   if (data.userId !== userId) {
     throw Object.assign(new Error("You do not have access to this history item"), { status: 403 });
+  }
+
+  if (assetType === "3d") {
+    data = await reconcileHistoryMarketplaceLock({
+      db,
+      historyRef: getHistorySourceRef(db, assetType, { collection: collectionName, id: sourceId }),
+      historyData: data,
+      ownerId: userId,
+    });
   }
 
   if (assetType === "image") {
@@ -707,13 +889,9 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
   const targetKey = keyFor(userId, "3d", fileName, "assets");
   await storageService.uploadFile(buffer, targetKey, contentType);
 
-  // Try to grab the Tripo-generated preview image as the marketplace card thumbnail.
-  // tripo_history entries store preview_image_url / preview_image_urls in params.
+  // Prefer the Tripo preview image so marketplace cards show the actual model silhouette.
   let thumbKey = null;
-  const previewImageUrl =
-    data.params?.preview_image_url ||
-    (Array.isArray(data.params?.preview_image_urls) && data.params.preview_image_urls[0]) ||
-    null;
+  const previewImageUrl = collectHistoryPreviewImageUrls(data)[0] || null;
   if (previewImageUrl) {
     try {
       const { buffer: imgBuf } = await downloadExternalAsset(previewImageUrl);
@@ -1113,7 +1291,8 @@ export async function updateMarketplaceAsset(req, res) {
 export async function deleteMarketplaceAsset(req, res) {
   try {
     const userId = req.user?.uid || req.userId;
-    const ref = admin.firestore().collection(MARKETPLACE_COLLECTIONS.assets).doc(req.params.id);
+    const db = admin.firestore();
+    const ref = db.collection(MARKETPLACE_COLLECTIONS.assets).doc(req.params.id);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ success: false, message: "Asset not found" });
 
@@ -1128,6 +1307,19 @@ export async function deleteMarketplaceAsset(req, res) {
       deletedBy: userId,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    if (data.type === "3d") {
+      const historyRef = getHistorySourceRef(db, data.type, data.source, data.tripo);
+      if (historyRef) {
+        const historySnap = await historyRef.get();
+        if (historySnap.exists) {
+          const historyData = historySnap.data() || {};
+          if (!historyData.marketplaceAssetId || historyData.marketplaceAssetId === req.params.id) {
+            await clearHistoryMarketplaceLock(historyRef);
+          }
+        }
+      }
+    }
 
     res.json({
       success: true,

@@ -21,6 +21,7 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 const ALLOWED_EXTENSIONS = new Set(["glb", "fbx", "obj", "stl"]);
 const MAX_FILE_SIZE = TRIPO_MODEL_IMPORT_MAX_BYTES;
+const TRUTHY_VALUES = new Set(["1", "true", "yes", "on"]);
 
 function errorPayload(err) {
   return {
@@ -30,6 +31,12 @@ function errorPayload(err) {
     ...(err.code && { tripoCode: err.code }),
     ...(err.suggestion && { tripoSuggestion: err.suggestion }),
   };
+}
+
+function isLegacyStsImportEnabled(env = process.env) {
+  return TRUTHY_VALUES.has(String(env.ENABLE_LEGACY_TRIPO_MODEL_STS_IMPORT || "")
+    .trim()
+    .toLowerCase());
 }
 
 /**
@@ -137,6 +144,14 @@ export async function uploadAsset(req, res) {
  * Creates an import_model task from a client-side STS uploaded object.
  */
 export async function importUploadedAsset(req, res) {
+  if (!isLegacyStsImportEnabled()) {
+    res.status(410).json({
+      success: false,
+      message: "Legacy direct model imports are disabled. Upload the model through /api/tripo/assets/upload instead.",
+    });
+    return;
+  }
+
   const userId = req.user?.uid;
   if (!userId) {
     res.status(401).json({ success: false, message: "Unauthorized" });

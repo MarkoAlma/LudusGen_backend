@@ -2825,6 +2825,8 @@ router.post('/texture-paint-edit', verifyFirebaseToken, imageLimiter, async (req
                 aspect_ratio: `${targetWidth}:${targetHeight}`,
                 width: targetWidth,
                 height: targetHeight,
+            }).catch((galleryError) => {
+                console.warn('[TexturePaint] Gallery upload failed:', galleryError?.message || galleryError);
             });
             return res.json({
                 success: true,
@@ -2891,6 +2893,8 @@ router.post('/texture-paint-edit', verifyFirebaseToken, imageLimiter, async (req
             aspect_ratio: `${targetWidth}:${targetHeight}`,
             width: targetWidth,
             height: targetHeight,
+        }).catch((galleryError) => {
+            console.warn('[TexturePaint] Gallery upload failed:', galleryError?.message || galleryError);
         });
 
         return res.json({
@@ -3023,12 +3027,15 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
             if (images.length === 0) throw new Error('A Gemini nem adott vissza kepet.');
             await logUsage(req.userId, 'image', { provider: 'google-image', apiId, numImages: images.length });
-            for (const img of images) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'google-image', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'google-image', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_google_image',
+            });
             unregisterJob(jobId);
             sseStart(res);
-            sseEmit(res, { type: 'done', images });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
@@ -3194,11 +3201,14 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 const { url: finalUrl, base64 } = await postProcess(immediateUrl, resizeMultiplier);
                 const finalImages = [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }];
                 await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
-                for (const img of finalImages) {
-                    processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
-                }
+                const persisted = await persistGeneratedImagesForResponse({
+                    userId: req.userId,
+                    images: finalImages,
+                    metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height }),
+                    filenamePrefix: 'ludusgen_modelscope_image',
+                });
                 sseStart(res);
-                sseEmit(res, { type: 'done', images: finalImages });
+                sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
                 return res.end();
             }
 
@@ -3258,11 +3268,14 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             const finalImages = [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }];
             await cleanupB2();
             await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
-            for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images: finalImages,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_modelscope_image',
+            });
             unregisterJob(jobId);
-            sseEmit(res, { type: 'done', images: finalImages });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
@@ -3294,12 +3307,15 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             const contentType = cfResp.headers['content-type']?.split(';')[0] || 'image/png';
             const finalImages = [{ url: `data:${contentType};base64,${base64}`, width: image_size.width || 1024, height: image_size.height || 1024 }];
             await logUsage(req.userId, 'image', { provider: 'cloudflare', apiId, numImages: 1 });
-            for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'cloudflare', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images: finalImages,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'cloudflare', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_cloudflare_image',
+            });
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
-            sseEmit(res, { type: 'done', images: finalImages });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
@@ -3342,12 +3358,15 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
             const finalImages = [{ url: `data:image/png;base64,${base64Image}`, width: image_size.width || 1024, height: image_size.height || 1024 }];
             await logUsage(req.userId, 'image', { provider: 'nvidia-image', apiId, numImages: 1 });
-            for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'nvidia-image', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images: finalImages,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'nvidia-image', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_nvidia_image',
+            });
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
-            sseEmit(res, { type: 'done', images: finalImages });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
@@ -3377,12 +3396,15 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             if (images.length === 0) throw new Error('Nem erkezett kep');
 
             await logUsage(req.userId, 'image', { apiId, numImages: num_images });
-            for (const img of images) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'fal', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'fal', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_fal_image',
+            });
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
-            sseEmit(res, { type: 'done', images });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
@@ -3500,16 +3522,23 @@ router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImag
             console.warn('[Upscale] Output meret beolvasas kihagyva:', err.message);
         }
 
-        const storedImage = await processImageAndUpload(req.userId, imageUrl, {
-            prompt: `${upscaleModel} upscale`,
-            modelId: upscaleModel,
-            provider: 'deapi-upscale',
-            aspect_ratio: inputMeta.width && inputMeta.height ? `${inputMeta.width}:${inputMeta.height}` : 'upscale',
-            width,
-            height,
-            operation: 'upscale',
-            requestId,
-        });
+        let storedImage = null;
+        const warnings = [];
+        try {
+            storedImage = await processImageAndUpload(req.userId, imageUrl, {
+                prompt: `${upscaleModel} upscale`,
+                modelId: upscaleModel,
+                provider: 'deapi-upscale',
+                aspect_ratio: inputMeta.width && inputMeta.height ? `${inputMeta.width}:${inputMeta.height}` : 'upscale',
+                width,
+                height,
+                operation: 'upscale',
+                requestId,
+            });
+        } catch (galleryError) {
+            warnings.push('A kep felnagyitasa sikerult, de a Gallery mentese sikertelen volt. Töltsd le most, es probald meg kesobb ujra.');
+            console.warn('[Upscale] Gallery persistence failed:', galleryError.message);
+        }
         const imageId = storedImage?.id || null;
 
         let outputImage = {
@@ -3559,6 +3588,7 @@ router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImag
             type: 'done',
             success: true,
             images: [outputImage],
+            warnings,
             requestId,
             elapsed,
         });
@@ -5962,98 +5992,176 @@ function isAllowedGalleryImportSource(source) {
     }
 }
 
+const IMAGE_GALLERY_PERSIST_MAX_ATTEMPTS = 3;
+
 async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
-    try {
-        const galleryCollection = admin.firestore().collection('generated_images');
-        const requestedDocId = safeGalleryDocId(metadata.docId);
-        if (requestedDocId) {
-            const existing = await galleryCollection.doc(requestedDocId).get();
-            if (existing.exists && existing.data()?.userId === userId) {
-                return {
-                    id: existing.id,
-                    duplicate: true,
-                    fullKey: existing.data()?.full_key || null,
-                    thumbKey: existing.data()?.thumb_key || null,
-                    width: existing.data()?.width || null,
-                    height: existing.data()?.height || null,
-                    contentType: existing.data()?.contentType || 'image/png',
-                    extension: 'png',
-                };
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= IMAGE_GALLERY_PERSIST_MAX_ATTEMPTS; attempt += 1) {
+        try {
+            const galleryCollection = admin.firestore().collection('generated_images');
+            const requestedDocId = safeGalleryDocId(metadata.docId);
+            if (requestedDocId) {
+                const existing = await galleryCollection.doc(requestedDocId).get();
+                if (existing.exists && existing.data()?.userId === userId) {
+                    return {
+                        id: existing.id,
+                        duplicate: true,
+                        fullKey: existing.data()?.full_key || null,
+                        thumbKey: existing.data()?.thumb_key || null,
+                        width: existing.data()?.width || null,
+                        height: existing.data()?.height || null,
+                        contentType: existing.data()?.contentType || 'image/png',
+                        extension: 'png',
+                    };
+                }
+            }
+
+            let inputBuffer;
+            let originalMime = 'image/png';
+
+            if (sourceUrlOrBase64.startsWith('data:')) {
+                const parts = sourceUrlOrBase64.split(',');
+                inputBuffer = Buffer.from(parts[1], 'base64');
+                originalMime = parts[0].match(/:(.*?);/)?.[1] || 'image/png';
+            } else {
+                const resp = await axios.get(sourceUrlOrBase64, { responseType: 'arraybuffer' });
+                inputBuffer = Buffer.from(resp.data);
+                originalMime = resp.headers['content-type'] || 'image/png';
+            }
+
+            const meta = await sharp(inputBuffer).metadata();
+            const ext = meta.format || 'png';
+
+            const timestamp = Date.now();
+            const rand = Math.random().toString(36).slice(2, 7);
+            const baseFilename = `${timestamp}_${rand}`;
+
+            const fullKey = `users/${userId}/images/full/${baseFilename}.${ext}`;
+            await uploadMediaToB2(inputBuffer, fullKey, originalMime);
+
+            const thumbKey = `users/${userId}/images/thumb/${baseFilename}.webp`;
+            const thumbBuffer = await sharp(inputBuffer)
+                .resize(300, null, { withoutEnlargement: true })
+                .webp({ quality: 80 })
+                .toBuffer();
+            await uploadMediaToB2(thumbBuffer, thumbKey, 'image/webp');
+
+            const storedWidth = metadata.width || meta.width || 1024;
+            const storedHeight = metadata.height || meta.height || 1024;
+
+            const galleryPayload = {
+                userId,
+                full_key: fullKey,
+                thumb_key: thumbKey,
+                prompt: metadata.prompt || '',
+                modelId: metadata.modelId || '',
+                provider: metadata.provider || '',
+                aspect_ratio: metadata.aspect_ratio || '1:1',
+                width: storedWidth,
+                height: storedHeight,
+                operation: metadata.operation || null,
+                requestId: metadata.requestId || null,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            };
+
+            let docRef;
+            if (requestedDocId) {
+                docRef = galleryCollection.doc(requestedDocId);
+                await docRef.set(galleryPayload);
+            } else {
+                docRef = await galleryCollection.add(galleryPayload);
+            }
+
+            return {
+                id: docRef.id,
+                fullKey,
+                thumbKey,
+                width: storedWidth,
+                height: storedHeight,
+                contentType: originalMime,
+                extension: ext,
+            };
+        } catch (err) {
+            lastError = err;
+            if (attempt < IMAGE_GALLERY_PERSIST_MAX_ATTEMPTS) {
+                console.warn(`[GalleryStore] Attempt ${attempt} failed:`, err.message);
+                await new Promise((resolve) => setTimeout(resolve, attempt * 350));
+                continue;
             }
         }
-
-        let inputBuffer;
-        let originalMime = 'image/png';
-
-        if (sourceUrlOrBase64.startsWith('data:')) {
-            const parts = sourceUrlOrBase64.split(',');
-            inputBuffer = Buffer.from(parts[1], 'base64');
-            originalMime = parts[0].match(/:(.*?);/)?.[1] || 'image/png';
-        } else {
-            const resp = await axios.get(sourceUrlOrBase64, { responseType: 'arraybuffer' });
-            inputBuffer = Buffer.from(resp.data);
-            originalMime = resp.headers['content-type'] || 'image/png';
-        }
-
-        const meta = await sharp(inputBuffer).metadata();
-        const ext = meta.format || 'png';
-
-        const timestamp = Date.now();
-        const rand = Math.random().toString(36).slice(2, 7);
-        const baseFilename = `${timestamp}_${rand}`;
-
-        // 1. Full resolution upload - DIRECT BUFFER (No re-encoding!)
-        const fullKey = `users/${userId}/images/full/${baseFilename}.${ext}`;
-        await uploadMediaToB2(inputBuffer, fullKey, originalMime);
-
-        // 2. Thumbnail upload - (Still re-encoded for speed)
-        const thumbKey = `users/${userId}/images/thumb/${baseFilename}.webp`;
-        const thumbBuffer = await sharp(inputBuffer)
-            .resize(300, null, { withoutEnlargement: true })
-            .webp({ quality: 80 })
-            .toBuffer();
-        await uploadMediaToB2(thumbBuffer, thumbKey, 'image/webp');
-
-        const storedWidth = metadata.width || meta.width || 1024;
-        const storedHeight = metadata.height || meta.height || 1024;
-
-        // 3. Save to Firestore
-        const galleryPayload = {
-            userId,
-            full_key: fullKey,
-            thumb_key: thumbKey,
-            prompt: metadata.prompt || '',
-            modelId: metadata.modelId || '',
-            provider: metadata.provider || '',
-            aspect_ratio: metadata.aspect_ratio || '1:1',
-            width: storedWidth,
-            height: storedHeight,
-            operation: metadata.operation || null,
-            requestId: metadata.requestId || null,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
-
-        let docRef;
-        if (requestedDocId) {
-            docRef = galleryCollection.doc(requestedDocId);
-            await docRef.set(galleryPayload);
-        } else {
-            docRef = await galleryCollection.add(galleryPayload);
-        }
-
-        return {
-            id: docRef.id,
-            fullKey,
-            thumbKey,
-            width: storedWidth,
-            height: storedHeight,
-            contentType: originalMime,
-            extension: ext,
-        };
-    } catch (err) {
-        console.error('[GalleryStore] Error:', err.message);
-        return null;
     }
+
+    console.error('[GalleryStore] Error:', lastError?.message || 'Unknown gallery persistence error');
+    throw lastError || new Error('Gallery persistence failed');
+}
+
+async function buildStoredImageResponse(image, storedImage, fallbackPrefix = 'ludusgen_image') {
+    const baseUrl = image?.url || image?.fullUrl || image?.downloadUrl || image?.image_url || image?.b64_json || null;
+    const responseImage = {
+        ...image,
+        url: baseUrl,
+        fullUrl: image?.fullUrl || baseUrl,
+        downloadUrl: image?.downloadUrl || baseUrl,
+        imageId: storedImage?.id || image?.imageId || image?.id || null,
+        width: storedImage?.width || image?.width || null,
+        height: storedImage?.height || image?.height || null,
+    };
+
+    if (!storedImage?.fullKey) {
+        return responseImage;
+    }
+
+    const filename = sanitizeImageDownloadFilename(`${fallbackPrefix}_${storedImage.id || Date.now()}.${storedImage.extension || 'png'}`);
+    const fullUrl = await getSignedUrl(b2, new GetObjectCommand({
+        Bucket: process.env.B2_BUCKET_NAME,
+        Key: storedImage.fullKey,
+    }), { expiresIn: 3600 });
+    const downloadUrl = await getSignedUrl(b2, new GetObjectCommand({
+        Bucket: process.env.B2_BUCKET_NAME,
+        Key: storedImage.fullKey,
+        ResponseContentDisposition: `attachment; filename="${filename}"`,
+    }), { expiresIn: 3600 });
+
+    return {
+        ...responseImage,
+        url: fullUrl,
+        fullUrl,
+        downloadUrl,
+        storage: 'b2',
+        fullKey: storedImage.fullKey,
+        thumbKey: storedImage.thumbKey || null,
+    };
+}
+
+async function persistGeneratedImagesForResponse({ userId, images, metadata, filenamePrefix = 'ludusgen_image' }) {
+    const warnings = [];
+    const resolvedImages = [];
+
+    for (let index = 0; index < images.length; index += 1) {
+        const image = images[index];
+        const resolvedMetadata = typeof metadata === 'function' ? metadata(image, index) : metadata;
+
+        try {
+            const storedImage = await processImageAndUpload(userId, image.url, resolvedMetadata);
+            resolvedImages.push(await buildStoredImageResponse(image, storedImage, filenamePrefix));
+        } catch (error) {
+            console.warn('[GalleryStore] Persist warning:', error.message);
+            warnings.push('A kep elkeszult, de a Gallery mentese sikertelen volt. Töltsd le most, es probald meg kesobb ujra.');
+            resolvedImages.push({
+                ...image,
+                url: image?.url || image?.fullUrl || image?.downloadUrl || null,
+                fullUrl: image?.fullUrl || image?.url || null,
+                downloadUrl: image?.downloadUrl || image?.url || image?.fullUrl || null,
+                imageId: image?.imageId || image?.id || null,
+            });
+        }
+    }
+
+    return {
+        images: resolvedImages,
+        warnings: [...new Set(warnings)],
+    };
 }
 
 async function streamB2Key(key, filename, res) {
