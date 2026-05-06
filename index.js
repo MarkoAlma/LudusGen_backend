@@ -7,6 +7,7 @@ import QRCode from "qrcode";
 import admin from "firebase-admin";
 import { readFileSync } from "fs";
 import nodemailer from "nodemailer";
+import axios from "axios";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
 
@@ -38,9 +39,32 @@ const allowedCorsOrigins = new Set([
   ...(process.env.NODE_ENV === 'production' ? [] : DEFAULT_DEV_ORIGINS),
 ]);
 const EMAIL_SEND_TIMEOUT_MS = Number(process.env.EMAIL_SEND_TIMEOUT_MS || 20000);
+const RESEND_API_URL = 'https://api.resend.com/emails';
+const MAIL_PROVIDER = process.env.RESEND_API_KEY ? 'resend' : 'smtp';
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || SMTP_PORT === 465;
 
 function getFrontendUrl() {
   return (process.env.FRONTEND_URL || 'http://localhost:5173').trim().replace(/\/+$/, '');
+}
+
+function getMailFrom() {
+  const configuredFrom = (process.env.EMAIL_FROM || process.env.MAIL_FROM || '').trim();
+  if (configuredFrom) return configuredFrom;
+
+  const emailUser = (process.env.EMAIL_USER || '').trim();
+  return emailUser ? `LudusGen <${emailUser}>` : '';
+}
+
+function getSafeErrorMessage(error) {
+  if (error?.response?.data) {
+    const data = typeof error.response.data === 'string'
+      ? error.response.data
+      : JSON.stringify(error.response.data);
+    return `${error.response.status || 'HTTP'} ${data}`;
+  }
+  return error?.message || String(error);
 }
 
 function withTimeout(promise, timeoutMs, message) {
@@ -137,11 +161,11 @@ try {
 const db = admin.firestore();
 
 
-// ==================== NODEMAILER SETUP ====================
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false, // true for 465, false for other ports
+// ==================== EMAIL SETUP ====================
+const smtpTransporter = nodemailer.createTransport({
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: SMTP_SECURE, // true for 465, false for STARTTLS ports
   connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
   greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
   socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 20000),
@@ -156,21 +180,79 @@ const transporter = nodemailer.createTransport({
 
 
 
-// ✅ VERIFY CONNECTION
-transporter.verify(function (error, success) {
-  if (error) {
-    console.log('❌ SMTP connection error:', error);
+console.log('[Email] Provider:', MAIL_PROVIDER);
+console.log('[Email] From configured:', getMailFrom() ? 'yes' : 'no');
+console.log('[Email] Frontend URL:', getFrontendUrl());
+
+if (MAIL_PROVIDER === 'smtp') {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
+    console.warn('[Email] SMTP credentials are missing. Set EMAIL_USER and EMAIL_PASSWORD.');
   } else {
-    console.log('✅ SMTP server is ready to send emails');
+    smtpTransporter.verify(function (error) {
+      if (error) {
+        console.log('[Email] SMTP connection error:', getSafeErrorMessage(error));
+      } else {
+        console.log('[Email] SMTP server is ready to send emails');
+      }
+    });
   }
-});
+} else {
+  console.log('[Email] Using Resend HTTP API for transactional emails');
+}
+
+async function sendTransactionalEmail(mailOptions) {
+  const from = mailOptions.from || getMailFrom();
+  if (!from) {
+    throw new Error('Email sender is not configured. Set EMAIL_FROM or EMAIL_USER.');
+  }
+
+  if (MAIL_PROVIDER === 'resend') {
+    try {
+      const response = await axios.post(
+        RESEND_API_URL,
+        {
+          from,
+          to: mailOptions.to,
+          subject: mailOptions.subject,
+          text: mailOptions.text,
+          html: mailOptions.html,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: EMAIL_SEND_TIMEOUT_MS,
+        },
+      );
+
+      return {
+        provider: 'resend',
+        messageId: response.data?.id,
+      };
+    } catch (error) {
+      throw new Error(`Resend email failed: ${getSafeErrorMessage(error)}`);
+    }
+  }
+
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
+    throw new Error('SMTP credentials are not configured. Set EMAIL_USER and EMAIL_PASSWORD.');
+  }
+
+  const info = await smtpTransporter.sendMail({
+    ...mailOptions,
+    from,
+  });
+
+  return {
+    provider: 'smtp',
+    messageId: info.messageId,
+  };
+}
 
 async function sendForgotPasswordEmail(email, resetLink, displayName) {
   const mailOptions = {
-    from: {
-      name: 'LudusGen',
-      address: process.env.EMAIL_USER
-    },
+    from: getMailFrom(),
     to: email,
     subject: 'Jelszó visszaállítása - LudusGen',
     text: `Jelszó visszaállítási kérelem érkezett a fiókodhoz. Kattints az alábbi linkre: ${resetLink}`,
@@ -260,16 +342,13 @@ async function sendForgotPasswordEmail(email, resetLink, displayName) {
     `,
   };
 
-  await transporter.sendMail(mailOptions);
+  return sendTransactionalEmail(mailOptions);
 }
 
 // Email küldő függvény
 async function sendVerificationEmail(email, verificationLink, displayName) {
   const mailOptions = {
-    from: {
-      name: 'LudusGen',
-      address: process.env.EMAIL_USER
-    },
+    from: getMailFrom(),
     to: email,
     subject: 'Erősítsd meg az email címedet - LudusGen',
     text: `Üdvözlünk a LudusGen-nél! Kattints az alábbi linkre az email megerősítéséhez: ${verificationLink}`, // ✅ Plaintext verzió
@@ -359,17 +438,12 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
     `,
   };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('✅ Verification email sent to:', email);
-    console.log('📧 Message ID:', info.messageId);
-    console.log('📬 Preview URL:', nodemailer.getTestMessageUrl(info)); // Ha Ethereal-t használnál
-    return true;
-  } catch (error) {
-    console.error('❌ Email sending failed:', error);
-    console.error('Error details:', error.message);
-    return false;
+  const info = await sendTransactionalEmail(mailOptions);
+  console.log('[Email] Verification email sent to:', maskEmail(email));
+  if (info.messageId) {
+    console.log('[Email] Message ID:', info.messageId);
   }
+  return info;
 }
 
 // verifyFirebaseToken imported from ./src/middleware/verifyFirebaseToken.js
@@ -487,21 +561,31 @@ app.post("/api/register-user", async (req, res) => {
 
     // 2. Email verifikációs link generálása
     const verificationLink = await admin.auth().generateEmailVerificationLink(email, {
-      url: 'http://localhost:5173', // Ide irányít az email link után
+      url: getFrontendUrl(),
     });
-    console.log(verificationLink);
-
 
     console.log("📧 Email verification link generated");
 
-    // 3. Email küldése Nodemailer-rel
-    const emailSent = await sendVerificationEmail(email, verificationLink, displayName);
+    // 3. Email küldése
+    try {
+      await withTimeout(
+        sendVerificationEmail(email, verificationLink, displayName),
+        EMAIL_SEND_TIMEOUT_MS,
+        'Verification email sending timed out',
+      );
+    } catch (emailError) {
+      console.error('[Email] Verification email failed:', getSafeErrorMessage(emailError));
+      try {
+        await admin.auth().deleteUser(userRecord.uid);
+        console.warn('[Email] Deleted auth user after verification email failure:', userRecord.uid);
+      } catch (cleanupError) {
+        console.error('[Email] Could not delete auth user after email failure:', getSafeErrorMessage(cleanupError));
+      }
 
-    if (!emailSent) {
-      console.warn('⚠️ Email sending failed, but user created');
-      // Opcionális: törölheted a usert, ha az email küldés sikertelen
-      // await admin.auth().deleteUser(userRecord.uid);
-      // return res.status(500).json({ success: false, message: "Email küldése sikertelen" });
+      return res.status(502).json({
+        success: false,
+        message: "Az email küldése sikertelen. Próbáld újra később.",
+      });
     }
 
     // 4. Firestore dokumentum létrehozása
@@ -1576,7 +1660,7 @@ app.post('/api/forgot-password', async (req, res) => {
       url: getFrontendUrl(), // ide irányít vissza reset után
     });
 
-    // 3. Küldd ki az emailt Nodemailerrel
+    // 3. Küldd ki az emailt a konfigurált email providerrel
     await withTimeout(
       sendForgotPasswordEmail(email, resetLink, userRecord.displayName),
       EMAIL_SEND_TIMEOUT_MS,
@@ -1587,8 +1671,8 @@ app.post('/api/forgot-password', async (req, res) => {
 
     res.status(200).json({ message: 'Ha létezik a fiók, kiküldtük az emailt.' });
   } catch (error) {
-    console.error('❌ Forgot password error:', error);
-    res.status(500).json({ error: 'Szerverhiba.' });
+    console.error('[Email] Forgot password error:', getSafeErrorMessage(error));
+    res.status(502).json({ error: 'Az email szolgáltatás átmenetileg nem elérhető.' });
   }
 });
 
