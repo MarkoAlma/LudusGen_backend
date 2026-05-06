@@ -45,14 +45,45 @@ const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || SMTP_PORT === 465;
 const DEFAULT_PRODUCTION_FRONTEND_URL = 'https://ludusgen.com';
+const DEV_FRONTEND_PORTS = new Set(['5173', '5174', '5179']);
+
+function parseUrl(value) {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
 
 function isLocalUrl(value) {
-  try {
-    const url = new URL(value);
-    return url.hostname === 'localhost' || url.hostname === '127.0.0.1';
-  } catch {
-    return false;
+  const url = parseUrl(value);
+  return !!url && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
+}
+
+function hasDevFrontendPort(value) {
+  const url = parseUrl(value);
+  return !!url && DEV_FRONTEND_PORTS.has(url.port);
+}
+
+function normalizeFrontendUrl(value) {
+  const allowLocalFrontend = process.env.ALLOW_LOCAL_FRONTEND_URL === 'true';
+  const url = parseUrl(String(value || '').trim());
+  const productionUrl = new URL(DEFAULT_PRODUCTION_FRONTEND_URL);
+
+  if (!url) return DEFAULT_PRODUCTION_FRONTEND_URL;
+
+  if ((isLocalUrl(url.href) || hasDevFrontendPort(url.href)) && !allowLocalFrontend) {
+    console.warn(`[Email] Ignoring development frontend URL for auth email links: ${url.href}`);
+    return DEFAULT_PRODUCTION_FRONTEND_URL;
   }
+
+  if (process.env.NODE_ENV !== 'development' && !allowLocalFrontend) {
+    url.protocol = 'https:';
+    if (DEV_FRONTEND_PORTS.has(url.port)) url.port = '';
+    if (url.hostname === productionUrl.hostname) url.port = '';
+  }
+
+  return url.toString().replace(/\/+$/, '');
 }
 
 function getFrontendUrl() {
@@ -61,16 +92,7 @@ function getFrontendUrl() {
     ? 'http://localhost:5173'
     : DEFAULT_PRODUCTION_FRONTEND_URL;
 
-  const normalizedUrl = (configuredUrl || fallbackUrl).replace(/\/+$/, '');
-  if (
-    isLocalUrl(normalizedUrl)
-    && process.env.ALLOW_LOCAL_FRONTEND_URL !== 'true'
-  ) {
-    console.warn(`[Email] Ignoring local frontend URL for auth email links: ${normalizedUrl}`);
-    return DEFAULT_PRODUCTION_FRONTEND_URL;
-  }
-
-  return normalizedUrl;
+  return normalizeFrontendUrl(configuredUrl || fallbackUrl);
 }
 
 function normalizeAuthActionLink(actionLink) {
@@ -79,16 +101,18 @@ function normalizeAuthActionLink(actionLink) {
   try {
     const linkUrl = new URL(actionLink);
     const appUrl = new URL(frontendUrl);
+    const allowLocalFrontend = process.env.ALLOW_LOCAL_FRONTEND_URL === 'true';
 
-    if (isLocalUrl(linkUrl.href) && process.env.ALLOW_LOCAL_FRONTEND_URL !== 'true') {
+    if ((isLocalUrl(linkUrl.href) || hasDevFrontendPort(linkUrl.href)) && !allowLocalFrontend) {
       linkUrl.protocol = appUrl.protocol;
-      linkUrl.host = appUrl.host;
+      linkUrl.hostname = appUrl.hostname;
+      linkUrl.port = appUrl.port;
       linkUrl.username = '';
       linkUrl.password = '';
     }
 
     const continueUrl = linkUrl.searchParams.get('continueUrl');
-    if (!continueUrl || isLocalUrl(continueUrl)) {
+    if (!continueUrl || isLocalUrl(continueUrl) || hasDevFrontendPort(continueUrl)) {
       linkUrl.searchParams.set('continueUrl', frontendUrl);
     }
 
