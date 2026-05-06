@@ -71,14 +71,27 @@ console.log('☁️ Cloudinary configured:', process.env.CLOUDINARY_CLOUD_NAME ?
 
 // ==================== FIREBASE ADMIN INIT ====================
 try {
-  const serviceAccount = JSON.parse(readFileSync("./serviceAccountKey.json"));
+  let serviceAccount;
+  
+  if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
+    serviceAccount = {
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n').replace(/"/g, ''),
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    };
+  } else {
+    serviceAccount = JSON.parse(readFileSync("./serviceAccountKey.json"));
+  }
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
   console.log("✅ Firebase Admin inicializálva");
 } catch (error) {
   console.error("❌ Firebase Admin init hiba:", error.message);
-  console.log("Győződj meg róla, hogy a serviceAccountKey.json létezik!");
+  if (!process.env.FIREBASE_PROJECT_ID) {
+    console.log("Győződj meg róla, hogy a serviceAccountKey.json létezik, vagy állítsd be a környezeti változókat!");
+  }
 }
 
 const db = admin.firestore();
