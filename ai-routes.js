@@ -59,6 +59,7 @@ import {
 } from './src/lib/spriteSecurity.js';
 import { storageService } from './src/services/storageService.js';
 import { canAccessMarketplaceStorageKey } from './src/services/marketplaceService.js';
+import { extractTrellisModelBase64, summarizeTrellisResponse } from './src/lib/trellisResponse.js';
 import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
 import {
     generateSpriteWithProvider,
@@ -104,6 +105,7 @@ import {
 } from './src/services/spriteJobService.js';
 import { postProcessSpriteAssets } from './src/services/spritePostProcessingService.js';
 import { assertMeshyAccess, isMeshyEnabled } from './src/services/meshyAccessService.js';
+import { resolveTrellisRequestSeed } from './src/lib/trellisSeed.js';
 import {
     IMAGE_STUDIO_SUBSCRIPTION_REQUIRED_CODE,
     SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
@@ -213,18 +215,18 @@ const activeStreams = new Map();
 
 router.post('/cancel-job', verifyFirebaseToken, (req, res) => {
     const { jobId } = req.body;
-    if (!jobId) return res.status(400).json({ success: false, message: 'Hiányzó jobId' });
+    if (!jobId) return res.status(400).json({ success: false, message: 'Missing jobId' });
     const job = activeJobs.get(jobId);
     if (job) {
         if (!job.userId || job.userId !== req.userId) {
-            return res.status(403).json({ success: false, message: 'Nincs jogosultsag a folyamat megszakitasahoz' });
+            return res.status(403).json({ success: false, message: 'You are not allowed to cancel this job' });
         }
         console.log(`[Cancel] User requested cancellation for job: ${jobId}`);
         job.controller.abort();
         unregisterJob(jobId);
-        return res.json({ success: true, message: 'Folyamat megszakítva' });
+        return res.json({ success: true, message: 'Job cancelled' });
     }
-    return res.status(404).json({ success: false, message: 'Folyamat nem található vagy már véget ért' });
+    return res.status(404).json({ success: false, message: 'Job not found or already finished' });
 });
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -5967,6 +5969,23 @@ import fetch from 'node-fetch';
 
 const TRELLIS_NIM_URL = 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis';
 const keepAliveAgent = new https.Agent({ keepAlive: true, timeout: 190_000 });
+const TRELLIS_PROMPT_MAX_LENGTH = 77;
+const TRELLIS_CFG_SCALE_MIN = 1;
+const TRELLIS_CFG_SCALE_MAX = 10;
+const TRELLIS_SAMPLING_STEPS_MIN = 10;
+const TRELLIS_SAMPLING_STEPS_MAX = 50;
+
+function clampNumber(value, min, max, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
+}
+
+function clampInteger(value, min, max, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(parsed)));
+}
 
 const b2 = new S3Client({
     region: 'us-east-005',
@@ -6344,40 +6363,40 @@ router.post('/audio/download', verifyFirebaseToken, async (req, res) => {
 router.get('/trellis/model/:filename', verifyFirebaseToken, async (req, res) => {
     const key = `trellis/${req.params.filename}`;
     try { await streamB2Key(key, req.params.filename, res); }
-    catch (err) { res.status(404).json({ success: false, message: 'Fájl nem található' }); }
+    catch (err) { res.status(404).json({ success: false, message: 'File not found' }); }
 });
 
 router.get('/trellis/proxy', verifyFirebaseToken, async (req, res) => {
     let key = req.query.key;
     if (!key && req.query.url) {
         try { const u = new URL(req.query.url); key = u.pathname.replace(/^\/[^/]+\//, ''); }
-        catch { return res.status(400).json({ success: false, message: 'Érvénytelen URL' }); }
+        catch { return res.status(400).json({ success: false, message: 'Invalid URL' }); }
     }
-    if (!key) return res.status(400).json({ success: false, message: 'Hiányzó key vagy url param' });
+    if (!key) return res.status(400).json({ success: false, message: 'Missing key or url parameter' });
     const filename = key.split('/').pop();
     try { await streamB2Key(key, filename, res); }
-    catch (err) { res.status(404).json({ success: false, message: 'Fájl nem található' }); }
+    catch (err) { res.status(404).json({ success: false, message: 'File not found' }); }
 });
 
 router.delete('/trellis/history/:id', verifyFirebaseToken, async (req, res) => {
     const { id } = req.params;
     const userId = req.userId;
-    if (!id) return res.status(400).json({ success: false, message: 'Hiányzó modell ID' });
+    if (!id) return res.status(400).json({ success: false, message: 'Missing model ID' });
 
     try {
         const docRef = admin.firestore().collection('trellis_history').doc(id);
         const doc = await docRef.get();
-        if (!doc.exists) return res.status(404).json({ success: false, message: 'Modell nem található' });
+        if (!doc.exists) return res.status(404).json({ success: false, message: 'Model not found' });
         const data = doc.data();
-        if (data.userId !== userId) return res.status(403).json({ success: false, message: 'Nincs jogosultság' });
+        if (data.userId !== userId) return res.status(403).json({ success: false, message: 'Access denied' });
 
         if (data.b2_key) { await deleteFromB2(data.b2_key); }
         else if (data.model_url?.includes('/api/trellis/model/')) { await deleteFromB2(`trellis/${data.model_url.split('/').pop()}`); }
 
         await docRef.delete();
-        return res.json({ success: true, message: 'Modell sikeresen törölve', deletedId: id });
+        return res.json({ success: true, message: 'Model deleted successfully', deletedId: id });
     } catch (err) {
-        return res.status(500).json({ success: false, message: 'Szerverhiba', error: err.message });
+        return res.status(500).json({ success: false, message: 'Server error', error: err.message });
     }
 });
 
@@ -6385,7 +6404,7 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
     const userId = req.userId;
     try {
         const snapshot = await admin.firestore().collection('trellis_history').where('userId', '==', userId).get();
-        if (snapshot.empty) return res.json({ success: true, message: 'Nincs törlendő előzmény', deletedCount: 0 });
+        if (snapshot.empty) return res.json({ success: true, message: 'No history entries to delete', deletedCount: 0 });
 
         const deletePromises = [];
         for (const doc of snapshot.docs) {
@@ -6399,14 +6418,14 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
         snapshot.docs.forEach(doc => batch.delete(doc.ref));
         await batch.commit();
 
-        return res.json({ success: true, message: `${snapshot.size} modell sikeresen törölve`, deletedCount: snapshot.size });
+        return res.json({ success: true, message: `${snapshot.size} models deleted successfully`, deletedCount: snapshot.size });
     } catch (err) {
-        return res.status(500).json({ success: false, message: 'Szerverhiba', error: err.message });
+        return res.status(500).json({ success: false, message: 'Server error', error: err.message });
     }
 });
 
 // ════════════════════════════════════════════════════
-// TRELLIS — Generálás
+// TRELLIS - Generation
 // ════════════════════════════════════════════════════
 router.get('/trellis/availability', verifyFirebaseToken, async (_req, res) => {
     const availability = getTrellisAvailabilitySnapshot();
@@ -6417,10 +6436,17 @@ router.get('/trellis/availability', verifyFirebaseToken, async (_req, res) => {
 });
 
 router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
-    const { prompt, seed = 0, slat_cfg_scale = 3, ss_cfg_scale = 7.5, slat_sampling_steps = 25, ss_sampling_steps = 25, jobId } = req.body;
+    const { prompt, slat_cfg_scale = 3, ss_cfg_scale = 7.5, slat_sampling_steps = 25, ss_sampling_steps = 25, jobId } = req.body;
+    const normalizedPrompt = String(prompt || '').replace(/\s+/g, ' ').trim();
 
-    if (!prompt || !String(prompt).trim()) return res.status(400).json({ success: false, message: 'A prompt megadása kötelező' });
-    if (String(prompt).length > 1000) return res.status(400).json({ success: false, message: 'A prompt maximum 1000 karakter lehet' });
+    if (!prompt || !String(prompt).trim()) return res.status(400).json({ success: false, message: 'Prompt is required.' });
+    if (String(prompt).length > 1000) return res.status(400).json({ success: false, message: 'Prompt must be 1000 characters or fewer.' });
+    if (normalizedPrompt.length > TRELLIS_PROMPT_MAX_LENGTH) {
+        return res.status(400).json({
+            success: false,
+            message: `Trellis prompts must be ${TRELLIS_PROMPT_MAX_LENGTH} characters or fewer including style (${normalizedPrompt.length}/${TRELLIS_PROMPT_MAX_LENGTH}).`,
+        });
+    }
 
     const availability = getTrellisAvailabilitySnapshot();
     if (!availability.available) {
@@ -6432,19 +6458,19 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
     }
 
     const apiKey = process.env.NVIDIA_API_KEY;
-    if (!apiKey) return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
+    if (!apiKey) return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY is not configured.' });
 
     const payload = {
-        prompt: String(prompt).trim(),
-        seed: Math.min(2147483647, Math.max(0, Math.floor(Number(seed) || 0))),
-        slat_cfg_scale: Number(slat_cfg_scale),
-        ss_cfg_scale: Number(ss_cfg_scale),
-        slat_sampling_steps: Math.round(Number(slat_sampling_steps)),
-        ss_sampling_steps: Math.round(Number(ss_sampling_steps)),
+        prompt: normalizedPrompt,
+        seed: resolveTrellisRequestSeed(req.body),
+        slat_cfg_scale: clampNumber(slat_cfg_scale, TRELLIS_CFG_SCALE_MIN, TRELLIS_CFG_SCALE_MAX, 3),
+        ss_cfg_scale: clampNumber(ss_cfg_scale, TRELLIS_CFG_SCALE_MIN, TRELLIS_CFG_SCALE_MAX, 7.5),
+        slat_sampling_steps: clampInteger(slat_sampling_steps, TRELLIS_SAMPLING_STEPS_MIN, TRELLIS_SAMPLING_STEPS_MAX, 25),
+        ss_sampling_steps: clampInteger(ss_sampling_steps, TRELLIS_SAMPLING_STEPS_MIN, TRELLIS_SAMPLING_STEPS_MAX, 25),
     };
 
     const controller = new AbortController();
-    // Modell generálásnál 30 perc (1800s) timeout
+    // Model generation can take up to 30 minutes (1800s).
     registerJob(jobId, req.userId, controller, 1800000);
 
     try {
@@ -6459,18 +6485,20 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
 
         if (!nimResp.ok) {
             const errText = await nimResp.text();
-            const msg = nimResp.status === 401 ? 'Érvénytelen NVIDIA API kulcs' : nimResp.status === 429 ? 'NVIDIA rate limit' : `Trellis hiba (${nimResp.status}): ${errText.slice(0, 200)}`;
+            const msg = nimResp.status === 401 ? 'Invalid NVIDIA API key' : nimResp.status === 429 ? 'NVIDIA rate limit reached' : `Trellis error (${nimResp.status}): ${errText.slice(0, 200)}`;
             return res.status(nimResp.status).json({ success: false, message: msg });
         }
 
         const body = await nimResp.json();
-        let base64Glb = null;
-        if (Array.isArray(body.artifacts) && body.artifacts.length > 0) {
-            const art = body.artifacts[0];
-            base64Glb = art.base64 ?? art.glb ?? art.model ?? art.data ?? null;
+        const base64Glb = extractTrellisModelBase64(body);
+        if (!base64Glb) {
+            const summary = summarizeTrellisResponse(body);
+            console.error('[Trellis] NVIDIA response did not include a GLB payload', summary);
+            return res.status(502).json({
+                success: false,
+                message: 'The Trellis API response did not include a 3D model. Try a shorter prompt or another style.',
+            });
         }
-        if (!base64Glb) base64Glb = body.base64 ?? body.glb ?? body.model ?? null;
-        if (!base64Glb) return res.status(500).json({ success: false, message: 'A Trellis API nem adott vissza 3D modellt' });
 
         const filename = `trellis_${Date.now()}_${payload.seed}.glb`;
         let glbUrl, b2Key = null;
@@ -6489,10 +6517,10 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
 
     } catch (err) {
         if (err.name === 'AbortError') {
-            if (!res.headersSent) res.status(499).json({ success: false, message: 'Generálás megszakítva' });
+            if (!res.headersSent) res.status(499).json({ success: false, message: 'Generation cancelled.' });
             return;
         }
-        return res.status(500).json({ success: false, message: err.message ?? 'Hálózati hiba' });
+        return res.status(500).json({ success: false, message: err.message ?? 'Network error' });
     } finally {
         unregisterJob(jobId);
     }

@@ -472,7 +472,7 @@ class TaskService {
             "type", "model_version", "prompt", "file", "files",
             "images", "batch_images",
             "texture", "pbr", "texture_quality",
-            "face_limit", "model_seed", "texture_seed",
+            "face_limit", "model_seed", "image_seed", "texture_seed",
             "auto_size", "compress", "export_uv",
             "orientation", "render_image", "texture_alignment", "original_task_id",
             "negative_prompt",

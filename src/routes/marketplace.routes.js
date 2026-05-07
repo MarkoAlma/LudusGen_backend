@@ -7,6 +7,7 @@ import {
   deleteMarketplaceAsset,
   downloadMarketplaceAsset,
   getMarketplaceAsset,
+  getMarketplaceAssetPreview,
   getMyMarketplaceLibrary,
   listMarketplaceAssets,
   purchaseMarketplaceAsset,
@@ -38,6 +39,7 @@ export function createMarketplaceRouter(verifyFirebaseToken) {
 
   router.get("/marketplace/assets", listMarketplaceAssets);
   router.get("/marketplace/assets/:id", getMarketplaceAsset);
+  router.get("/marketplace/assets/:id/preview", getMarketplaceAssetPreview);
   router.post("/marketplace/assets/upload", verifyFirebaseToken, marketplaceUploadLimiter, upload.single("file"), uploadMarketplaceAsset);
   router.post("/marketplace/assets", verifyFirebaseToken, createMarketplaceAsset);
   router.patch("/marketplace/assets/:id", verifyFirebaseToken, updateMarketplaceAsset);

@@ -39,6 +39,36 @@ function isLegacyStsImportEnabled(env = process.env) {
     .toLowerCase());
 }
 
+function sanitizeUploadDisplayName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const cleaned = raw
+    .replace(/[\u0000-\u001f<>:"\\|?*]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  return cleaned || null;
+}
+
+function sanitizeUploadSourceKind(value) {
+  const cleaned = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48);
+  return cleaned || null;
+}
+
+function sanitizeUploadSourceTaskId(value) {
+  const cleaned = String(value || "").trim().slice(0, 128);
+  return cleaned || null;
+}
+
+function isTripoBridgeImportSourceKind(sourceKind) {
+  return sourceKind === "trellis_bridge" || sourceKind === "stored_model_bridge";
+}
+
 /**
  * POST /api/tripo/assets/upload
  * Uploads a 3D model file through Tripo STS and creates an import_model task.
@@ -72,6 +102,11 @@ export async function uploadAsset(req, res) {
     return;
   }
 
+  const displayName = sanitizeUploadDisplayName(req.body?.displayName) || file.originalname;
+  const sourceKind = sanitizeUploadSourceKind(req.body?.sourceKind);
+  const sourceTaskId = sanitizeUploadSourceTaskId(req.body?.sourceTaskId);
+  const historySource = isTripoBridgeImportSourceKind(sourceKind) ? "tripo" : "upload";
+
   try {
     const client = getTripoClient();
 
@@ -93,28 +128,36 @@ export async function uploadAsset(req, res) {
       },
     }, {});
 
-    registerForRecovery(taskId, userId, "import_model", null, file.originalname, {});
+    registerForRecovery(taskId, userId, "import_model", null, displayName, {});
 
     console.log(`[AssetController] Uploaded asset for user ${userId}, task ${taskId}`);
 
-    // Save to history immediately as "upload" source
+    // Save immediately so Tripo import ownership survives refresh/restart.
     const db = admin.firestore();
     const historyRef = db.collection(HISTORY_COLLECTION).doc(`tripo_${taskId}`);
     const now = Date.now();
     await historyRef.set({
       userId,
-      source: "upload",
+      source: historySource,
       mode: "upload",
-      prompt: file.originalname,
+      prompt: displayName,
+      name: displayName,
       status: "pending",
       model_url: null,
       taskId,
       params: {
         model_version: null,
         mode: "upload",
+        type: "import_model",
         filename: file.originalname,
+        displayName,
         fileSize: file.size,
         fileType: ext,
+        ...(sourceKind && { source_kind: sourceKind }),
+        ...(sourceTaskId && {
+          sourceTaskId,
+          source_task_id: sourceTaskId,
+        }),
         uploadObject: {
           bucket: uploadedObject.bucket,
           key: uploadedObject.key,
@@ -130,8 +173,10 @@ export async function uploadAsset(req, res) {
       taskId,
       historyId: historyRef.id,
       filename: file.originalname,
+      displayName,
       fileSize: file.size,
       fileType: ext,
+      source: historySource,
     });
   } catch (err) {
     console.error(`[AssetController] upload error:`, err.message);

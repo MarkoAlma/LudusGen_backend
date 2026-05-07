@@ -274,7 +274,7 @@ export const MODEL_CAPABILITIES = {
     multiview:    true,  batch:     true,  tPose:      false, inParts:     false,
     negPrompt:    true,  smartLowPoly: false, quad:    false,
     autoSize:     true,  exportUv:  true,  makeBetter: true,
-    modelSeed:    true,  imageSeed: false, textureSeed: true,
+    modelSeed:    true,  imageSeed: true,  textureSeed: true,
   },
   "v3.1-20260211": {
     ultraMesh:    true,  texture:   true,  pbr:        true,  tex4K:       true,

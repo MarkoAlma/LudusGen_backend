@@ -8,6 +8,7 @@ import { storageService } from "../services/storageService.js";
 import {
   MARKETPLACE_COLLECTIONS,
   calculateFeaturedScore,
+  getMarketplacePreviewImageUrl,
   getVerifiedMarketplacePurchase,
   isVerifiedMarketplacePurchase,
   normalizeAssetForClient,
@@ -418,16 +419,58 @@ function collectHistoryPreviewImageUrls(historyData = {}) {
   return [...new Set([...directUrls, ...derivedUrls])];
 }
 
+function normalizeHistorySourceCollection(sourceCollection, defaultCollection) {
+  const raw = String(sourceCollection || defaultCollection || "").trim();
+  const aliases = {
+    tripo: "tripo_history",
+    tripo3d: "tripo_history",
+    trellis: "trellis_history",
+    trellis3d: "trellis_history",
+    upload: "tripo_history",
+    uploads: "tripo_history",
+    image: "generated_images",
+    images: "generated_images",
+    audio: "generated_audio",
+  };
+  return aliases[raw.toLowerCase()] || raw;
+}
+
+async function resolve3dHistorySourceById(db, sourceId, userId, preferredCollection = "") {
+  if (!sourceId) return null;
+
+  const tryCollection = async (collectionName) => {
+    if (collectionName !== "tripo_history" && collectionName !== "trellis_history") return null;
+    const ref = db.collection(collectionName).doc(sourceId);
+    const snap = await ref.get();
+    if (!snap.exists) return null;
+    const data = snap.data() || {};
+    if (data.userId !== userId) return null;
+    return { collectionName, ref, snap, data };
+  };
+
+  const preferred = await tryCollection(preferredCollection);
+  if (preferred) return preferred;
+
+  for (const fallbackCollection of ["trellis_history", "tripo_history"]) {
+    if (fallbackCollection === preferredCollection) continue;
+    const fallback = await tryCollection(fallbackCollection);
+    if (fallback) return fallback;
+  }
+
+  return null;
+}
+
 async function resolveMarketplace3dPreviewFallback(data = {}) {
   if (data.type !== "3d") return null;
 
   const sourceHistoryId = data.tripo?.sourceHistoryId || data.source?.id || null;
+  const sourceCollection = normalizeHistorySourceCollection(data.source?.collection, "tripo_history");
   const ownerId = data.ownerId || null;
   const db = admin.firestore();
   let historyData = null;
 
-  if (sourceHistoryId) {
-    const historySnap = await db.collection("tripo_history").doc(sourceHistoryId).get();
+  if (sourceHistoryId && (sourceCollection === "tripo_history" || sourceCollection === "trellis_history")) {
+    const historySnap = await db.collection(sourceCollection).doc(sourceHistoryId).get();
     if (historySnap.exists) {
       const sourceHistory = historySnap.data();
       if (!ownerId || sourceHistory?.userId === ownerId) {
@@ -456,10 +499,11 @@ async function resolveMarketplace3dPreviewFallback(data = {}) {
 
 function getHistorySourceRef(db, assetType, source = {}, tripo = {}) {
   if (assetType !== "3d") return null;
-  const collectionName = source?.collection || "tripo_history";
+  const collectionName = normalizeHistorySourceCollection(source?.collection, "tripo_history");
   const sourceId = source?.id || tripo?.sourceHistoryId || null;
-  if (collectionName !== "tripo_history" || !sourceId) return null;
-  return db.collection("tripo_history").doc(sourceId);
+  if (collectionName !== "tripo_history" && collectionName !== "trellis_history") return null;
+  if (!sourceId) return null;
+  return db.collection(collectionName).doc(sourceId);
 }
 
 async function clearHistoryMarketplaceLock(historyRef) {
@@ -552,7 +596,7 @@ async function assetForClient(doc, ownedIds = new Set(), viewerId = null) {
   const viewerCanAccessFile = Boolean(viewerOwnsAsset || viewerIsOwner);
 
   if (previewKey) {
-    asset.previewUrl = await storageService.getSignedUrl(previewKey, 3600);
+    asset.previewUrl = getMarketplacePreviewImageUrl(id, data) || await storageService.getSignedUrl(previewKey, 3600);
   } else if (data.type === "3d") {
     const previewFallbackUrl = await resolveMarketplace3dPreviewFallback(data);
     if (previewFallbackUrl) asset.previewUrl = previewFallbackUrl;
@@ -567,6 +611,41 @@ async function assetForClient(doc, ownedIds = new Set(), viewerId = null) {
     asset.modelPreviewUrl = inlineModelUrl;
   }
   return asset;
+}
+
+export async function getMarketplaceAssetPreview(req, res) {
+  try {
+    const snap = await admin.firestore()
+      .collection(MARKETPLACE_COLLECTIONS.assets)
+      .doc(req.params.id)
+      .get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ success: false, message: "Asset not found" });
+    }
+
+    const data = snap.data();
+    if (data.status !== "published") {
+      return res.status(404).json({ success: false, message: "Asset not found" });
+    }
+
+    const storageKey = data.storage?.key || data.storageKey;
+    const previewKey = safePreviewKey(data.preview?.key || data.storage?.thumbKey, data.ownerId, storageKey);
+
+    if (previewKey) {
+      const previewUrl = await storageService.getSignedUrl(previewKey, 3600);
+      if (!previewUrl) {
+        return res.status(404).json({ success: false, message: "Preview not available" });
+      }
+      res.set("Cache-Control", "public, max-age=300");
+      return res.redirect(302, previewUrl);
+    }
+
+    return res.status(404).json({ success: false, message: "Preview not available" });
+  } catch (err) {
+    console.error("[Marketplace] preview error:", err);
+    return res.status(500).json({ success: false, message: err.message || "Preview failed" });
+  }
 }
 
 const MARKETPLACE_PREVIEW_MAX_SIZE = 720;
@@ -674,7 +753,7 @@ function createWatermarkSvg(width, height, seedText = "") {
   `;
 }
 
-async function createImageThumb(buffer, userId, sourceName) {
+async function createImageThumb(buffer, userId, sourceName, { watermark = true } = {}) {
   const resized = await sharp(buffer, { failOn: "none" })
     .rotate()
     .resize(MARKETPLACE_PREVIEW_MAX_SIZE, MARKETPLACE_PREVIEW_MAX_SIZE, { fit: "inside", withoutEnlargement: true })
@@ -682,9 +761,12 @@ async function createImageThumb(buffer, userId, sourceName) {
     .png()
     .toBuffer({ resolveWithObject: true });
 
-  const watermarkSvg = createWatermarkSvg(resized.info.width, resized.info.height, sourceName);
-  const thumbBuffer = await sharp(resized.data)
-    .composite([{ input: Buffer.from(watermarkSvg), blend: "over" }])
+  const thumbPipeline = sharp(resized.data);
+  if (watermark) {
+    const watermarkSvg = createWatermarkSvg(resized.info.width, resized.info.height, sourceName);
+    thumbPipeline.composite([{ input: Buffer.from(watermarkSvg), blend: "over" }]);
+  }
+  const thumbBuffer = await thumbPipeline
     .webp({ quality: 74, effort: 5 })
     .toBuffer();
 
@@ -752,6 +834,15 @@ async function downloadExternalAsset(url) {
   };
 }
 
+function isImportModelHistoryItem(data = {}) {
+  return Boolean(
+    data?.type === "import_model" ||
+      data?.params?.type === "import_model" ||
+      data?.mode === "upload" ||
+      data?.source === "upload",
+  );
+}
+
 async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
   const db = admin.firestore();
   const defaultCollection = (
@@ -759,30 +850,56 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
     assetType === "audio" ? "generated_audio" :
     "tripo_history"
   );
-  const collectionName = String(sourceCollection || defaultCollection).trim();
+  let collectionName = normalizeHistorySourceCollection(sourceCollection, defaultCollection);
   const allowedCollections = assetType === "image"
     ? new Set(["generated_images"])
     : assetType === "audio"
       ? new Set(["generated_audio", "audio_history"])
-      : new Set(["tripo_history"]);
+      : new Set(["tripo_history", "trellis_history"]);
+  let resolvedSource = null;
+
+  if (!allowedCollections.has(collectionName)) {
+    if (assetType === "3d") {
+      const fallback = await resolve3dHistorySourceById(db, sourceId, userId, collectionName);
+      if (fallback) {
+        collectionName = fallback.collectionName;
+        resolvedSource = fallback;
+      }
+    }
+  }
 
   if (!allowedCollections.has(collectionName)) {
     throw Object.assign(new Error("Unsupported history source"), { status: 400 });
   }
 
-  const ref = db.collection(collectionName).doc(sourceId);
-  const snap = await ref.get();
+  let ref = resolvedSource?.ref || db.collection(collectionName).doc(sourceId);
+  let snap = resolvedSource?.snap || await ref.get();
+
+  if (!snap.exists) {
+    if (assetType === "3d") {
+      const fallback = await resolve3dHistorySourceById(db, sourceId, userId, collectionName);
+      if (fallback) {
+        collectionName = fallback.collectionName;
+        resolvedSource = fallback;
+        ref = fallback.ref;
+        snap = fallback.snap;
+      }
+    }
+  }
 
   if (!snap.exists) {
     throw Object.assign(new Error("Source item not found"), { status: 404 });
   }
 
-  let data = snap.data();
+  let data = resolvedSource?.data || snap.data();
   if (data.userId !== userId) {
     throw Object.assign(new Error("You do not have access to this history item"), { status: 403 });
   }
 
   if (assetType === "3d") {
+    if (collectionName === "tripo_history" && isImportModelHistoryItem(data)) {
+      throw Object.assign(new Error("Import models cannot be listed on the marketplace"), { status: 400 });
+    }
     data = await reconcileHistoryMarketplaceLock({
       db,
       historyRef: getHistorySourceRef(db, assetType, { collection: collectionName, id: sourceId }),
@@ -895,7 +1012,7 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
   if (previewImageUrl) {
     try {
       const { buffer: imgBuf } = await downloadExternalAsset(previewImageUrl);
-      thumbKey = await createImageThumb(imgBuf, userId, `preview_${sourceId}`);
+      thumbKey = await createImageThumb(imgBuf, userId, `preview_${sourceId}`, { watermark: false });
     } catch (err) {
       console.warn(`[Marketplace] 3D preview thumb failed for ${sourceId}:`, err.message);
     }
@@ -913,13 +1030,13 @@ async function copyFromHistory(userId, assetType, sourceCollection, sourceId) {
       kind: "history",
       collection: collectionName,
       id: sourceId,
-      taskId: data.taskId || null,
+      taskId: collectionName === "tripo_history" ? data.taskId || null : null,
       prompt: data.prompt || "",
     },
     tripo: {
       compatible: true,
       importStatus: "succeeded",
-      importTaskId: data.taskId || null,
+      importTaskId: collectionName === "tripo_history" ? data.taskId || null : null,
       sourceHistoryId: sourceId,
     },
     sourceRef: ref,
