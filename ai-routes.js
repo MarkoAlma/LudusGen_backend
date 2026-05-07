@@ -286,6 +286,92 @@ function normalizeMessages(messages) {
     return finalMessages;
 }
 
+const NVIDIA_GEMMA_MODELS = new Set([
+    'google/gemma-3-27b-it',
+    'google/gemma-3n-e4b-it',
+    'google/gemma-4-31b-it',
+]);
+
+function isNvidiaGemmaModel(model) {
+    return NVIDIA_GEMMA_MODELS.has(model);
+}
+
+function prependTextToMessageContent(content, prefix) {
+    if (!prefix) return content;
+
+    if (Array.isArray(content)) {
+        return [{ type: 'text', text: prefix }, ...content];
+    }
+
+    const text = content === null || content === undefined ? '' : String(content);
+    return text.trim() ? `${prefix}\n\n${text}` : prefix;
+}
+
+function nvidiaGemmaContentToString(content) {
+    if (!Array.isArray(content)) {
+        return content === null || content === undefined ? '' : String(content);
+    }
+
+    const textParts = [];
+    const imageTags = [];
+
+    for (const part of content) {
+        if (part?.type === 'text') {
+            const text = typeof part.text === 'string' ? part.text.trim() : '';
+            if (text) textParts.push(text);
+            continue;
+        }
+
+        if (part?.type === 'image_url') {
+            const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+            if (typeof url === 'string' && url.trim()) {
+                imageTags.push(`<img src="${url.trim()}" />`);
+            }
+        }
+    }
+
+    return [...textParts, ...imageTags].join('\n\n');
+}
+
+function normalizeNvidiaGemmaMessages(messages) {
+    const normalized = normalizeMessages(messages);
+    const systemContent = [];
+    const chatMessages = [];
+
+    for (const message of normalized) {
+        if (message.role === 'system') {
+            systemContent.push(typeof message.content === 'string' ? message.content : JSON.stringify(message.content));
+            continue;
+        }
+
+        if (message.role === 'user' || message.role === 'assistant') {
+            chatMessages.push({
+                ...message,
+                content: message.role === 'user'
+                    ? nvidiaGemmaContentToString(message.content)
+                    : message.content,
+            });
+        }
+    }
+
+    while (chatMessages.length > 0 && chatMessages[0].role === 'assistant') {
+        chatMessages.shift();
+    }
+
+    if (systemContent.length > 0) {
+        const systemPrefix = `[System instructions]\n${systemContent.join('\n\n')}`;
+        const firstUserMessage = chatMessages.find((message) => message.role === 'user');
+
+        if (firstUserMessage) {
+            firstUserMessage.content = prependTextToMessageContent(firstUserMessage.content, systemPrefix);
+        } else {
+            chatMessages.unshift({ role: 'user', content: systemPrefix });
+        }
+    }
+
+    return chatMessages;
+}
+
 function dataUrlToGeminiInlineData(dataUrl) {
     if (typeof dataUrl !== 'string') return null;
     const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
@@ -424,7 +510,9 @@ function getModelConfig(modelId) {
         'cerebras-llama8b': { apiModel: 'llama3.1-8b', provider: 'cerebras', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'mistral-large': { apiModel: 'mistral-large-latest', provider: 'mistral', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'nvidia-glm4.7': { apiModel: 'z-ai/glm4.7', provider: 'nvidia', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
-        'google-gemma-3-27b-it': { apiModel: 'google/gemma-3-27b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'google-gemma-3-27b-it': { apiModel: 'google/gemma-3n-e4b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'google-gemma-3n-e4b-it': { apiModel: 'google/gemma-3n-e4b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'google-gemma-4-31b-it': { apiModel: 'google/gemma-4-31b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
     };
     return MODEL_MAP[modelId] || null;
 }
@@ -1739,7 +1827,30 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
             }
 
-            const nvidiaMsgs = normalizeMessages(context);
+            const usesGemmaSchema = isNvidiaGemmaModel(apiModel);
+            const nvidiaMsgs = usesGemmaSchema
+                ? normalizeNvidiaGemmaMessages(context)
+                : normalizeMessages(context);
+            const nvidiaBody = {
+                model: apiModel,
+                messages: nvidiaMsgs,
+                temperature: Math.min(Math.max(0, temperature), usesGemmaSchema ? 1 : 2),
+                max_tokens: apiModel === 'google/gemma-3-27b-it' || apiModel === 'google/gemma-3n-e4b-it'
+                    ? Math.min(safeMax, 4096)
+                    : apiModel === 'google/gemma-4-31b-it'
+                        ? Math.min(safeMax, 32768)
+                        : safeMax,
+                top_p: Math.min(Math.max(0, top_p), 1),
+                stream: true,
+            };
+
+            if (!usesGemmaSchema) {
+                nvidiaBody.stream_options = { include_usage: true };
+            }
+
+            if (apiModel === 'google/gemma-4-31b-it' || apiModel === 'z-ai/glm4.7') {
+                nvidiaBody.chat_template_kwargs = { enable_thinking: false };
+            }
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -1755,16 +1866,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             try {
                 streamResp = await axios.post(
                     'https://integrate.api.nvidia.com/v1/chat/completions',
-                    {
-                        model: apiModel,
-                        messages: nvidiaMsgs,
-                        temperature: Math.min(Math.max(0, temperature), 2),
-                        max_tokens: safeMax,
-                        top_p: Math.min(Math.max(0, top_p), 1),
-                        stream: true,
-                        stream_options: { include_usage: true },
-                        chat_template_kwargs: { enable_thinking: false }
-                    },
+                    nvidiaBody,
                     {
                         headers: {
                             'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
@@ -1781,8 +1883,18 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     console.log('[NVIDIA] Stream leállítva.');
                     return;
                 }
-                console.error('NVIDIA kapcsolódási hiba:', err.message);
-                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                activeStreams.delete(streamKey);
+                const details = await getAxiosErrorDetails(err);
+                const statusText = details.status ? `HTTP ${details.status}` : 'request failed';
+                const codeText = details.code ? ` (${details.code})` : '';
+                const userMessage = `NVIDIA ${statusText}${codeText}: ${details.message}`;
+                console.error('[NVIDIA] Chat request failed:', {
+                    model: apiModel,
+                    status: details.status,
+                    code: details.code,
+                    message: details.message,
+                });
+                res.write(`data: ${JSON.stringify({ error: userMessage })}\n\n`);
                 return res.end();
             }
 
@@ -2391,6 +2503,8 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
 });
 
 // ── VISION DESCRIBE ───────────────────────────────────────────────────────────
+const GEMMA_VISION_MODEL = 'google/gemma-3n-e4b-it';
+
 router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
     try {
         const { images, systemPrompt } = req.body;
@@ -2405,38 +2519,39 @@ router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
             return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
         }
 
-        const userContentBlocks = [
-            { type: 'text', text: systemPrompt || 'Describe the uploaded image(s) in detail.' },
-            ...images.map((dataUrl) => ({
-                type: 'image_url',
-                image_url: { url: dataUrl },
-            })),
-        ];
+        const userContent = [
+            systemPrompt || 'Describe the uploaded image(s) in detail.',
+            ...images.map((dataUrl) => `<img src="${dataUrl}" />`),
+        ].join('\n\n');
 
         let resp;
         try {
             resp = await axios.post(
                 'https://integrate.api.nvidia.com/v1/chat/completions',
                 {
-                    model: 'google/gemma-3-27b-it',
-                    messages: [{ role: 'user', content: userContentBlocks }],
-                    max_tokens: 1500,
+                    model: GEMMA_VISION_MODEL,
+                    messages: [{ role: 'user', content: userContent }],
+                    max_tokens: 512,
                     temperature: 0.2,
                     top_p: 0.7,
+                    frequency_penalty: 0,
+                    presence_penalty: 0,
                     stream: false,
                 },
                 {
                     headers: {
                         Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
                         'Content-Type': 'application/json',
+                        Accept: 'application/json',
                     },
                     timeout: 90000,
                 }
             );
         } catch (err) {
-            const msg = err.response?.data?.message || err.response?.data?.detail || err.message || 'NVIDIA API hiba';
-            console.error('Vision describe NVIDIA hiba:', msg);
-            return res.status(502).json({ success: false, message: `NVIDIA API hiba: ${msg}` });
+            const details = await getAxiosErrorDetails(err);
+            const statusText = details.status ? `HTTP ${details.status}` : 'request failed';
+            console.error('[Vision Describe] NVIDIA request failed:', details);
+            return res.status(502).json({ success: false, message: `NVIDIA API hiba: ${statusText}: ${details.message}` });
         }
 
         const description = resp.data?.choices?.[0]?.message?.content?.trim() || '';
@@ -2445,7 +2560,7 @@ router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
         }
 
         await logUsage(req.userId, 'vision-describe', {
-            model: 'google/gemma-3-27b-it',
+            model: GEMMA_VISION_MODEL,
             provider: 'nvidia',
             tokens: resp.data?.usage?.total_tokens || 0,
             images: images.length,
