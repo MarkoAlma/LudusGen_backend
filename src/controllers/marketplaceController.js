@@ -649,6 +649,7 @@ export async function getMarketplaceAssetPreview(req, res) {
 }
 
 const MARKETPLACE_PREVIEW_MAX_SIZE = 720;
+const MARKETPLACE_PREVIEW_DATA_URL_MAX_BYTES = 5 * 1024 * 1024;
 const MARKETPLACE_WATERMARK_TEXT = "LudusGen Preview";
 const MARKETPLACE_WATERMARK_MICROTEXT = "LUDUSGEN MARKETPLACE PREVIEW ONLY";
 
@@ -773,6 +774,22 @@ async function createImageThumb(buffer, userId, sourceName, { watermark = true }
   const thumbKey = `marketplace/previews/${userId}/${Date.now()}_${crypto.randomUUID()}_${safeFileName(sourceName)}.webp`;
   await storageService.uploadFile(thumbBuffer, thumbKey, "image/webp");
   return thumbKey;
+}
+
+function decodeMarketplacePreviewDataUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  const match = raw.match(/^data:image\/(png|jpe?g|webp);base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (!match) {
+    throw Object.assign(new Error("Invalid preview image"), { status: 400 });
+  }
+
+  const buffer = Buffer.from(match[2].replace(/\s/g, ""), "base64");
+  if (!buffer.length || buffer.length > MARKETPLACE_PREVIEW_DATA_URL_MAX_BYTES) {
+    throw Object.assign(new Error("Preview image is too large"), { status: 400 });
+  }
+  return buffer;
 }
 
 async function startTripoImportForUpload(file, userId) {
@@ -1317,6 +1334,27 @@ export async function createMarketplaceAsset(req, res) {
     const userData = userDoc.exists ? userDoc.data() : {};
     const now = Date.now();
     const assetRef = db.collection(MARKETPLACE_COLLECTIONS.assets).doc();
+
+    if (assetType === "3d" && body.previewDataUrl && !safePreviewKey(sourceBundle.storage?.thumbKey, userId)) {
+      const previewBuffer = decodeMarketplacePreviewDataUrl(body.previewDataUrl);
+      if (previewBuffer) {
+        const thumbKey = await createImageThumb(previewBuffer, userId, `preview_${assetRef.id}`, { watermark: false });
+        sourceBundle = {
+          ...sourceBundle,
+          storage: {
+            ...sourceBundle.storage,
+            thumbKey,
+          },
+          preview: {
+            ...(sourceBundle.preview || {}),
+            key: thumbKey,
+            kind: "model",
+            watermarked: false,
+          },
+        };
+      }
+    }
+
     const asset = {
       ownerId: userId,
       ownerEmail: req.userEmail || req.user?.email || userData.email || "",

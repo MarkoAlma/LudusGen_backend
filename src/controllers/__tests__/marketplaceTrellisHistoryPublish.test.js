@@ -49,6 +49,13 @@ assert(
 );
 
 assert(
+  source.includes("function decodeMarketplacePreviewDataUrl") &&
+    source.includes("body.previewDataUrl") &&
+    source.includes("createImageThumb(previewBuffer, userId, `preview_${assetRef.id}`"),
+  "3D marketplace publishing should persist the client-generated preview image when history has no stored preview",
+);
+
+assert(
   source.includes("watermarked: assetType === \"image\" || assetType === \"audio\""),
   "Image and audio marketplace previews should keep their watermark metadata",
 );
