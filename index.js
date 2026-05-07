@@ -31,6 +31,7 @@ const DEFAULT_DEV_ORIGINS = [
   'http://localhost:5179',
   'http://127.0.0.1:5179',
 ];
+
 const configuredCorsOrigins = (process.env.CORS_ORIGINS || process.env.FRONTEND_URL || '')
   .split(',')
   .map((origin) => origin.trim())
