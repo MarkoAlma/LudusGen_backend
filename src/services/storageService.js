@@ -90,7 +90,6 @@ class StorageService {
         Body: buffer,
         ContentType: contentType,
       }));
-      console.log(`[StorageService] Uploaded ${key} (${buffer.length} bytes)`);
       return key;
     } catch (err) {
       console.error(`[StorageService] Upload failed for ${key}:`, err.message);
@@ -116,7 +115,6 @@ class StorageService {
         Body: fileStream,
         ContentType: contentType,
       }));
-      console.log(`[StorageService] Uploaded ${key} from path`);
       return key;
     } catch (err) {
       console.error(`[StorageService] Stream upload failed for ${key}:`, err.message);

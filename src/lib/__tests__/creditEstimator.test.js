@@ -13,7 +13,6 @@ let failed = 0;
 
 function assert(condition, label) {
   if (condition) {
-    console.log(`  PASS: ${label}`);
     passed++;
   } else {
     console.error(`  FAIL: ${label}`);
@@ -28,7 +27,6 @@ function assert(condition, label) {
 // AFTER FIX:  Estimator charges base(30) + texture_std(10) = 40
 // Why: P1 strips texture_quality="detailed" → only standard texture reaches API
 // ─────────────────────────────────────────────────────────────────────────────
-console.log("\nScenario 1: P1 text_to_model with detailed texture");
 {
   const result = estimateCost({
     type: "text_to_model",
@@ -49,7 +47,6 @@ console.log("\nScenario 1: P1 text_to_model with detailed texture");
 // AFTER FIX:  Estimator charges base(30) = 30
 // Why: P1 strips both geometry_quality and smart_low_poly
 // ─────────────────────────────────────────────────────────────────────────────
-console.log("\nScenario 2: P1 text_to_model with geometry_quality + smart_low_poly");
 {
   const result = estimateCost({
     type: "text_to_model",
@@ -70,7 +67,6 @@ console.log("\nScenario 2: P1 text_to_model with geometry_quality + smart_low_po
 // AFTER FIX:  Estimator charges base(30) + tex_std(10) = 40
 // Why: P1 strips generate_parts, quad, and texture_quality="detailed"
 // ─────────────────────────────────────────────────────────────────────────────
-console.log("\nScenario 3: P1 text_to_model with generate_parts + quad + detailed texture");
 {
   const result = estimateCost({
     type: "text_to_model",
@@ -90,7 +86,6 @@ console.log("\nScenario 3: P1 text_to_model with generate_parts + quad + detaile
 // ─────────────────────────────────────────────────────────────────────────────
 // Sanity: v3.1 should STILL charge for all addons (not P1)
 // ─────────────────────────────────────────────────────────────────────────────
-console.log("\nSanity: v3.1 text_to_model with all addons (should charge everything)");
 {
   const result = estimateCost({
     type: "text_to_model",
@@ -114,7 +109,6 @@ console.log("\nSanity: v3.1 text_to_model with all addons (should charge everyth
 // ─────────────────────────────────────────────────────────────────────────────
 // Sanity: P1 with standard texture (no overcharge scenario)
 // ─────────────────────────────────────────────────────────────────────────────
-console.log("\nSanity: P1 text_to_model with standard texture (normal case)");
 {
   const result = estimateCost({
     type: "text_to_model",
@@ -130,7 +124,6 @@ console.log("\nSanity: P1 text_to_model with standard texture (normal case)");
 // ─────────────────────────────────────────────────────────────────────────────
 // Summary
 // ─────────────────────────────────────────────────────────────────────────────
-console.log("\nScenario: image_to_model images array charges per image");
 {
   const result = estimateCost({
     type: "image_to_model",
@@ -151,7 +144,6 @@ console.log("\nScenario: image_to_model images array charges per image");
   );
 }
 
-console.log("\nScenario: generate_image charges by model_version tier");
 {
   const premium = estimateCost({
     type: "generate_image",
@@ -173,7 +165,6 @@ console.log("\nScenario: generate_image charges by model_version tier");
   assert(defaultModel.total === 5, `Default generate_image should cost 5 credits, got ${defaultModel.total}`);
 }
 
-console.log("\nScenario: edit_multiview_image charges per edited image");
 {
   const result = estimateCost({
     type: "edit_multiview_image",
@@ -187,11 +178,8 @@ console.log("\nScenario: edit_multiview_image charges per edited image");
   assert(result.total === 10, `Two edited images should cost 10 credits, got ${result.total}`);
 }
 
-console.log(`\n${"=".repeat(60)}`);
-console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
 if (failed > 0) {
   console.error("BILLING TESTS FAILED");
   process.exit(1);
 } else {
-  console.log("ALL BILLING TESTS PASSED");
 }

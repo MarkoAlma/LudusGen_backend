@@ -26,7 +26,6 @@ class PipelineService {
 
     const result = { pipelineId, steps: [], finalModelUrl: null, status: "running" };
     _pipelines.set(pipelineId, result);
-    console.log(`[Pipeline ${pipelineId}] starting (${genType})`);
 
     try {
       /* Step 1 — Generation */
@@ -67,7 +66,6 @@ class PipelineService {
           }, client);
           const checkTask = await client.getTask(checkId);
           isAnimatable    = checkTask.output?.is_animatable !== false;
-          console.log(`[Pipeline ${pipelineId}] rig check: isAnimatable=${isAnimatable}`);
         } catch (err) {
           console.warn(`[Pipeline ${pipelineId}] prerigcheck skipped:`, err.message);
           result.steps.push({ type: "animate_prerigcheck", status: "skipped" });
@@ -118,7 +116,6 @@ class PipelineService {
       const out       = finalTask.output ?? {};
       result.finalModelUrl = out.model ?? out.animated_model ?? out.rigged_model ?? null;
       result.status        = "completed";
-      console.log(`[Pipeline ${pipelineId}] completed`);
       return result;
 
     } catch (err) {
@@ -138,7 +135,7 @@ class PipelineService {
       step.taskId  = taskId;
       analyticsService.recordTaskStart(taskId, type);
       const poll = await client.pollTask(taskId, {
-        onProgress: (p, s) => console.log(`[Pipeline step=${type} task=${taskId}] ${s} ${p}%`),
+        onProgress: () => void 0,
       });
       if (!poll.success) throw new Error(`Step "${type}" task ${taskId} status=${poll.status}`);
       step.status     = "success";

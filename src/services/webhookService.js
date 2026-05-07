@@ -35,7 +35,6 @@ class WebhookService {
 
   async handlePayload(payload) {
     const { task_id, status, progress } = payload;
-    console.log(`[WebhookService] task=${task_id} status=${status} progress=${progress}`);
 
     if (["success", "failed", "cancelled"].includes(status))
       analyticsService.recordTaskEnd(task_id, status, 0);

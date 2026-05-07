@@ -30,5 +30,3 @@ assert(
   source.includes("hasBeenCharged(uid, taskId)"),
   "task ownership checks should accept linked credit transactions for pre-pending-history tasks after backend restarts",
 );
-
-console.log("tripo pending-history recovery assertions passed");

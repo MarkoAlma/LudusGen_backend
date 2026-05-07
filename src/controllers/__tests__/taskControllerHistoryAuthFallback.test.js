@@ -25,5 +25,3 @@ assert(
   source.includes("assetData.ownerId === uid"),
   "model proxy marketplace guard should allow the asset owner to load their own published Tripo history item",
 );
-
-console.log("taskController history auth fallback assertions passed");

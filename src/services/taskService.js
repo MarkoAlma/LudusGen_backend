@@ -362,15 +362,10 @@ class TaskService {
     const idempotencyKey = opts.idempotencyKey ?? crypto.randomUUID();
     const client = getTripoClient();
     const startMs = Date.now();
-    console.log("[TaskService] validated create body:", JSON.stringify({
-      idempotencyKey,
-      validated,
-    }, null, 2));
 
     try {
       const taskId = await client.createTask(validated, idempotencyKey, opts);
       analyticsService.recordTaskStart(taskId, body.type, body.model_version);
-      console.log(`[TaskService] created task ${taskId} (type=${body.type}) in ${Date.now() - startMs}ms`);
       return taskId;
     } catch (err) {
       analyticsService.recordTaskError("unknown", body.type, err.message);
@@ -390,7 +385,6 @@ class TaskService {
     const client = getTripoClient();
     const result = await client.cancelTask(taskId);
     analyticsService.recordTaskEnd(taskId, "stop_requested", 0);
-    console.log(`[TaskService] stop requested for ${taskId} — task is still running on Tripo servers`);
     return result;
   }
 
@@ -839,7 +833,6 @@ class TaskService {
     const errorMessage = extractTaskError(task);
     const errorCode = extractTaskErrorCode(task);
     if (task.status === "success" && (task.type === "animate_retarget") && Array.isArray(out.animated_models)) {
-      console.log(`[TaskService] animate_retarget result for ${task.task_id}:`, { animated_models_count: out.animated_models.length, animated_models: out.animated_models, animated_model: out.animated_model ?? null });
     }
     const {
       modelUrl,
@@ -851,16 +844,6 @@ class TaskService {
       previewImageUrl,
       previewImageUrls,
     } = extractModelUrl(task, outputHints);
-    if (DEBUG_TRIPO && task.status === "success") {
-      console.log("[TaskService] output selection:", JSON.stringify({
-        taskId: task.task_id ?? null,
-        type: task.type ?? null,
-        preferDraftOutput: outputHints.preferBaseModel === true,
-        preferTexturedOutput: outputHints.preferPbrModel === true,
-        chosenSource,
-        availableOutputKeys: Object.keys(out),
-      }, null, 2));
-    }
     return {
       success: task.status === "success",
       status: task.status,

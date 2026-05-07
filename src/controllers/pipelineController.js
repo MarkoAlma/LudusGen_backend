@@ -25,7 +25,6 @@ export async function generateCharacter(req, res) {
 
   // Fire-and-forget
   pipelineService.generateCharacter({ ...body, pipelineId }).then(result => {
-    console.log(`[Pipeline ${result.pipelineId}] final status=${result.status}`);
   }).catch(err => {
     console.error("[pipelineController] generateCharacter error:", err.message);
   });

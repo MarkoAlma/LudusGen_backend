@@ -23,5 +23,3 @@ assert.equal(
   false,
   "deleteHistoryItem should not emit a visible 404 for already-cleaned-up history docs",
 );
-
-console.log("tripoHistoryDeleteIdempotent assertions passed");

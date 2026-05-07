@@ -88,7 +88,6 @@ export async function uploadAsset(req, res) {
 
     registerForRecovery(taskId, userId, "import_model", null, file.originalname, {});
 
-    console.log(`[AssetController] Uploaded asset for user ${userId}, task ${taskId}`);
 
     // Save to history immediately as "upload" source
     const db = admin.firestore();

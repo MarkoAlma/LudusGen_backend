@@ -20,5 +20,3 @@ assert(
   controllerSource.includes("assetForClient(doc, ownedIds, viewerId)"),
   "marketplace list responses should hydrate assets with the current viewer id",
 );
-
-console.log("marketplaceControllerClientAsset assertions passed");

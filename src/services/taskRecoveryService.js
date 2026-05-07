@@ -82,9 +82,6 @@ async function restorePendingHistoryTasks() {
     restored += 1;
   }
 
-  if (restored > 0) {
-    console.log(`[TaskRecovery] Restored ${restored} pending history task(s) from Firestore`);
-  }
 }
 
 export function registerTask(taskId, userId, type, modelVersion, prompt = null, extra = {}) {
@@ -101,7 +98,6 @@ export function registerTask(taskId, userId, type, modelVersion, prompt = null, 
   };
   pendingTasks.set(taskId, meta);
   recentTaskMeta.set(taskId, meta);
-  console.log(`[TaskRecovery] Registered task ${taskId} for user ${userId}${prompt ? ` (${prompt})` : ''}`);
 }
 
 export function getRegisteredTaskMeta(taskId) {
@@ -120,7 +116,6 @@ let cleanupInterval = null;
 export function startTaskRecovery() {
   if (pollerInterval) return; // already running
 
-  console.log("[TaskRecovery] Background task recovery started");
   restorePendingHistoryTasks().catch((err) => {
     console.error("[TaskRecovery] Failed to restore pending history tasks:", err.message);
   });
@@ -134,7 +129,6 @@ export function startTaskRecovery() {
     for (const entry of toPoll) {
       // Timeout check
       if (now - entry.startedAt > MAX_POLL_MS) {
-        console.log(`[TaskRecovery] Task ${entry.taskId} timed out after ${MAX_POLL_MS / 1000}s`);
         pendingTasks.delete(entry.taskId);
         continue;
       }
@@ -162,7 +156,6 @@ export function startTaskRecovery() {
     const now = Date.now();
     for (const [taskId, entry] of pendingTasks) {
       if (now - entry.startedAt > MAX_POLL_MS) {
-        console.log(`[TaskRecovery] Cleaning up timed-out task ${taskId}`);
         pendingTasks.delete(taskId);
       }
     }
@@ -184,7 +177,6 @@ export function stopTaskRecovery() {
     clearInterval(cleanupInterval);
     cleanupInterval = null;
   }
-  console.log("[TaskRecovery] Background task recovery stopped");
 }
 
 /* ─── Save completed task to Firestore history ────────────────────────── */
@@ -194,31 +186,18 @@ async function saveToHistory(entry, taskData) {
 
   // prerigcheck only returns is_animatable — no model to save
   if (entry.type === "animate_prerigcheck") {
-    console.log(`[TaskRecovery] prerigcheck task ${entry.taskId} completed (is_animatable=${out.is_animatable}) — no model to save`);
     return;
   }
 
   const animatedModels = Array.isArray(out.animated_models) && out.animated_models.length > 0
     ? out.animated_models
     : null;
-  if (animatedModels && entry.type === "animate_retarget") {
-    console.log(`[TaskRecovery] animate_retarget ${entry.taskId}: animated_models count=${animatedModels.length}`, animatedModels);
-  }
   const prefersTexturedOutput = entry.type === "texture_model" || entry.texture === true || entry.pbr === true;
   const prefersDraftOutput = !prefersTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(entry.type);
   const { modelUrl, chosenSource, previewImageUrl, previewImageUrls } = extractModelUrl(
     { output: out, type: entry.type },
     { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput },
   );
-  if (DEBUG_TRIPO) console.log("[TaskRecovery] output selection:", JSON.stringify({
-    taskId: entry.taskId,
-    type: entry.type,
-    prefersDraftOutput,
-    prefersTexturedOutput,
-    chosenSource,
-    modelUrl,
-    availableOutputKeys: Object.keys(out),
-  }, null, 2));
 
   if (!modelUrl) {
     console.warn(`[TaskRecovery] Task ${entry.taskId} (${entry.type}) succeeded but no model URL found in output:`, JSON.stringify(out));
@@ -278,9 +257,7 @@ async function saveToHistory(entry, taskData) {
       expiresAt: now + HISTORY_TTL_MS,
     }, { merge: true });
   }
-  console.log(`[TaskRecovery] Saved ${urlsToSave.length} model(s) for task ${entry.taskId} to history for user ${entry.userId}`);
 
-  console.log(`[TaskRecovery] Saved task ${entry.taskId} to history for user ${entry.userId}`);
 }
 
 /* ─── Handle failed/cancelled task — refund credits ───────────────────── */
@@ -320,14 +297,12 @@ async function handleFailedTask(entry, taskData) {
     .get();
 
   if (snap.empty) {
-    console.log(`[TaskRecovery] No credit charge found for failed task ${taskId}`);
     return;
   }
 
   // Find the debit transaction in-memory
   const debitDoc = snap.docs.find(d => d.data().type === "debit");
   if (!debitDoc) {
-    console.log(`[TaskRecovery] No debit transaction found for failed task ${taskId}`);
     return;
   }
   const data = debitDoc.data();
@@ -335,13 +310,11 @@ async function handleFailedTask(entry, taskData) {
   // Check for NSFW/content policy — no refund
   const errorMsg = String(taskError ?? "").toLowerCase();
   if (errorMsg.includes("nsfw") || errorMsg.includes("content policy") || errorMsg.includes("safety") || errorMsg.includes("moderat")) {
-    console.log(`[TaskRecovery] No refund for task ${taskId}: NSFW/content policy violation`);
     return;
   }
 
   try {
     await refundCredits(userId, data.amount, taskId, `recovery_${taskData.status}`);
-    console.log(`[TaskRecovery] Refunded ${data.amount} credits for failed task ${taskId}`);
   } catch (err) {
     console.error(`[TaskRecovery] Refund failed for task ${taskId}:`, err.message);
   }

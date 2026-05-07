@@ -143,7 +143,6 @@ router.post('/cancel-job', verifyFirebaseToken, (req, res) => {
         if (!job.userId || job.userId !== req.userId) {
             return res.status(403).json({ success: false, message: 'Nincs jogosultsag a folyamat megszakitasahoz' });
         }
-        console.log(`[Cancel] User requested cancellation for job: ${jobId}`);
         job.controller.abort();
         unregisterJob(jobId);
         return res.json({ success: true, message: 'Folyamat megszakítva' });
@@ -205,7 +204,6 @@ function printTokenUsage(provider, model, usage) {
     const sExtra = extraT > 0 ? `| EXTRA: \x1b[36m${String(extraT).padStart(6)}\x1b[0m ` : "".padEnd(0);
     const sTotal = String(totalT).padStart(7);
 
-    console.log(`\x1b[32m[USAGE]\x1b[0m \x1b[1m${p}\x1b[0m | \x1b[36m${m}\x1b[0m | IN: \x1b[33m${sIn}\x1b[0m | OUT: \x1b[33m${sOut}\x1b[0m ${sExtra}| TOTAL: \x1b[35m${sTotal}\x1b[0m`);
 }
 
 // ── Firestore usage log ───────────────────────────────────────────────────────
@@ -896,7 +894,6 @@ Keep it under 180 tokens.`;
 
     await batch.commit();
 
-    console.log(`[Summary] Cumulative summary refreshed. summarized=${nextSummarizedMessageCount}, session=${sessionId}`);
 
     return {
         summaryRefreshed: true,
@@ -934,7 +931,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         activeStreams.set(streamKey, controller);
 
         req.on('close', () => {
-            console.log(`[Chat] Kliens lecsatlakozott, AI stream leállítva...`);
             controller.abort();
             activeStreams.delete(streamKey);
         });
@@ -1021,18 +1017,14 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
         context = trimToContextLimit(context, 8192 * 32 * 0.8);
 
-        console.log(`[Chat] Kontextus: ${context.length} üzenet, summary: ${sessionData.summary ? 'igen' : 'nem'}`);
 
         // ── Title generálás (csak az első üzenetnél) ──
         if (!sessionData.title) {
             const firstUserText = messageText || '[kep]';
-            console.log(`[Title] Generating for session ${sessionId}, message: "${firstUserText.slice(0, 60)}"`);
             const generatedTitle = await generateSessionTitle(firstUserText);
-            console.log(`[Title] Generated: "${generatedTitle}"`);
             if (generatedTitle) {
                 await sessionRef.set({ title: generatedTitle }, { merge: true });
                 sessionData.title = generatedTitle;
-                console.log(`[Title] Saved to Firestore: "${generatedTitle}"`);
             }
         }
 
@@ -1194,7 +1186,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 stream.on('error', (err) => {
                     if (anthropicStreamClosed) return;
                     if (err.name === 'AbortError') {
-                        console.log('[Anthropic] Stream leállítva.');
                     } else {
                         console.error('Anthropic stream hiba:', err);
                         writeAnthropicSse({ error: err.message || 'Anthropic stream hiba' });
@@ -1285,7 +1276,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             } catch (err) {
                 activeStreams.delete(streamKey);
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[OpenAI] Stream leállítva.');
                 } else {
                     console.error('OpenAI stream hiba:', err);
                     if (!res.writableEnded) {
@@ -1339,7 +1329,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[Cerebras] Stream leállítva.');
                     return;
                 }
                 console.error('Cerebras hiba:', err.response?.data || err.message);
@@ -1459,7 +1448,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[Mistral] Stream leállítva.');
                     return;
                 }
                 console.error('Mistral hiba:', err.response?.data || err.message);
@@ -1578,7 +1566,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[Groq] Stream leállítva.');
                     return;
                 }
                 console.error('Groq hiba:', err.response?.data || err.message);
@@ -1739,7 +1726,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     return res.end();
                 }
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[Gemini] Stream leállítva.');
                     return;
                 }
                 console.error('Gemini kapcsolódási hiba:', err.message);
@@ -1880,7 +1866,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[NVIDIA] Stream leállítva.');
                     return;
                 }
                 activeStreams.delete(streamKey);
@@ -2041,7 +2026,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     break;
                 } catch (err) {
                     if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                        console.log('[ModelScope] Stream leallitva.');
                         return;
                     }
 
@@ -2242,7 +2226,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[OpenRouter] Stream leállítva.');
                     return;
                 }
                 activeStreams.delete(streamKey);
@@ -2399,7 +2382,6 @@ router.post('/chat/stop', verifyFirebaseToken, async (req, res) => {
         const controller = activeStreams.get(streamKey);
 
         if (controller) {
-            console.log(`[Chat] Stop: session ${sessionId}. Stream leállítva.`);
             controller.abort();
             activeStreams.delete(streamKey);
             return res.json({ success: true, message: 'Adatfolyam leállítva' });
@@ -3446,7 +3428,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
     } catch (err) {
         unregisterJob(req.body.jobId);
         if (err.name === 'AbortError') {
-            console.log(`[Abort] Job ${req.body.jobId} was aborted.`);
             if (!res.headersSent) {
                 sseStart(res);
                 sseEmit(res, { type: 'error', message: 'Folyamat megszakítva (Timeout/User cancel)' });
@@ -6494,7 +6475,6 @@ router.post('/chat/switch-model', verifyFirebaseToken, async (req, res) => {
             sessionData,
         });
 
-        console.log(`[SwitchModel] ${sessionId} → ${newModelId} (context megőrizve)`);
         return res.json({ success: true, summaryRefreshed: summaryResult.summaryRefreshed });
     } catch (e) {
         console.error('Switch model hiba:', e);
@@ -6748,7 +6728,6 @@ router.delete('/image-gallery', verifyFirebaseToken, async (req, res) => {
         snap.docs.forEach(doc => batch.delete(doc.ref));
         await batch.commit();
 
-        console.log(`[GalleryBulkDelete] Purged ${snap.size} objects for user ${userId}`);
         res.json({ success: true, message: 'Összes kép sikeresen törölve' });
     } catch (err) {
         console.error('[GalleryBulkDelete] Error:', err);

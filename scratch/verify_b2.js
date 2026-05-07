@@ -13,11 +13,9 @@ const b2 = new S3Client({
 async function checkExists(key) {
     try {
         await b2.send(new HeadObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: key }));
-        console.log(`✅ Object EXISTS: ${key}`);
         return true;
     } catch (err) {
         if (err.name === 'NotFound') {
-            console.log(`❌ Object DELETED: ${key}`);
             return false;
         }
         console.error(`⚠️ Error checking ${key}:`, err.message);
@@ -29,5 +27,4 @@ const keyToCheck = process.argv[2];
 if (keyToCheck) {
     checkExists(keyToCheck);
 } else {
-    console.log('Provide a B2 key as argument');
 }

@@ -68,7 +68,6 @@ async function saveCompletedTaskToHistory(taskId, payload) {
     .get();
 
   if (snap.empty) {
-    console.log(`[WebhookController] No credit charge found for task ${taskId}, skipping history save`);
     return;
   }
 
@@ -84,7 +83,6 @@ async function saveCompletedTaskToHistory(taskId, payload) {
     .get();
 
   if (!existing.empty) {
-    console.log(`[WebhookController] History already exists for task ${taskId}, skipping`);
     return;
   }
 
@@ -109,7 +107,6 @@ async function saveCompletedTaskToHistory(taskId, payload) {
 
 
   if (!modelUrl) {
-    console.log(`[WebhookController] No model URL for completed task ${taskId}`);
     return;
   }
 
@@ -170,7 +167,6 @@ async function saveCompletedTaskToHistory(taskId, payload) {
   // We do this in the background after acknowledging the webhook
   (async () => {
     try {
-      console.log(`[WebhookController] Downloading model from Tripo for task ${taskId}...`);
       const resp = await axios.get(modelUrl, { responseType: 'arraybuffer', timeout: 60000 });
       const buffer = Buffer.from(resp.data);
       
@@ -192,13 +188,11 @@ async function saveCompletedTaskToHistory(taskId, payload) {
         // We keep model_url as a fallback, but we'll prefer b2_key in proxy
       });
       
-      console.log(`[WebhookController] Task ${taskId} successfully archived to B2: ${b2Key}`);
     } catch (archiveErr) {
       console.error(`[WebhookController] Failed to archive task ${taskId} to B2:`, archiveErr.message);
     }
   })();
 
-  console.log(`[WebhookController] Saved task ${taskId} to history for user ${userId}`);
 }
 
 export async function testWebhook(req, res) {
@@ -224,7 +218,6 @@ async function processRefundForTask(taskId, status, payload) {
   // Check for NSFW/content policy — no refund
   const errorMsg = (payload.error_msg ?? payload.message ?? payload.reason ?? "").toLowerCase();
   if (errorMsg.includes("nsfw") || errorMsg.includes("content policy") || errorMsg.includes("safety") || errorMsg.includes("moderat")) {
-    console.log(`[WebhookController] No refund for task ${taskId}: NSFW/content policy violation`);
     return;
   }
 
@@ -237,7 +230,6 @@ async function processRefundForTask(taskId, status, payload) {
     .get();
 
   if (snap.empty) {
-    console.log(`[WebhookController] No credit charge found for task ${taskId}, skipping refund`);
     return;
   }
 
@@ -246,7 +238,6 @@ async function processRefundForTask(taskId, status, payload) {
   // The document path is: credit_history/{userId}/transactions/{txId}
   const userId = doc.ref.parent.parent.id;
 
-  console.log(`[WebhookController] Processing refund for task ${taskId}, user ${userId}, amount ${data.amount}`);
 
   try {
     await refundCredits(userId, data.amount, taskId, `webhook_${status}`);

@@ -62,9 +62,7 @@ function isRefineModelVersionSupported(version) {
 function logDebug(label, payload) {
   if (!DEBUG_TRIPO) return;
   try {
-    console.log(label, JSON.stringify(payload, null, 2));
   } catch {
-    console.log(label, payload);
   }
 }
 
@@ -267,7 +265,6 @@ async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
     deleted += slice.length;
   }
 
-  console.log(`[HistoryController] cleanup reason=${reason} docs=${deleted} b2Deleted=${b2Deleted} b2Failed=${b2Failed}`);
   return { deleted, b2Deleted, b2Failed };
 }
 
@@ -421,7 +418,6 @@ export async function createTask(req, res) {
           sourceTask?.input?.original_model_task_id ??
           null;
         if (upstreamId && sourceType && !TEXTURE_DIRECT_SOURCE_TYPES.has(sourceType)) {
-          console.log(`[TaskController][texture-source] Rewriting texture source ${body.original_model_task_id} (${sourceType}) -> ${upstreamId}`);
           body.original_model_task_id = upstreamId;
         }
       } catch (sourceErr) {
@@ -510,8 +506,6 @@ export async function createTask(req, res) {
     taskService.validate(body);
     const estimateResult = estimateCost(body);
     estimatedCost = estimateResult.total;
-    console.log(`[TaskController][create] type=${body.type} model=${body.model_version} base_cost=${estimateResult.breakdown.base} tex_addon=${estimateResult.breakdown.texture || 0} total_cost=${estimatedCost}`);
-    console.log(`[TaskController] create type=${body.type} model=${body.model_version ?? "default"} cost=${estimatedCost}`);
 
     if (estimatedCost > 0 && userId) {
       tempTxId = `pending_${type}_${Date.now()}`;
@@ -519,7 +513,6 @@ export async function createTask(req, res) {
         const tripoBalance = await getTripoClient().getBalance();
         const availableTripo = tripoBalance.balance ?? 0;
         if (availableTripo < estimatedCost) {
-          console.log(`[TaskController] Tripo balance ${availableTripo} < estimated cost ${estimatedCost} — rejecting`);
           return res.status(402).json({
             success: false,
             message: `Insufficient credits: ${availableTripo} available, ${estimatedCost} required. Please top up your balance.`,
@@ -575,7 +568,6 @@ export async function createTask(req, res) {
               } else {
                 formattedAnim = `preset:${anim}`;
               }
-              console.log(`[TaskController] Formatted ${type} animation: ${formattedAnim} (ver=${version}, rig=${rigType})`);
               if (body.animations) {
                 body.animations = body.animations.map(a => a.startsWith("preset:") ? a : (rigType === "biped" || rigType === "quadruped" || isV1 ? `preset:${rigType}:${a}` : `preset:${a}`));
               } else {
@@ -687,17 +679,6 @@ export async function createTask(req, res) {
       }
     }
     // Extra logging for animate_retarget to verify request structure
-    if (type === "animate_retarget") {
-      console.log(`[TaskController] animate_retarget request validation:`, {
-        original_model_task_id: body.original_model_task_id,
-        animation: body.animation,
-        animations: body.animations,
-        out_format: body.out_format ?? "glb",
-        bake_animation: body.bake_animation ?? true,
-        export_with_geometry: body.export_with_geometry ?? true,
-        animate_in_place: body.animate_in_place ?? false,
-      });
-    }
     if (type === "refine_model") {
       logDebug("[TaskController][refine-debug] validated body before taskService.create:", {
         draft_model_task_id: body.draft_model_task_id ?? null,
@@ -828,7 +809,6 @@ export async function createTask(req, res) {
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
       if (userId && estimatedCost > 0 && creditsDeducted) {
-        console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
         await refundDeductedCredits("tripo_403_insufficient_credit");
       }
     }
@@ -1035,7 +1015,6 @@ export async function uploadFile(req, res) {
   try {
     const client = getTripoClient();
     const imageToken = await client.uploadFile(file.buffer, file.originalname || "image.jpg", file.mimetype);
-    console.log(`[TaskController] uploaded image token: ${imageToken.slice(0, 12)}…`);
     // FIX: volt itt egy setImgToken(d.imageToken) — az React frontend kód, nem ide való
     res.json({ success: true, imageToken });
   } catch (err) {
@@ -1077,9 +1056,6 @@ function startCacheCleanup() {
         REFRESH_FAILURE_CACHE.delete(key);
         cleanedFailure++;
       }
-    }
-    if (cleanedModel > 0 || cleanedFailure > 0) {
-      console.log(`[TaskController] cache cleanup: removed ${cleanedModel} models, ${cleanedFailure} dead marks`);
     }
   }, 30 * 60 * 1000);
   _cacheCleanupTimer.unref?.();
@@ -1135,7 +1111,6 @@ async function archiveModelProxyFetch({
       archivedAt: admin.firestore.FieldValue.serverTimestamp(),
       archiveSource: "model_proxy",
     });
-    console.log(`[TaskController] modelProxy archived task ${taskId} to ${key}`);
   } catch (err) {
     console.warn(`[TaskController] modelProxy archive failed for ${taskId}:`, err.message);
   }
@@ -1242,7 +1217,6 @@ export async function modelProxy(req, res) {
       try {
         const histData = authorizedHistory?.data;
         if (histData?.b2_key) {
-          console.log(`[TaskController] modelProxy: found B2 key ${histData.b2_key} for task ${taskIdParam}`);
           const b2Url = await storageService.getSignedUrl(histData.b2_key);
           if (b2Url) {
             url = b2Url; // Use B2 URL instead of Tripo URL
@@ -1278,22 +1252,18 @@ export async function modelProxy(req, res) {
       const taskId = taskIdParam || null;
 
       if (taskId) {
-        console.log(`[TaskController] modelProxy: Upstream ${error} for task ${taskId} (source: ${taskIdSource})`);
         // Check if we already know this task is dead
         if (REFRESH_FAILURE_CACHE.has(taskId)) {
-          console.log(`[TaskController] modelProxy: skipping refresh for known dead task ${taskId}`);
           rejectInFlight?.(Object.assign(new Error("Task expired or deleted from source"), { status: 410, code: "TASK_NOT_FOUND" }));
           MODEL_IN_FLIGHT.delete(requestCacheKey);
           res.status(410).json({ success: false, message: "Task expired or deleted from source", code: "TASK_NOT_FOUND" });
           return;
         }
 
-        console.log(`[TaskController] modelProxy: URL expired (Upstream ${error}), refreshing task ${taskId}...`);
         try {
           const freshData = await taskService.get(taskId);
           if (freshData.success && freshData.modelUrl) {
             if (freshData.modelUrl !== url) {
-              console.log(`[TaskController] modelProxy: refresh successful, retrying with new URL`);
               url = freshData.modelUrl;
               const retry = await performFetch(url);
               error = retry.error;
@@ -1330,7 +1300,6 @@ export async function modelProxy(req, res) {
 
                 const allDocs = [...taskSnap.docs, ...urlSnap.docs];
                 const cleanup = await deleteHistoryDocsWithStorage(allDocs, "model_proxy_source_missing");
-                if (cleanup.deleted > 0) console.log(`[TaskController] Deleted ${cleanup.deleted} dead history documents for taskId ${taskId}`);
               } catch (fsErr) {
                 console.warn(`[TaskController] Dead history cleanup failed:`, fsErr.message);
               }
@@ -1527,7 +1496,6 @@ export async function deleteHistoryItem(req, res) {
     }
 
     const cleanup = await deleteHistoryDocsWithStorage([doc], "single_delete");
-    console.log(`[HistoryController] deleted item ${id} for user ${uid}`);
     res.json({ success: true, id, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] deleteHistoryItem error:", err.message);
@@ -1555,7 +1523,6 @@ export async function clearHistory(req, res) {
 
     const cleanup = await deleteHistoryDocsWithStorage(snap.docs, `clear_${source}`);
 
-    console.log(`[HistoryController] cleared ${snap.size} ${source} items for user ${uid}`);
     res.json({ success: true, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] clearHistory error:", err.message);
@@ -1598,7 +1565,6 @@ export async function cleanupExpiredHistory(req, res) {
 
     const cleanup = await deleteHistoryDocsWithStorage(expiredDocs, "expired_ttl");
 
-    console.log(`[HistoryController] cleaned up ${cleanup.deleted} expired items for user ${uid}`);
     res.json({ success: true, ...cleanup });
   } catch (err) {
     console.error("[HistoryController] cleanupExpiredHistory error:", err.message);
