@@ -9,6 +9,7 @@ import {
   POLL_INTERVAL, RETRY_CONFIG,
 } from "../config/tripo.config.js";
 import { extractModelUrl } from "../utils/tripoUtils.js";
+import { isFailedLikeTripoTaskStatus, normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
@@ -370,9 +371,10 @@ export class TripoClient {
 
     while (Date.now() < deadline) {
       const task = await this.getTask(taskId);
-      opts.onProgress?.(task.progress ?? 0, task.status);
+      const normalizedStatus = normalizeTripoTaskStatus(task.status);
+      opts.onProgress?.(task.progress ?? 0, normalizedStatus);
 
-      if (task.status === "success") {
+      if (normalizedStatus === "success") {
         const { modelUrl, rigCheckResult, rigType, topology, rawOutput } = extractModelUrl(task);
         return {
           success: true,
@@ -388,9 +390,9 @@ export class TripoClient {
         };
       }
 
-      if (task.status === "failed" || task.status === "cancelled") {
+      if (isFailedLikeTripoTaskStatus(task.status)) {
         return {
-          success: false, status: task.status, progress: task.progress ?? 0,
+          success: false, status: normalizedStatus, progress: task.progress ?? 0,
           modelUrl: null, tripoTraceId: task._traceId ?? null, rigCheckResult: null, rawOutput: null
         };
       }

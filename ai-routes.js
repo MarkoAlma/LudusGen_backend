@@ -11,6 +11,7 @@ import multer from 'multer';
 import dns from "dns";
 dns.setDefaultResultOrder("ipv4first");
 import https from "https";
+import crypto from "node:crypto";
 
 import grpc from '@grpc/grpc-js';
 import protoLoader from '@grpc/proto-loader';
@@ -29,13 +30,90 @@ import {
     trimToContextLimit,
 } from './src/lib/contextBuilder.js';
 import {
+    buildTripoAssetNameFallback,
+    buildTripoAssetNamingMessages,
+    normalizeTripoAssetName,
+} from './src/lib/tripoAssetNaming.js';
+import {
     encodeImageGalleryCursor,
     decodeImageGalleryCursor,
     clampImageGalleryLimit,
 } from './src/lib/imageGalleryCursor.js';
+import {
+    classifySpriteRequest,
+    normalizeSpriteGenerateRequest,
+    parseSpriteProviderChoice,
+    SUPPORTED_SPRITE_PROVIDERS,
+} from './src/lib/spriteRouting.js';
+import {
+    getSpriteCapabilities,
+    getSpriteOperation,
+    getSpriteProvidersForOperation,
+    resolveSpriteCapabilityRoute,
+    spriteOperationRequiresReference,
+} from './src/lib/spriteCapabilities.js';
+import {
+    getSpriteWebhookSecret,
+    sanitizeSpritePrompt,
+    verifySpriteWebhookSignature,
+} from './src/lib/spriteSecurity.js';
 import { storageService } from './src/services/storageService.js';
 import { canAccessMarketplaceStorageKey } from './src/services/marketplaceService.js';
+import { extractTrellisModelBase64, summarizeTrellisResponse } from './src/lib/trellisResponse.js';
 import { verifyFirebaseToken } from './src/middleware/verifyFirebaseToken.js';
+import {
+    generateSpriteWithProvider,
+    SpriteProviderError,
+} from './src/services/spriteProviderAdapters.js';
+import {
+    calculateSpriteCreditCharge,
+    chargeSpriteGeneration,
+    estimateSpriteGenerationCharge,
+    makeSpriteAuditPayload,
+    normalizeProviderCostUsd,
+    reserveSpriteCredits,
+    refundSpriteCreditReservation,
+    writeSpriteAuditLog,
+} from './src/services/spriteBillingService.js';
+import {
+    getCachedSpriteGeneration,
+    setCachedSpriteGeneration,
+} from './src/services/spriteCacheService.js';
+import { finalizeSpriteSuccessResponse } from './src/services/spriteResponseService.js';
+import {
+    getSpriteFallbackChain,
+    runSpriteGenerationWithFallback,
+} from './src/services/spriteExecutionService.js';
+import {
+    getProviderHealthSnapshot,
+    recordSpriteProviderMetric,
+    spriteMetricsStore,
+} from './src/services/spriteMetricsService.js';
+import {
+    getOpenSpriteProviders,
+    recordSpriteCircuitFailure,
+    recordSpriteCircuitSuccess,
+    spriteCircuitStore,
+} from './src/services/spriteCircuitBreaker.js';
+import {
+    createSpriteJobRecord,
+    getSpriteJobRecord,
+    sanitizeSpriteJobForClient,
+    saveSpriteJobRecord,
+    transitionSpriteJob,
+    updateSpriteJobRecord,
+} from './src/services/spriteJobService.js';
+import { postProcessSpriteAssets } from './src/services/spritePostProcessingService.js';
+import { assertMeshyAccess, isMeshyEnabled } from './src/services/meshyAccessService.js';
+import { resolveTrellisRequestSeed } from './src/lib/trellisSeed.js';
+import {
+    IMAGE_STUDIO_SUBSCRIPTION_REQUIRED_CODE,
+    SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+    TRELLIS_API_LIMIT_REACHED_CODE,
+    buildImageStudioAvailability,
+    getTrellisAvailabilitySnapshot,
+    recordTrellisCall,
+} from './src/services/serviceAvailabilityService.js';
 
 import { registerJob, unregisterJob, activeJobs } from './src/lib/jobRegistry.js';
 
@@ -137,17 +215,17 @@ const activeStreams = new Map();
 
 router.post('/cancel-job', verifyFirebaseToken, (req, res) => {
     const { jobId } = req.body;
-    if (!jobId) return res.status(400).json({ success: false, message: 'Hiányzó jobId' });
+    if (!jobId) return res.status(400).json({ success: false, message: 'Missing jobId' });
     const job = activeJobs.get(jobId);
     if (job) {
         if (!job.userId || job.userId !== req.userId) {
-            return res.status(403).json({ success: false, message: 'Nincs jogosultsag a folyamat megszakitasahoz' });
+            return res.status(403).json({ success: false, message: 'You are not allowed to cancel this job' });
         }
         job.controller.abort();
         unregisterJob(jobId);
-        return res.json({ success: true, message: 'Folyamat megszakítva' });
+        return res.json({ success: true, message: 'Job cancelled' });
     }
-    return res.status(404).json({ success: false, message: 'Folyamat nem található vagy már véget ért' });
+    return res.status(404).json({ success: false, message: 'Job not found or already finished' });
 });
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -185,6 +263,12 @@ const genLimiter = rateLimit({
 });
 
 // ── Token Usage Logger (Precise) ─────────────────────────────────────────────
+const spriteLimiter = rateLimit({
+    windowMs: 60 * 1000, max: 60,
+    keyGenerator: (req) => req.userId || ipKeyGenerator(req),
+    message: { success: false, message: 'Tul sok 2D sprite keres - probald ujra 1 perc mulva' },
+});
+
 function printTokenUsage(provider, model, usage) {
     const p = provider.toUpperCase().padEnd(10);
     const m = model.padEnd(25);
@@ -2848,6 +2932,8 @@ router.post('/texture-paint-edit', verifyFirebaseToken, imageLimiter, async (req
                 aspect_ratio: `${targetWidth}:${targetHeight}`,
                 width: targetWidth,
                 height: targetHeight,
+            }).catch((galleryError) => {
+                console.warn('[TexturePaint] Gallery upload failed:', galleryError?.message || galleryError);
             });
             return res.json({
                 success: true,
@@ -2914,6 +3000,8 @@ router.post('/texture-paint-edit', verifyFirebaseToken, imageLimiter, async (req
             aspect_ratio: `${targetWidth}:${targetHeight}`,
             width: targetWidth,
             height: targetHeight,
+        }).catch((galleryError) => {
+            console.warn('[TexturePaint] Gallery upload failed:', galleryError?.message || galleryError);
         });
 
         return res.json({
@@ -2934,7 +3022,10 @@ router.post('/texture-paint-edit', verifyFirebaseToken, imageLimiter, async (req
 // 2.  KÉPGENERÁLÁS  —  POST /api/generate-image
 // ════════════════════════════════════════════════════
 router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, res) => {
+    let imageSseStarted = false;
     const sseStart = (res) => {
+        if (imageSseStarted) return;
+        imageSseStarted = true;
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -2963,6 +3054,15 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             return res.status(400).json({ success: false, message: 'Hiányzó prompt' });
         }
 
+        if (process.env.IMAGE_STUDIO_GENERATION_DISABLED !== "false") {
+            const imageAvailability = buildImageStudioAvailability();
+            return res.status(402).json({
+                success: false,
+                ...imageAvailability,
+                code: IMAGE_STUDIO_SUBSCRIPTION_REQUIRED_CODE,
+            });
+        }
+
         const imageModel = resolveImageGenerationModel({
             modelId: requestedModelId,
             provider: requestedProvider,
@@ -2974,6 +3074,12 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
         const { provider, apiId } = imageModel;
         const controller = new AbortController();
         registerJob(jobId, req.userId, controller, 600000); // 10 minutes timeout
+
+        const emitImageError = (message) => {
+            sseStart(res);
+            sseEmit(res, { type: 'error', message });
+            return res.end();
+        };
 
         const ESTIMATED_DURATIONS = {
             modelscope_edit: 150,
@@ -3004,9 +3110,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
         if (provider === 'google-image') {
             if (!process.env.GEMINI_API_KEY) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: 'GEMINI_API_KEY nincs beállítva' });
-                return res.end();
+                return emitImageError('GEMINI_API_KEY nincs beallitva');
             }
 
             const response = await axios.post(
@@ -3037,22 +3141,23 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 }
             }
 
-            if (images.length === 0) throw new Error('A Gemini nem adott vissza képet.');
+            if (images.length === 0) throw new Error('A Gemini nem adott vissza kepet.');
             await logUsage(req.userId, 'image', { provider: 'google-image', apiId, numImages: images.length });
-            for (const img of images) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'google-image', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'google-image', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_google_image',
+            });
             unregisterJob(jobId);
             sseStart(res);
-            sseEmit(res, { type: 'done', images });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
         else if (provider === 'modelscope') {
             if (!process.env.MODELSCOPE_API_KEY) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: 'MODELSCOPE_API_KEY nincs beállítva' });
-                return res.end();
+                return emitImageError('MODELSCOPE_API_KEY nincs beallitva');
             }
 
             const msHeaders = {
@@ -3134,9 +3239,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                     }
                 } catch (e) {
                     console.error('B2 hiba:', e.message);
-                    sseStart(res);
-                    sseEmit(res, { type: 'error', message: e.message });
-                    return res.end();
+                    return emitImageError(e.message);
                 }
             }
 
@@ -3172,9 +3275,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
 
                 const genData = await genResp.json();
                 if (!genResp.ok) {
-                    sseStart(res);
-                    sseEmit(res, { type: 'error', message: `ModelScope hiba: ${JSON.stringify(genData?.errors || genData).slice(0, 200)}` });
-                    return res.end();
+                    return emitImageError(`ModelScope hiba: ${JSON.stringify(genData?.errors || genData).slice(0, 200)}`);
                 }
 
                 if (genData.output_images?.length > 0) {
@@ -3182,14 +3283,10 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 } else if (genData.task_id) {
                     taskId = genData.task_id;
                 } else {
-                    sseStart(res);
-                    sseEmit(res, { type: 'error', message: `ModelScope: ismeretlen válasz` });
-                    return res.end();
+                    return emitImageError(`ModelScope: ismeretlen valasz`);
                 }
             } catch (err) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: 'ModelScope kapcsolódási hiba: ' + err.message });
-                return res.end();
+                return emitImageError('ModelScope kapcsolodasi hiba: ' + err.message);
             }
 
             const cleanupB2 = async () => {
@@ -3220,11 +3317,14 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 const { url: finalUrl, base64 } = await postProcess(immediateUrl, resizeMultiplier);
                 const finalImages = [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }];
                 await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
-                for (const img of finalImages) {
-                    processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
-                }
+                const persisted = await persistGeneratedImagesForResponse({
+                    userId: req.userId,
+                    images: finalImages,
+                    metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height }),
+                    filenamePrefix: 'ludusgen_modelscope_image',
+                });
                 sseStart(res);
-                sseEmit(res, { type: 'done', images: finalImages });
+                sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
                 return res.end();
             }
 
@@ -3264,42 +3364,40 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                     imageUrl = pollData?.output_images?.[0];
                     if (!imageUrl) {
                         await cleanupB2();
-                        sseEmit(res, { type: 'error', message: 'ModelScope SUCCEED de nincs output_images' });
-                        return res.end();
+                        return emitImageError('ModelScope SUCCEED de nincs output_images');
                     }
                     sseEmit(res, { type: 'status', status: 'PROCESSING', progress: Math.max(progress, 90), elapsed });
                     break;
                 } else if (status === 'FAILED') {
                     await cleanupB2();
-                    sseEmit(res, { type: 'error', message: 'ModelScope generálás sikertelen' });
-                    return res.end();
+                    return emitImageError('ModelScope generalas sikertelen');
                 } else {
                     sseEmit(res, { type: 'status', status: status || 'PENDING', progress, elapsed });
                 }
             }
 
             if (!imageUrl) {
-                sseEmit(res, { type: 'error', message: 'ModelScope időtúllépés' });
-                return res.end();
+                return emitImageError('ModelScope idotullepes');
             }
 
             const { url: finalUrl, base64 } = await postProcess(imageUrl, resizeMultiplier);
             const finalImages = [{ url: base64 || finalUrl, width: originalWidth || image_size?.width || 1024, height: originalHeight || image_size?.height || 1024 }];
             await cleanupB2();
             await logUsage(req.userId, 'image', { provider: 'modelscope', apiId });
-            for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images: finalImages,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'modelscope', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_modelscope_image',
+            });
             unregisterJob(jobId);
-            sseEmit(res, { type: 'done', images: finalImages });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
         else if (provider === 'cloudflare') {
             if (!process.env.CLOUDFLARE_API_KEY || !process.env.CLOUDFLARE_ACCOUNT_ID) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: 'CLOUDFLARE_API_KEY vagy CLOUDFLARE_ACCOUNT_ID nincs beállítva' });
-                return res.end();
+                return emitImageError('CLOUDFLARE_API_KEY vagy CLOUDFLARE_ACCOUNT_ID nincs beallitva');
             }
 
             const cfResp = await axios.post(
@@ -3317,6 +3415,7 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                     headers: { 'Authorization': `Bearer ${process.env.CLOUDFLARE_API_KEY}`, 'Content-Type': 'application/json' },
                     responseType: 'arraybuffer',
                     timeout: 120000,
+                    signal: controller.signal,
                 }
             );
 
@@ -3324,20 +3423,21 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             const contentType = cfResp.headers['content-type']?.split(';')[0] || 'image/png';
             const finalImages = [{ url: `data:${contentType};base64,${base64}`, width: image_size.width || 1024, height: image_size.height || 1024 }];
             await logUsage(req.userId, 'image', { provider: 'cloudflare', apiId, numImages: 1 });
-            for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'cloudflare', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images: finalImages,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'cloudflare', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_cloudflare_image',
+            });
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
-            sseEmit(res, { type: 'done', images: finalImages });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
         else if (provider === 'nvidia-image') {
             if (!process.env.NVIDIA_API_KEY) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: 'NVIDIA_API_KEY nincs beállítva' });
-                return res.end();
+                return emitImageError('NVIDIA_API_KEY nincs beallitva');
             }
 
             const id = apiId.toLowerCase();
@@ -3361,41 +3461,37 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
                 nimResp = await axios.post(`https://ai.api.nvidia.com/v1/genai/${apiId}`, requestBody, {
                     headers: { 'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
                     timeout: 180000,
+                    signal: controller.signal,
                 });
             } catch (err) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: err.response?.data?.detail || err.message });
-                return res.end();
+                return emitImageError(err.response?.data?.detail || err.message);
             }
 
             const base64Image = nimResp.data?.image ?? nimResp.data?.artifacts?.[0]?.base64;
             if (!base64Image) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: 'Nem érkezett kép az NVIDIA API-tól' });
-                return res.end();
+                return emitImageError('Nem erkezett kep az NVIDIA API-tol');
             }
 
             const finalImages = [{ url: `data:image/png;base64,${base64Image}`, width: image_size.width || 1024, height: image_size.height || 1024 }];
             await logUsage(req.userId, 'image', { provider: 'nvidia-image', apiId, numImages: 1 });
-            for (const img of finalImages) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'nvidia-image', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images: finalImages,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'nvidia-image', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_nvidia_image',
+            });
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
-            sseEmit(res, { type: 'done', images: finalImages });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
         else {
             if (!apiId) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: 'Hiányzó apiId' });
-                return res.end();
+                return emitImageError('Hianyzo apiId');
             }
             if (!process.env.FAL_KEY) {
-                sseStart(res);
-                sseEmit(res, { type: 'error', message: 'FAL_KEY nincs beállítva' });
-                return res.end();
+                return emitImageError('FAL_KEY nincs beallitva');
             }
 
             const result = await fal.subscribe(apiId, {
@@ -3413,15 +3509,18 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
             });
 
             const images = (result.data?.images || []).map((img) => ({ url: img.url, width: img.width, height: img.height }));
-            if (images.length === 0) throw new Error('Nem érkezett kép');
+            if (images.length === 0) throw new Error('Nem erkezett kep');
 
             await logUsage(req.userId, 'image', { apiId, numImages: num_images });
-            for (const img of images) {
-                processImageAndUpload(req.userId, img.url, { prompt, modelId: imageModel.id, provider: 'fal', aspect_ratio, width: img.width, height: img.height });
-            }
+            const persisted = await persistGeneratedImagesForResponse({
+                userId: req.userId,
+                images,
+                metadata: (img) => ({ prompt, modelId: imageModel.id, provider: 'fal', aspect_ratio, width: img.width, height: img.height }),
+                filenamePrefix: 'ludusgen_fal_image',
+            });
             sseStart(res);
             sseEmit(res, { type: 'status', status: 'PROCESSING', progress: 50, elapsed: 1 });
-            sseEmit(res, { type: 'done', images });
+            sseEmit(res, { type: 'done', images: persisted.images, warnings: persisted.warnings });
             return res.end();
         }
 
@@ -3538,16 +3637,23 @@ router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImag
             console.warn('[Upscale] Output meret beolvasas kihagyva:', err.message);
         }
 
-        const storedImage = await processImageAndUpload(req.userId, imageUrl, {
-            prompt: `${upscaleModel} upscale`,
-            modelId: upscaleModel,
-            provider: 'deapi-upscale',
-            aspect_ratio: inputMeta.width && inputMeta.height ? `${inputMeta.width}:${inputMeta.height}` : 'upscale',
-            width,
-            height,
-            operation: 'upscale',
-            requestId,
-        });
+        let storedImage = null;
+        const warnings = [];
+        try {
+            storedImage = await processImageAndUpload(req.userId, imageUrl, {
+                prompt: `${upscaleModel} upscale`,
+                modelId: upscaleModel,
+                provider: 'deapi-upscale',
+                aspect_ratio: inputMeta.width && inputMeta.height ? `${inputMeta.width}:${inputMeta.height}` : 'upscale',
+                width,
+                height,
+                operation: 'upscale',
+                requestId,
+            });
+        } catch (galleryError) {
+            warnings.push('A kep felnagyitasa sikerult, de a Gallery mentese sikertelen volt. Töltsd le most, es probald meg kesobb ujra.');
+            console.warn('[Upscale] Gallery persistence failed:', galleryError.message);
+        }
         const imageId = storedImage?.id || null;
 
         let outputImage = {
@@ -3597,6 +3703,7 @@ router.post('/upscale-image', verifyFirebaseToken, imageLimiter, handleDeapiImag
             type: 'done',
             success: true,
             images: [outputImage],
+            warnings,
             requestId,
             elapsed,
         });
@@ -5804,8 +5911,23 @@ router.get('/usage-stats', verifyFirebaseToken, async (req, res) => {
 // ════════════════════════════════════════════════════
 // 6.  MESHY — Text to 3D
 // ════════════════════════════════════════════════════
+function ensureMeshyAccess(res) {
+    try {
+        assertMeshyAccess(process.env);
+        return true;
+    } catch (error) {
+        res.status(error.status || 503).json({
+            success: false,
+            code: error.code || 'MESHY_UNAVAILABLE',
+            message: error.message || 'Meshy is unavailable.',
+        });
+        return false;
+    }
+}
+
+if (isMeshyEnabled(process.env)) {
 router.post('/meshy/text-to-3d', verifyFirebaseToken, genLimiter, async (req, res) => {
-    if (!MESHY_KEY) return res.status(500).json({ success: false, message: 'MESHY_API_KEY nincs beállítva' });
+    if (!ensureMeshyAccess(res)) return;
 
     const { prompt, ai_model = 'latest', topology = 'triangle', target_polycount = 100_000, should_remesh = false, symmetry_mode = 'auto', pose_mode = '', moderation = false, jobId } = req.body;
 
@@ -5836,7 +5958,7 @@ router.post('/meshy/text-to-3d', verifyFirebaseToken, genLimiter, async (req, re
 // 7.  MESHY — Image to 3D
 // ════════════════════════════════════════════════════
 router.post('/meshy/image-to-3d', verifyFirebaseToken, genLimiter, async (req, res) => {
-    if (!MESHY_KEY) return res.status(500).json({ success: false, message: 'MESHY_API_KEY nincs beállítva' });
+    if (!ensureMeshyAccess(res)) return;
 
     const { image_url, model_type = 'standard', ai_model = 'latest', topology = 'triangle', target_polycount = 100_000, symmetry_mode = 'auto', should_remesh = false, should_texture = true, enable_pbr = false, pose_mode = '', texture_prompt = '', moderation = false, jobId } = req.body;
 
@@ -5868,7 +5990,7 @@ router.post('/meshy/image-to-3d', verifyFirebaseToken, genLimiter, async (req, r
 // 8.  MESHY — Refine
 // ════════════════════════════════════════════════════
 router.post('/meshy/refine', verifyFirebaseToken, async (req, res) => {
-    if (!MESHY_KEY) return res.status(500).json({ success: false, message: 'MESHY_API_KEY nincs beállítva' });
+    if (!ensureMeshyAccess(res)) return;
 
     const { preview_task_id, enable_pbr = true, texture_prompt = '', texture_image_url = '', ai_model = 'latest', moderation = false, jobId } = req.body;
 
@@ -5898,7 +6020,7 @@ router.post('/meshy/refine', verifyFirebaseToken, async (req, res) => {
 // 9.  MESHY — Task státusz
 // ════════════════════════════════════════════════════
 router.get('/meshy/task/:type/:taskId', verifyFirebaseToken, async (req, res) => {
-    if (!MESHY_KEY) return res.status(500).json({ success: false, message: 'MESHY_API_KEY nincs beállítva' });
+    if (!ensureMeshyAccess(res)) return;
 
     const { type, taskId } = req.params;
     const endpoint = type === 'text-to-3d' ? `/openapi/v2/text-to-3d/${taskId}` : `/openapi/v1/image-to-3d/${taskId}`;
@@ -5915,6 +6037,7 @@ router.get('/meshy/task/:type/:taskId', verifyFirebaseToken, async (req, res) =>
 // 10. MESHY — Előzmények
 // ════════════════════════════════════════════════════
 router.get('/meshy/history', verifyFirebaseToken, async (req, res) => {
+    if (!ensureMeshyAccess(res)) return;
     try {
         const snap = await admin.firestore()
             .collection('usage_logs')
@@ -5934,10 +6057,31 @@ router.get('/meshy/history', verifyFirebaseToken, async (req, res) => {
 // ════════════════════════════════════════════════════
 // TRELLIS — B2 helpers
 // ════════════════════════════════════════════════════
+} else {
+    console.info('[Meshy] Routes disabled. Set ENABLE_MESHY=true to re-enable them.');
+}
+
 import fetch from 'node-fetch';
 
 const TRELLIS_NIM_URL = 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis';
 const keepAliveAgent = new https.Agent({ keepAlive: true, timeout: 190_000 });
+const TRELLIS_PROMPT_MAX_LENGTH = 77;
+const TRELLIS_CFG_SCALE_MIN = 1;
+const TRELLIS_CFG_SCALE_MAX = 10;
+const TRELLIS_SAMPLING_STEPS_MIN = 10;
+const TRELLIS_SAMPLING_STEPS_MAX = 50;
+
+function clampNumber(value, min, max, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
+}
+
+function clampInteger(value, min, max, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(parsed)));
+}
 
 const b2 = new S3Client({
     region: 'us-east-005',
@@ -5980,98 +6124,176 @@ function isAllowedGalleryImportSource(source) {
     }
 }
 
+const IMAGE_GALLERY_PERSIST_MAX_ATTEMPTS = 3;
+
 async function processImageAndUpload(userId, sourceUrlOrBase64, metadata) {
-    try {
-        const galleryCollection = admin.firestore().collection('generated_images');
-        const requestedDocId = safeGalleryDocId(metadata.docId);
-        if (requestedDocId) {
-            const existing = await galleryCollection.doc(requestedDocId).get();
-            if (existing.exists && existing.data()?.userId === userId) {
-                return {
-                    id: existing.id,
-                    duplicate: true,
-                    fullKey: existing.data()?.full_key || null,
-                    thumbKey: existing.data()?.thumb_key || null,
-                    width: existing.data()?.width || null,
-                    height: existing.data()?.height || null,
-                    contentType: existing.data()?.contentType || 'image/png',
-                    extension: 'png',
-                };
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= IMAGE_GALLERY_PERSIST_MAX_ATTEMPTS; attempt += 1) {
+        try {
+            const galleryCollection = admin.firestore().collection('generated_images');
+            const requestedDocId = safeGalleryDocId(metadata.docId);
+            if (requestedDocId) {
+                const existing = await galleryCollection.doc(requestedDocId).get();
+                if (existing.exists && existing.data()?.userId === userId) {
+                    return {
+                        id: existing.id,
+                        duplicate: true,
+                        fullKey: existing.data()?.full_key || null,
+                        thumbKey: existing.data()?.thumb_key || null,
+                        width: existing.data()?.width || null,
+                        height: existing.data()?.height || null,
+                        contentType: existing.data()?.contentType || 'image/png',
+                        extension: 'png',
+                    };
+                }
+            }
+
+            let inputBuffer;
+            let originalMime = 'image/png';
+
+            if (sourceUrlOrBase64.startsWith('data:')) {
+                const parts = sourceUrlOrBase64.split(',');
+                inputBuffer = Buffer.from(parts[1], 'base64');
+                originalMime = parts[0].match(/:(.*?);/)?.[1] || 'image/png';
+            } else {
+                const resp = await axios.get(sourceUrlOrBase64, { responseType: 'arraybuffer' });
+                inputBuffer = Buffer.from(resp.data);
+                originalMime = resp.headers['content-type'] || 'image/png';
+            }
+
+            const meta = await sharp(inputBuffer).metadata();
+            const ext = meta.format || 'png';
+
+            const timestamp = Date.now();
+            const rand = Math.random().toString(36).slice(2, 7);
+            const baseFilename = `${timestamp}_${rand}`;
+
+            const fullKey = `users/${userId}/images/full/${baseFilename}.${ext}`;
+            await uploadMediaToB2(inputBuffer, fullKey, originalMime);
+
+            const thumbKey = `users/${userId}/images/thumb/${baseFilename}.webp`;
+            const thumbBuffer = await sharp(inputBuffer)
+                .resize(300, null, { withoutEnlargement: true })
+                .webp({ quality: 80 })
+                .toBuffer();
+            await uploadMediaToB2(thumbBuffer, thumbKey, 'image/webp');
+
+            const storedWidth = metadata.width || meta.width || 1024;
+            const storedHeight = metadata.height || meta.height || 1024;
+
+            const galleryPayload = {
+                userId,
+                full_key: fullKey,
+                thumb_key: thumbKey,
+                prompt: metadata.prompt || '',
+                modelId: metadata.modelId || '',
+                provider: metadata.provider || '',
+                aspect_ratio: metadata.aspect_ratio || '1:1',
+                width: storedWidth,
+                height: storedHeight,
+                operation: metadata.operation || null,
+                requestId: metadata.requestId || null,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            };
+
+            let docRef;
+            if (requestedDocId) {
+                docRef = galleryCollection.doc(requestedDocId);
+                await docRef.set(galleryPayload);
+            } else {
+                docRef = await galleryCollection.add(galleryPayload);
+            }
+
+            return {
+                id: docRef.id,
+                fullKey,
+                thumbKey,
+                width: storedWidth,
+                height: storedHeight,
+                contentType: originalMime,
+                extension: ext,
+            };
+        } catch (err) {
+            lastError = err;
+            if (attempt < IMAGE_GALLERY_PERSIST_MAX_ATTEMPTS) {
+                console.warn(`[GalleryStore] Attempt ${attempt} failed:`, err.message);
+                await new Promise((resolve) => setTimeout(resolve, attempt * 350));
+                continue;
             }
         }
-
-        let inputBuffer;
-        let originalMime = 'image/png';
-
-        if (sourceUrlOrBase64.startsWith('data:')) {
-            const parts = sourceUrlOrBase64.split(',');
-            inputBuffer = Buffer.from(parts[1], 'base64');
-            originalMime = parts[0].match(/:(.*?);/)?.[1] || 'image/png';
-        } else {
-            const resp = await axios.get(sourceUrlOrBase64, { responseType: 'arraybuffer' });
-            inputBuffer = Buffer.from(resp.data);
-            originalMime = resp.headers['content-type'] || 'image/png';
-        }
-
-        const meta = await sharp(inputBuffer).metadata();
-        const ext = meta.format || 'png';
-
-        const timestamp = Date.now();
-        const rand = Math.random().toString(36).slice(2, 7);
-        const baseFilename = `${timestamp}_${rand}`;
-
-        // 1. Full resolution upload - DIRECT BUFFER (No re-encoding!)
-        const fullKey = `users/${userId}/images/full/${baseFilename}.${ext}`;
-        await uploadMediaToB2(inputBuffer, fullKey, originalMime);
-
-        // 2. Thumbnail upload - (Still re-encoded for speed)
-        const thumbKey = `users/${userId}/images/thumb/${baseFilename}.webp`;
-        const thumbBuffer = await sharp(inputBuffer)
-            .resize(300, null, { withoutEnlargement: true })
-            .webp({ quality: 80 })
-            .toBuffer();
-        await uploadMediaToB2(thumbBuffer, thumbKey, 'image/webp');
-
-        const storedWidth = metadata.width || meta.width || 1024;
-        const storedHeight = metadata.height || meta.height || 1024;
-
-        // 3. Save to Firestore
-        const galleryPayload = {
-            userId,
-            full_key: fullKey,
-            thumb_key: thumbKey,
-            prompt: metadata.prompt || '',
-            modelId: metadata.modelId || '',
-            provider: metadata.provider || '',
-            aspect_ratio: metadata.aspect_ratio || '1:1',
-            width: storedWidth,
-            height: storedHeight,
-            operation: metadata.operation || null,
-            requestId: metadata.requestId || null,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
-
-        let docRef;
-        if (requestedDocId) {
-            docRef = galleryCollection.doc(requestedDocId);
-            await docRef.set(galleryPayload);
-        } else {
-            docRef = await galleryCollection.add(galleryPayload);
-        }
-
-        return {
-            id: docRef.id,
-            fullKey,
-            thumbKey,
-            width: storedWidth,
-            height: storedHeight,
-            contentType: originalMime,
-            extension: ext,
-        };
-    } catch (err) {
-        console.error('[GalleryStore] Error:', err.message);
-        return null;
     }
+
+    console.error('[GalleryStore] Error:', lastError?.message || 'Unknown gallery persistence error');
+    throw lastError || new Error('Gallery persistence failed');
+}
+
+async function buildStoredImageResponse(image, storedImage, fallbackPrefix = 'ludusgen_image') {
+    const baseUrl = image?.url || image?.fullUrl || image?.downloadUrl || image?.image_url || image?.b64_json || null;
+    const responseImage = {
+        ...image,
+        url: baseUrl,
+        fullUrl: image?.fullUrl || baseUrl,
+        downloadUrl: image?.downloadUrl || baseUrl,
+        imageId: storedImage?.id || image?.imageId || image?.id || null,
+        width: storedImage?.width || image?.width || null,
+        height: storedImage?.height || image?.height || null,
+    };
+
+    if (!storedImage?.fullKey) {
+        return responseImage;
+    }
+
+    const filename = sanitizeImageDownloadFilename(`${fallbackPrefix}_${storedImage.id || Date.now()}.${storedImage.extension || 'png'}`);
+    const fullUrl = await getSignedUrl(b2, new GetObjectCommand({
+        Bucket: process.env.B2_BUCKET_NAME,
+        Key: storedImage.fullKey,
+    }), { expiresIn: 3600 });
+    const downloadUrl = await getSignedUrl(b2, new GetObjectCommand({
+        Bucket: process.env.B2_BUCKET_NAME,
+        Key: storedImage.fullKey,
+        ResponseContentDisposition: `attachment; filename="${filename}"`,
+    }), { expiresIn: 3600 });
+
+    return {
+        ...responseImage,
+        url: fullUrl,
+        fullUrl,
+        downloadUrl,
+        storage: 'b2',
+        fullKey: storedImage.fullKey,
+        thumbKey: storedImage.thumbKey || null,
+    };
+}
+
+async function persistGeneratedImagesForResponse({ userId, images, metadata, filenamePrefix = 'ludusgen_image' }) {
+    const warnings = [];
+    const resolvedImages = [];
+
+    for (let index = 0; index < images.length; index += 1) {
+        const image = images[index];
+        const resolvedMetadata = typeof metadata === 'function' ? metadata(image, index) : metadata;
+
+        try {
+            const storedImage = await processImageAndUpload(userId, image.url, resolvedMetadata);
+            resolvedImages.push(await buildStoredImageResponse(image, storedImage, filenamePrefix));
+        } catch (error) {
+            console.warn('[GalleryStore] Persist warning:', error.message);
+            warnings.push('A kep elkeszult, de a Gallery mentese sikertelen volt. Töltsd le most, es probald meg kesobb ujra.');
+            resolvedImages.push({
+                ...image,
+                url: image?.url || image?.fullUrl || image?.downloadUrl || null,
+                fullUrl: image?.fullUrl || image?.url || null,
+                downloadUrl: image?.downloadUrl || image?.url || image?.fullUrl || null,
+                imageId: image?.imageId || image?.id || null,
+            });
+        }
+    }
+
+    return {
+        images: resolvedImages,
+        warnings: [...new Set(warnings)],
+    };
 }
 
 async function streamB2Key(key, filename, res) {
@@ -6237,40 +6459,40 @@ router.post('/audio/download', verifyFirebaseToken, async (req, res) => {
 router.get('/trellis/model/:filename', verifyFirebaseToken, async (req, res) => {
     const key = `trellis/${req.params.filename}`;
     try { await streamB2Key(key, req.params.filename, res); }
-    catch (err) { res.status(404).json({ success: false, message: 'Fájl nem található' }); }
+    catch (err) { res.status(404).json({ success: false, message: 'File not found' }); }
 });
 
 router.get('/trellis/proxy', verifyFirebaseToken, async (req, res) => {
     let key = req.query.key;
     if (!key && req.query.url) {
         try { const u = new URL(req.query.url); key = u.pathname.replace(/^\/[^/]+\//, ''); }
-        catch { return res.status(400).json({ success: false, message: 'Érvénytelen URL' }); }
+        catch { return res.status(400).json({ success: false, message: 'Invalid URL' }); }
     }
-    if (!key) return res.status(400).json({ success: false, message: 'Hiányzó key vagy url param' });
+    if (!key) return res.status(400).json({ success: false, message: 'Missing key or url parameter' });
     const filename = key.split('/').pop();
     try { await streamB2Key(key, filename, res); }
-    catch (err) { res.status(404).json({ success: false, message: 'Fájl nem található' }); }
+    catch (err) { res.status(404).json({ success: false, message: 'File not found' }); }
 });
 
 router.delete('/trellis/history/:id', verifyFirebaseToken, async (req, res) => {
     const { id } = req.params;
     const userId = req.userId;
-    if (!id) return res.status(400).json({ success: false, message: 'Hiányzó modell ID' });
+    if (!id) return res.status(400).json({ success: false, message: 'Missing model ID' });
 
     try {
         const docRef = admin.firestore().collection('trellis_history').doc(id);
         const doc = await docRef.get();
-        if (!doc.exists) return res.status(404).json({ success: false, message: 'Modell nem található' });
+        if (!doc.exists) return res.status(404).json({ success: false, message: 'Model not found' });
         const data = doc.data();
-        if (data.userId !== userId) return res.status(403).json({ success: false, message: 'Nincs jogosultság' });
+        if (data.userId !== userId) return res.status(403).json({ success: false, message: 'Access denied' });
 
         if (data.b2_key) { await deleteFromB2(data.b2_key); }
         else if (data.model_url?.includes('/api/trellis/model/')) { await deleteFromB2(`trellis/${data.model_url.split('/').pop()}`); }
 
         await docRef.delete();
-        return res.json({ success: true, message: 'Modell sikeresen törölve', deletedId: id });
+        return res.json({ success: true, message: 'Model deleted successfully', deletedId: id });
     } catch (err) {
-        return res.status(500).json({ success: false, message: 'Szerverhiba', error: err.message });
+        return res.status(500).json({ success: false, message: 'Server error', error: err.message });
     }
 });
 
@@ -6278,7 +6500,7 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
     const userId = req.userId;
     try {
         const snapshot = await admin.firestore().collection('trellis_history').where('userId', '==', userId).get();
-        if (snapshot.empty) return res.json({ success: true, message: 'Nincs törlendő előzmény', deletedCount: 0 });
+        if (snapshot.empty) return res.json({ success: true, message: 'No history entries to delete', deletedCount: 0 });
 
         const deletePromises = [];
         for (const doc of snapshot.docs) {
@@ -6292,38 +6514,63 @@ router.delete('/trellis/history', verifyFirebaseToken, async (req, res) => {
         snapshot.docs.forEach(doc => batch.delete(doc.ref));
         await batch.commit();
 
-        return res.json({ success: true, message: `${snapshot.size} modell sikeresen törölve`, deletedCount: snapshot.size });
+        return res.json({ success: true, message: `${snapshot.size} models deleted successfully`, deletedCount: snapshot.size });
     } catch (err) {
-        return res.status(500).json({ success: false, message: 'Szerverhiba', error: err.message });
+        return res.status(500).json({ success: false, message: 'Server error', error: err.message });
     }
 });
 
 // ════════════════════════════════════════════════════
-// TRELLIS — Generálás
+// TRELLIS - Generation
 // ════════════════════════════════════════════════════
-router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
-    const { prompt, seed = 0, slat_cfg_scale = 3, ss_cfg_scale = 7.5, slat_sampling_steps = 25, ss_sampling_steps = 25, jobId } = req.body;
+router.get('/trellis/availability', verifyFirebaseToken, async (_req, res) => {
+    const availability = getTrellisAvailabilitySnapshot();
+    return res.status(availability.available ? 200 : 503).json({
+        success: true,
+        ...availability,
+    });
+});
 
-    if (!prompt || !String(prompt).trim()) return res.status(400).json({ success: false, message: 'A prompt megadása kötelező' });
-    if (String(prompt).length > 1000) return res.status(400).json({ success: false, message: 'A prompt maximum 1000 karakter lehet' });
+router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
+    const { prompt, slat_cfg_scale = 3, ss_cfg_scale = 7.5, slat_sampling_steps = 25, ss_sampling_steps = 25, jobId } = req.body;
+    const normalizedPrompt = String(prompt || '').replace(/\s+/g, ' ').trim();
+
+    if (!prompt || !String(prompt).trim()) return res.status(400).json({ success: false, message: 'Prompt is required.' });
+    if (String(prompt).length > 1000) return res.status(400).json({ success: false, message: 'Prompt must be 1000 characters or fewer.' });
+    if (normalizedPrompt.length > TRELLIS_PROMPT_MAX_LENGTH) {
+        return res.status(400).json({
+            success: false,
+            message: `Trellis prompts must be ${TRELLIS_PROMPT_MAX_LENGTH} characters or fewer including style (${normalizedPrompt.length}/${TRELLIS_PROMPT_MAX_LENGTH}).`,
+        });
+    }
+
+    const availability = getTrellisAvailabilitySnapshot();
+    if (!availability.available) {
+        return res.status(availability.code === TRELLIS_API_LIMIT_REACHED_CODE ? 429 : 503).json({
+            success: false,
+            ...availability,
+            message: availability.message || SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+        });
+    }
 
     const apiKey = process.env.NVIDIA_API_KEY;
-    if (!apiKey) return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
+    if (!apiKey) return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY is not configured.' });
 
     const payload = {
-        prompt: String(prompt).trim(),
-        seed: Math.min(2147483647, Math.max(0, Math.floor(Number(seed) || 0))),
-        slat_cfg_scale: Number(slat_cfg_scale),
-        ss_cfg_scale: Number(ss_cfg_scale),
-        slat_sampling_steps: Math.round(Number(slat_sampling_steps)),
-        ss_sampling_steps: Math.round(Number(ss_sampling_steps)),
+        prompt: normalizedPrompt,
+        seed: resolveTrellisRequestSeed(req.body),
+        slat_cfg_scale: clampNumber(slat_cfg_scale, TRELLIS_CFG_SCALE_MIN, TRELLIS_CFG_SCALE_MAX, 3),
+        ss_cfg_scale: clampNumber(ss_cfg_scale, TRELLIS_CFG_SCALE_MIN, TRELLIS_CFG_SCALE_MAX, 7.5),
+        slat_sampling_steps: clampInteger(slat_sampling_steps, TRELLIS_SAMPLING_STEPS_MIN, TRELLIS_SAMPLING_STEPS_MAX, 25),
+        ss_sampling_steps: clampInteger(ss_sampling_steps, TRELLIS_SAMPLING_STEPS_MIN, TRELLIS_SAMPLING_STEPS_MAX, 25),
     };
 
     const controller = new AbortController();
-    // Modell generálásnál 30 perc (1800s) timeout
+    // Model generation can take up to 30 minutes (1800s).
     registerJob(jobId, req.userId, controller, 1800000);
 
     try {
+        recordTrellisCall();
         const nimResp = await fetch(TRELLIS_NIM_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Connection': 'keep-alive' },
@@ -6334,18 +6581,20 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
 
         if (!nimResp.ok) {
             const errText = await nimResp.text();
-            const msg = nimResp.status === 401 ? 'Érvénytelen NVIDIA API kulcs' : nimResp.status === 429 ? 'NVIDIA rate limit' : `Trellis hiba (${nimResp.status}): ${errText.slice(0, 200)}`;
+            const msg = nimResp.status === 401 ? 'Invalid NVIDIA API key' : nimResp.status === 429 ? 'NVIDIA rate limit reached' : `Trellis error (${nimResp.status}): ${errText.slice(0, 200)}`;
             return res.status(nimResp.status).json({ success: false, message: msg });
         }
 
         const body = await nimResp.json();
-        let base64Glb = null;
-        if (Array.isArray(body.artifacts) && body.artifacts.length > 0) {
-            const art = body.artifacts[0];
-            base64Glb = art.base64 ?? art.glb ?? art.model ?? art.data ?? null;
+        const base64Glb = extractTrellisModelBase64(body);
+        if (!base64Glb) {
+            const summary = summarizeTrellisResponse(body);
+            console.error('[Trellis] NVIDIA response did not include a GLB payload', summary);
+            return res.status(502).json({
+                success: false,
+                message: 'The Trellis API response did not include a 3D model. Try a shorter prompt or another style.',
+            });
         }
-        if (!base64Glb) base64Glb = body.base64 ?? body.glb ?? body.model ?? null;
-        if (!base64Glb) return res.status(500).json({ success: false, message: 'A Trellis API nem adott vissza 3D modellt' });
 
         const filename = `trellis_${Date.now()}_${payload.seed}.glb`;
         let glbUrl, b2Key = null;
@@ -6364,13 +6613,12 @@ router.post('/trellis', verifyFirebaseToken, genLimiter, async (req, res) => {
 
     } catch (err) {
         if (err.name === 'AbortError') {
-            if (!res.headersSent) res.status(499).json({ success: false, message: 'Generálás megszakítva' });
+            if (!res.headersSent) res.status(499).json({ success: false, message: 'Generation cancelled.' });
             return;
         }
-        return res.status(500).json({ success: false, message: err.message ?? 'Hálózati hiba' });
+        return res.status(500).json({ success: false, message: err.message ?? 'Network error' });
     } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-        req.off('close', onClose);
+        unregisterJob(jobId);
     }
 });
 
@@ -6438,6 +6686,55 @@ router.get('/chat/summary/:sessionId', verifyFirebaseToken, async (req, res) => 
         return res.json({ success: true, summary: summaryDoc.data() });
     } catch (err) {
         return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+router.post('/tripo/asset-name', verifyFirebaseToken, async (req, res) => {
+    const {
+        prompt = '',
+        basePrompt = '',
+        mode = 'generate',
+        type = 'text_to_model',
+        styleId = '',
+        sourceName = '',
+        negativePrompt = '',
+        modelVersion = '',
+    } = req.body || {};
+
+    const fallbackName = buildTripoAssetNameFallback({
+        mode,
+        sourceName,
+        basePrompt,
+        prompt,
+    });
+
+    try {
+        const resp = await groqWithRetry({
+            model: 'openai/gpt-oss-120b',
+            messages: buildTripoAssetNamingMessages({
+                mode,
+                type,
+                prompt,
+                basePrompt,
+                styleId,
+                sourceName,
+                negativePrompt,
+                modelVersion,
+            }),
+            temperature: 0.35,
+            max_tokens: 140,
+            stream: false,
+        });
+
+        const rawContent = resp.data?.choices?.[0]?.message?.content?.trim() || '';
+        const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+        const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+        const name = normalizeTripoAssetName(parsed?.name || fallbackName) || fallbackName;
+        const summary = typeof parsed?.summary === 'string' ? parsed.summary.trim() : '';
+        return res.json({ success: true, name, summary });
+    } catch (err) {
+        console.warn('[TripoAssetName] fallback used:', err.message);
+        return res.json({ success: true, name: fallbackName, summary: '' });
     }
 });
 
@@ -6732,6 +7029,875 @@ router.delete('/image-gallery', verifyFirebaseToken, async (req, res) => {
     } catch (err) {
         console.error('[GalleryBulkDelete] Error:', err);
         res.status(500).json({ success: false, message: 'Csoportos törlés sikertelen' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// SEGMIND — 2D Character Animation Sprite Sheet Generator
+// POST /api/sprite-sheet
+// Architecture: submit → server-side polling (7 s intervals) → single response
+// Max wait: ~3 min (26 polls × 7 s). Express timeout extended to 4 min.
+// ════════════════════════════════════════════════════════════════════════════
+async function classifySpriteProviderWithClaude(normalizedRequest) {
+    if (!process.env.ANTHROPIC_API_KEY || process.env.SPRITE_ROUTER_CLAUDE_FALLBACK === 'false') {
+        return null;
+    }
+
+    try {
+        const response = await anthropic.messages.create({
+            model: process.env.SPRITE_ROUTER_CLAUDE_MODEL || 'claude-sonnet-4-20250514',
+            max_tokens: 120,
+            temperature: 0,
+            system: [
+                'You route 2D game sprite generation requests to exactly one provider.',
+                'Return compact JSON only: {"provider":"pixellab|godmode|segmind","confidence":0-1,"reason":"short reason"}.',
+                'PixelLab is best for pixel art, retro, 8-bit, 16-bit, sprite sheets, rotations, and pixel animations.',
+                'God Mode AI is best for modern smooth 2D animation, Spine, auto-rigging, layered exports, and retargeting.',
+                'Segmind is best for anime, cartoon, illustrated, hand-drawn, manga, and fantasy art.',
+            ].join(' '),
+            messages: [{
+                role: 'user',
+                content: JSON.stringify({
+                    prompt: normalizedRequest.prompt,
+                    style: normalizedRequest.style,
+                    options: normalizedRequest.options,
+                    hasReferenceImage: Boolean(normalizedRequest.referenceImage),
+                }),
+            }],
+        });
+
+        const raw = response.content
+            ?.map((part) => part.type === 'text' ? part.text : '')
+            .join('')
+            .trim();
+        const parsed = parseSpriteProviderChoice(raw);
+        if (!parsed) return null;
+
+        return {
+            provider: parsed.provider,
+            strategy: 'claude',
+            confidence: parsed.confidence,
+            matchedKeywords: [],
+            reason: parsed.reason,
+        };
+    } catch (error) {
+        console.warn('[SpriteRouter] Claude fallback failed:', error?.message || error);
+        return null;
+    }
+}
+
+async function resolveSpriteRoute(normalizedRequest) {
+    const keywordRoute = classifySpriteRequest({
+        prompt: normalizedRequest.prompt,
+        style: normalizedRequest.style,
+        provider: normalizedRequest.provider,
+    });
+
+    let route;
+    if (keywordRoute.strategy === 'manual' || keywordRoute.strategy === 'keyword') {
+        route = keywordRoute;
+    } else {
+        const claudeRoute = await classifySpriteProviderWithClaude(normalizedRequest);
+        route = claudeRoute || keywordRoute;
+    }
+
+    return resolveSpriteCapabilityRoute(route, normalizedRequest);
+}
+
+function makeSpriteHttpRequestId(req) {
+    return String(req.body?.requestId || req.headers['x-request-id'] || crypto.randomUUID());
+}
+
+function makeSpriteJobId() {
+    return `sprite_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+}
+
+async function prepareSpriteGenerationRequest(req, { legacyProvider = null } = {}) {
+    const body = req.body || {};
+    const rawPrompt = body.prompt ?? body.animationScene ?? '';
+    const safePrompt = sanitizeSpritePrompt(rawPrompt);
+    const normalizedRequest = normalizeSpriteGenerateRequest({
+        ...body,
+        prompt: safePrompt,
+        provider: legacyProvider || body.provider,
+    });
+    const route = await resolveSpriteRoute(normalizedRequest);
+    const operation = route.operation || getSpriteOperation(normalizedRequest);
+    if (spriteOperationRequiresReference(operation) && !normalizedRequest.referenceImage) {
+        throw Object.assign(
+            new Error(`${operation} requires a reference character image.`),
+            {
+                code: 'SPRITE_REFERENCE_REQUIRED',
+                provider: route.provider,
+            },
+        );
+    }
+    return { normalizedRequest, route };
+}
+
+async function getSpriteCachedResponse({ userId, requestId, normalizedRequest, route }) {
+    const cached = await getCachedSpriteGeneration(normalizedRequest);
+    if (!cached?.images?.length) return null;
+
+    const provider = cached.provider || route.provider;
+    await writeSpriteAuditLog(makeSpriteAuditPayload({
+        userId,
+        requestId,
+        provider,
+        prompt: normalizedRequest.prompt,
+        creditAmount: 0,
+        usdCost: 0,
+        cacheHit: true,
+        event: 'cache_hit',
+    }));
+
+    return {
+        ...cached,
+        success: true,
+        requestId,
+        cacheHit: true,
+        provider,
+        route: cached.route || route,
+        billing: {
+            creditAmount: 0,
+            usdCost: 0,
+        },
+    };
+}
+
+function getOpenSpriteCircuits() {
+    return getOpenSpriteProviders(spriteCircuitStore);
+}
+
+function getUnsupportedProvidersForRoute(route) {
+    const supported = new Set(getSpriteProvidersForOperation(route.operation || 'static_sprite'));
+    return SUPPORTED_SPRITE_PROVIDERS.filter((provider) => !supported.has(provider));
+}
+
+function getBlockedProvidersForRoute(route) {
+    return [...new Set([...getOpenSpriteCircuits(), ...getUnsupportedProvidersForRoute(route)])];
+}
+
+function estimateSpriteCreditsForRoute(route) {
+    const openProviders = getBlockedProvidersForRoute(route);
+    const fallbackChain = getSpriteFallbackChain(route.provider, { openProviders });
+    if (fallbackChain.length === 0) {
+        throw new SpriteProviderError('No sprite provider available.', {
+            status: 503,
+            provider: route.provider,
+            code: 'NO_PROVIDER_AVAILABLE',
+        });
+    }
+
+    return Math.max(
+        ...fallbackChain.map((provider) =>
+            calculateSpriteCreditCharge(normalizeProviderCostUsd({ provider })),
+        ),
+    );
+}
+
+function recordSpriteProviderFailures(failures = []) {
+    for (const failure of failures) {
+        recordSpriteProviderMetric(spriteMetricsStore, {
+            provider: failure.provider,
+            ok: false,
+            elapsedMs: failure.elapsed_ms,
+            errorCode: failure.error_code,
+        });
+    }
+}
+
+function spriteHttpStatusForError(error) {
+    if (error?.code === 'INSUFFICIENT_CREDITS') return 402;
+    if (error?.code === 'NO_PROVIDER_AVAILABLE') return 503;
+    if (error?.code === 'SPRITE_REFERENCE_REQUIRED') return 400;
+    if (error instanceof SpriteProviderError) return error.status;
+    if (/prompt is required|prompt must be|Unsupported sprite provider|safe prompt content|at most 500|<=500/.test(error?.message || '')) {
+        return 400;
+    }
+    return 500;
+}
+
+function serializeSpriteError(error, route = null) {
+    return {
+        provider: error?.provider || route?.provider || null,
+        code: error?.code || 'SPRITE_GENERATION_FAILED',
+        message: error?.message || 'Sprite generation failed',
+    };
+}
+
+async function executeSpriteGenerationForUser({
+    userId,
+    requestId,
+    normalizedRequest,
+    route,
+    startedAt = Date.now(),
+    creditReservation = null,
+} = {}) {
+    const result = await runSpriteGenerationWithFallback({
+        initialProvider: route.provider,
+        request: normalizedRequest,
+        requestId,
+        openProviders: getBlockedProvidersForRoute(route),
+        callProvider: generateSpriteWithProvider,
+        dependencies: {
+            env: process.env,
+            axiosClient: axios,
+            httpsAgent,
+        },
+        logger: (line) => console.warn(line),
+        onProviderFailure: (provider) => {
+            recordSpriteCircuitFailure(spriteCircuitStore, provider);
+        },
+        onProviderSuccess: (provider) => {
+            recordSpriteCircuitSuccess(spriteCircuitStore, provider);
+        },
+    });
+
+    const images = Array.isArray(result.images) ? result.images : [];
+    if (images.length === 0) {
+        throw new SpriteProviderError(`${result.provider} did not return a displayable image.`, {
+            status: 502,
+            provider: result.provider,
+            code: 'NO_SPRITE_IMAGES',
+            details: result.output,
+        });
+    }
+
+    const postProcessedAssets = await postProcessSpriteAssets({
+        images,
+        request: normalizedRequest,
+        result,
+        requestId,
+        route,
+        axiosClient: axios,
+        sharpLib: sharp,
+    });
+    const responseImages = postProcessedAssets.spriteSheet
+        ? [postProcessedAssets.spriteSheet, ...images]
+        : images;
+    const providerAtlas = result.output?.atlas || result.output?.atlasUrl || null;
+    const elapsedSeconds = (Date.now() - startedAt) / 1000;
+    recordSpriteProviderFailures(result.failures || []);
+    recordSpriteProviderMetric(spriteMetricsStore, {
+        provider: result.provider,
+        ok: true,
+        elapsedMs: Math.round(elapsedSeconds * 1000),
+    });
+
+    const providerCostUsd = normalizeProviderCostUsd({
+        usage: result.usage,
+        provider: result.provider,
+    });
+    const estimatedBilling = estimateSpriteGenerationCharge({
+        providerCostUsd,
+        usage: result.usage,
+        provider: result.provider,
+        reservation: creditReservation,
+    });
+
+    const responsePayload = {
+        success: true,
+        requestId,
+        cacheHit: false,
+        provider: result.provider,
+        route: {
+            ...route,
+            provider: result.provider,
+            fallbackProvidersTried: result.fallbackProvidersTried || [result.provider],
+        },
+        images: responseImages,
+        assets: {
+            images: responseImages,
+            frames: images,
+            spriteSheet: postProcessedAssets.spriteSheet,
+            spine: result.metadata?.spine || null,
+            atlas: postProcessedAssets.atlas || providerAtlas,
+            providerAtlas,
+            metadata: {
+                ...(result.metadata || {}),
+                postProcessing: {
+                    mode: postProcessedAssets.spriteSheet ? 'assembled' : 'metadata',
+                    error: postProcessedAssets.postProcessError,
+                },
+            },
+        },
+        elapsedSeconds,
+        pollCount: result.metadata?.pollCount,
+        endpoint: result.endpoint,
+        billing: {
+            creditAmount: estimatedBilling.creditAmount,
+            usdCost: estimatedBilling.usdCost,
+            reservedCreditAmount: estimatedBilling.reservedCreditAmount,
+            adjustmentCreditAmount: estimatedBilling.adjustmentCreditAmount,
+        },
+    };
+
+    const { responsePayload: finalizedPayload } = await finalizeSpriteSuccessResponse({
+        responsePayload,
+        cacheWriter: () => setCachedSpriteGeneration(normalizedRequest, responsePayload),
+        usageLogger: () => logUsage(userId, 'sprite', {
+            provider: result.provider,
+            routeStrategy: route.strategy,
+            endpoint: result.endpoint,
+            imageCount: responseImages.length,
+            elapsedSeconds,
+            usageUsd: providerCostUsd,
+            creditAmount: estimatedBilling.creditAmount,
+            requestId,
+        }),
+        chargeGeneration: () => chargeSpriteGeneration({
+            userId,
+            requestId,
+            provider: result.provider,
+            prompt: normalizedRequest.prompt,
+            providerCostUsd,
+            usage: result.usage,
+            reservation: creditReservation,
+        }),
+        logger: console,
+    });
+
+    for (const image of responseImages) {
+        processImageAndUpload(userId, image, {
+            prompt: normalizedRequest.prompt,
+            modelId: result.provider,
+            provider: result.provider,
+            aspect_ratio: '1:1',
+            width: normalizedRequest.options.imageSize.width,
+            height: normalizedRequest.options.imageSize.height,
+            operation: 'sprite',
+            requestId,
+        }).catch((uploadError) => {
+            console.warn('[SpriteRouter] Gallery upload failed:', uploadError?.message || uploadError);
+        });
+    }
+
+    return finalizedPayload;
+}
+
+async function handleSpriteGenerate(req, res, { legacyProvider = null } = {}) {
+    res.setTimeout(300_000, () => {
+        if (!res.headersSent) {
+            res.status(504).json({ success: false, message: 'Sprite generation timed out. Please try again.' });
+        }
+    });
+
+    const startedAt = Date.now();
+    const requestId = makeSpriteHttpRequestId(req);
+    let route = null;
+    let normalizedRequest = null;
+    let creditReservation = null;
+
+    try {
+        ({ normalizedRequest, route } = await prepareSpriteGenerationRequest(req, { legacyProvider }));
+
+        const cached = await getSpriteCachedResponse({
+            userId: req.userId,
+            requestId,
+            normalizedRequest,
+            route,
+        });
+        if (cached) {
+            return res.json(cached);
+        }
+
+        const maxEstimatedCredits = estimateSpriteCreditsForRoute(route);
+        creditReservation = await reserveSpriteCredits({
+            userId: req.userId,
+            requestId,
+            provider: route.provider,
+            estimatedCreditAmount: maxEstimatedCredits,
+        });
+
+        const responsePayload = await executeSpriteGenerationForUser({
+            userId: req.userId,
+            requestId,
+            normalizedRequest,
+            route,
+            startedAt,
+            creditReservation,
+        });
+
+        return res.json(responsePayload);
+    } catch (error) {
+        const elapsedMs = Date.now() - startedAt;
+        recordSpriteProviderFailures(error?.failures || []);
+        const structuredError = {
+            event: 'sprite_generation_failed',
+            request_id: requestId,
+            provider: error?.provider || route?.provider || null,
+            error_code: error?.code || 'SPRITE_GENERATION_FAILED',
+            elapsed_ms: elapsedMs,
+        };
+        console.error(JSON.stringify(structuredError));
+        await refundSpriteCreditReservation(creditReservation, error?.code || 'sprite_generation_failed');
+        return res.status(spriteHttpStatusForError(error)).json({
+            success: false,
+            requestId,
+            ...serializeSpriteError(error, route),
+        });
+    }
+}
+
+async function runSpriteJob({ jobId, userId, requestId, normalizedRequest, route, creditReservation = null }) {
+    let job = null;
+    let jobReservation = creditReservation;
+    const startedAt = Date.now();
+
+    try {
+        job = await getSpriteJobRecord({ jobId, userId });
+        if (!job) {
+            console.warn(JSON.stringify({ event: 'sprite_job_missing', job_id: jobId, request_id: requestId }));
+            return;
+        }
+        jobReservation = jobReservation || job.billingReservation || null;
+
+        job = await updateSpriteJobRecord(job, {
+            status: 'running',
+            provider: route.provider,
+        });
+
+        const cached = await getSpriteCachedResponse({
+            userId,
+            requestId,
+            normalizedRequest,
+            route,
+        });
+        if (cached) {
+            await refundSpriteCreditReservation(jobReservation, 'sprite_cache_hit_after_reservation');
+        }
+        const responsePayload = cached || await executeSpriteGenerationForUser({
+            userId,
+            requestId,
+            normalizedRequest,
+            route,
+            startedAt,
+            creditReservation: jobReservation,
+        });
+
+        await updateSpriteJobRecord(job, {
+            status: 'completed',
+            provider: responsePayload.provider,
+            response: responsePayload,
+            billing: responsePayload.billing || { creditAmount: 0, usdCost: 0 },
+        });
+    } catch (error) {
+        const elapsedMs = Date.now() - startedAt;
+        recordSpriteProviderFailures(error?.failures || []);
+        console.error(JSON.stringify({
+            event: 'sprite_job_failed',
+            job_id: jobId,
+            request_id: requestId,
+            provider: error?.provider || route?.provider || null,
+            error_code: error?.code || 'SPRITE_JOB_FAILED',
+            elapsed_ms: elapsedMs,
+        }));
+        await refundSpriteCreditReservation(jobReservation, error?.code || 'sprite_job_failed');
+
+        if (normalizedRequest?.prompt) {
+            try {
+                await writeSpriteAuditLog(makeSpriteAuditPayload({
+                    userId,
+                    requestId,
+                    provider: error?.provider || route?.provider || null,
+                    prompt: normalizedRequest.prompt,
+                    creditAmount: 0,
+                    usdCost: 0,
+                    cacheHit: false,
+                    event: 'failed',
+                    errorCode: error?.code || 'SPRITE_JOB_FAILED',
+                }));
+            } catch (auditError) {
+                console.warn('[SpriteRouter] Failed job audit log failed:', auditError?.message || auditError);
+            }
+        }
+
+        if (job) {
+            await updateSpriteJobRecord(job, {
+                status: 'failed',
+                provider: error?.provider || route?.provider || job.provider,
+                error: serializeSpriteError(error, route),
+            });
+        }
+    }
+}
+
+async function handleSpriteJobCreate(req, res) {
+    const requestId = makeSpriteHttpRequestId(req);
+    let route = null;
+    let creditReservation = null;
+
+    try {
+        const { normalizedRequest, route: resolvedRoute } = await prepareSpriteGenerationRequest(req);
+        route = resolvedRoute;
+
+        const jobId = makeSpriteJobId();
+        const cached = await getSpriteCachedResponse({
+            userId: req.userId,
+            requestId,
+            normalizedRequest,
+            route,
+        });
+        if (cached) {
+            const jobRecord = createSpriteJobRecord({
+                jobId,
+                userId: req.userId,
+                requestId,
+                request: normalizedRequest,
+                route,
+                estimatedCredits: 0,
+            });
+            const completedJob = transitionSpriteJob(jobRecord, {
+                status: 'completed',
+                provider: cached.provider,
+                response: cached,
+                billing: cached.billing,
+            });
+            await saveSpriteJobRecord(completedJob);
+            return res.json({
+                success: true,
+                jobId,
+                requestId,
+                cacheHit: true,
+                status: 'completed',
+                job: sanitizeSpriteJobForClient(completedJob),
+                response: cached,
+            });
+        }
+
+        const maxEstimatedCredits = estimateSpriteCreditsForRoute(route);
+        creditReservation = await reserveSpriteCredits({
+            userId: req.userId,
+            requestId,
+            provider: route.provider,
+            estimatedCreditAmount: maxEstimatedCredits,
+        });
+
+        const jobRecord = createSpriteJobRecord({
+            jobId,
+            userId: req.userId,
+            requestId,
+            request: normalizedRequest,
+            route,
+            estimatedCredits: maxEstimatedCredits,
+            creditReservation,
+        });
+
+        await saveSpriteJobRecord(jobRecord);
+        setTimeout(() => {
+            runSpriteJob({
+                jobId,
+                userId: req.userId,
+                requestId,
+                normalizedRequest,
+                route,
+                creditReservation,
+            }).catch((error) => {
+                console.error(JSON.stringify({
+                    event: 'sprite_job_background_crashed',
+                    job_id: jobId,
+                    request_id: requestId,
+                    error_code: error?.code || 'SPRITE_JOB_BACKGROUND_CRASHED',
+                }));
+            });
+        }, 0);
+
+        return res.status(202).json({
+            success: true,
+            jobId,
+            requestId,
+            cacheHit: false,
+            status: 'queued',
+            job: sanitizeSpriteJobForClient(jobRecord),
+        });
+    } catch (error) {
+        const structuredError = {
+            event: 'sprite_job_create_failed',
+            request_id: requestId,
+            provider: error?.provider || route?.provider || null,
+            error_code: error?.code || 'SPRITE_GENERATION_FAILED',
+        };
+        console.error(JSON.stringify(structuredError));
+        await refundSpriteCreditReservation(creditReservation, error?.code || 'sprite_job_create_failed');
+        return res.status(spriteHttpStatusForError(error)).json({
+            success: false,
+            requestId,
+            ...serializeSpriteError(error, route),
+        });
+    }
+}
+
+function getSpriteHealthSnapshot() {
+    return getProviderHealthSnapshot(spriteMetricsStore, {
+        openProviders: getOpenSpriteCircuits(),
+    });
+}
+
+router.get('/health', async (_req, res) => {
+    res.json(getSpriteHealthSnapshot());
+});
+
+router.get('/sprite/health', async (_req, res) => {
+    res.json(getSpriteHealthSnapshot());
+});
+
+router.get('/sprite/capabilities', async (_req, res) => {
+    res.json({
+        success: true,
+        ...getSpriteCapabilities(),
+    });
+});
+
+router.post('/sprite/webhook/:provider', async (req, res) => {
+    const provider = req.params.provider;
+    const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+    const signatureHeader = req.headers['x-signature'] || req.headers['x-webhook-signature'];
+    const ok = verifySpriteWebhookSignature({
+        rawBody,
+        signatureHeader,
+        secret: getSpriteWebhookSecret(provider),
+    });
+    if (!ok) return res.status(401).json({ success: false, message: 'Invalid webhook signature' });
+    console.log(JSON.stringify({ event: 'sprite_webhook_verified', provider }));
+    return res.json({ success: true });
+});
+
+router.post('/sprite/generate', verifyFirebaseToken, spriteLimiter, async (req, res) => {
+    return handleSpriteGenerate(req, res);
+});
+
+router.post('/sprite/jobs', verifyFirebaseToken, spriteLimiter, async (req, res) => {
+    return handleSpriteJobCreate(req, res);
+});
+
+router.get('/sprite/jobs/:jobId', verifyFirebaseToken, spriteLimiter, async (req, res) => {
+    const job = await getSpriteJobRecord({
+        jobId: req.params.jobId,
+        userId: req.userId,
+    });
+    if (!job) return res.status(404).json({ success: false, message: 'Sprite job not found' });
+    return res.json({
+        success: true,
+        job: sanitizeSpriteJobForClient(job),
+    });
+});
+
+const SEGMIND_WORKFLOW_URL = 'https://api.segmind.com/workflows/6836c47e3d5f6408be00bd26-v7';
+const SEGMIND_POLL_MS = 7000;
+const SEGMIND_MAX_POLLS = 26; // 26 × 7 s ≈ 3 min
+const SEGMIND_TRANSIENT_RETRY = 3; // retries per poll request on network errors
+
+/**
+ * Parse all image URLs / base64 strings out of an arbitrary Segmind output value.
+ * Returns an array so the frontend can display multiple frames when present.
+ */
+function extractSegmindImages(value, depth = 0) {
+    if (!value || depth > 6) return [];
+    if (typeof value === 'string') {
+        if (value.startsWith('http') || value.startsWith('data:image')) return [value];
+        // Base64 without the data: prefix
+        if (/^[A-Za-z0-9+/]{100,}={0,2}$/.test(value)) return [`data:image/png;base64,${value}`];
+        return [];
+    }
+    if (Array.isArray(value)) {
+        return value.flatMap(v => extractSegmindImages(v, depth + 1));
+    }
+    if (typeof value === 'object') {
+        // Priority keys first
+        const PRIO_KEYS = ['url', 'image_url', 'image', 'src', 'output', 'result', 'data', 'file'];
+        const seen = new Set();
+        const images = [];
+        for (const k of PRIO_KEYS) {
+            if (value[k] != null) {
+                const found = extractSegmindImages(value[k], depth + 1);
+                found.forEach(u => { if (!seen.has(u)) { seen.add(u); images.push(u); } });
+            }
+        }
+        // Fallback: all other keys
+        for (const [k, v] of Object.entries(value)) {
+            if (PRIO_KEYS.includes(k)) continue;
+            const found = extractSegmindImages(v, depth + 1);
+            found.forEach(u => { if (!seen.has(u)) { seen.add(u); images.push(u); } });
+        }
+        return images;
+    }
+    return [];
+}
+
+router.post('/sprite-sheet', verifyFirebaseToken, genLimiter, async (req, res) => {
+    req.body = {
+        ...req.body,
+        prompt: req.body?.prompt ?? req.body?.animationScene,
+        referenceImage: req.body?.referenceImage ?? req.body?.characterImage,
+        provider: 'segmind',
+        options: {
+            output: 'sprite_sheet',
+            ...(req.body?.options || {}),
+        },
+    };
+    if (req.body) {
+        return handleSpriteGenerate(req, res, { legacyProvider: 'segmind' });
+    }
+
+    // Extend Express socket timeout to 4 minutes (default is 2 min)
+    res.setTimeout(240_000, () => {
+        if (!res.headersSent) {
+            res.status(504).json({ success: false, message: 'Generation timed out. Please try again.' });
+        }
+    });
+
+    const { animationScene, characterImage } = req.body;
+    if (!animationScene || typeof animationScene !== 'string' || !animationScene.trim()) {
+        return res.status(400).json({ success: false, message: 'animationScene is required' });
+    }
+    if (animationScene.trim().length > 500) {
+        return res.status(400).json({ success: false, message: 'animationScene must be ≤500 characters' });
+    }
+
+    const apiKey = process.env.SEGMIND_API_KEY;
+    if (!apiKey || apiKey === 'YOUR_SEGMIND_API_KEY_HERE') {
+        console.error('[SpriteSheet] SEGMIND_API_KEY is not configured');
+        return res.status(503).json({ success: false, message: 'Sprite sheet generation is not configured on this server.' });
+    }
+
+    const scene = animationScene.trim();
+    console.log(`[SpriteSheet] Starting — scene: "${scene.slice(0, 80)}"`);
+    const startMs = Date.now();
+
+    try {
+        // ── Step 1: Submit job ──────────────────────────────────────────────
+        let submitResp;
+        try {
+            const payload = { Animation_Scene: scene };
+            if (characterImage) {
+                // Strip the "data:image/png;base64," prefix for Segmind
+                const base64Data = characterImage.includes('base64,')
+                    ? characterImage.split('base64,')[1]
+                    : characterImage;
+
+                // To maximize compatibility with unknown Segmind workflows, we send the image under likely input names.
+                // We only send it once to prevent Payload Too Large (502) errors.
+                payload.image = base64Data;
+            }
+
+            submitResp = await axios.post(
+                SEGMIND_WORKFLOW_URL,
+                payload,
+                {
+                    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+                    timeout: 30000,
+                    httpsAgent,
+                }
+            );
+        } catch (submitErr) {
+            const { status, message } = await getAxiosErrorDetails(submitErr);
+            if (status === 401 || status === 403) {
+                return res.status(502).json({ success: false, message: 'Invalid Segmind API key.' });
+            }
+            if (status === 429) {
+                return res.status(429).json({ success: false, message: 'Segmind rate limit reached. Please try again in a moment.' });
+            }
+            if (status === 402) {
+                return res.status(402).json({ success: false, message: 'Insufficient Segmind credits. Please top up at segmind.com.' });
+            }
+            return res.status(status || 502).json({ success: false, message: message || 'Failed to submit job to Segmind.' });
+        }
+
+        const { poll_url, id: jobId } = submitResp.data;
+        if (!poll_url) {
+            console.error('[SpriteSheet] No poll_url in submit response:', JSON.stringify(submitResp.data).slice(0, 300));
+            return res.status(502).json({ success: false, message: 'Segmind did not return a poll URL.' });
+        }
+        console.log(`[SpriteSheet] Job queued — id=${jobId || 'n/a'}, poll_url=${poll_url}`);
+
+        // ── Step 2: Poll until complete ─────────────────────────────────────
+        let polls = 0;
+        let consecutiveErrors = 0;
+
+        while (polls < SEGMIND_MAX_POLLS) {
+            await sleep(SEGMIND_POLL_MS);
+
+            // Bail early if client disconnected
+            if (res.destroyed || res.headersSent) {
+                console.log('[SpriteSheet] Client disconnected — aborting poll loop');
+                return;
+            }
+
+            polls++;
+            let pollData = null;
+
+            // Retry transient network errors on each poll attempt
+            for (let attempt = 1; attempt <= SEGMIND_TRANSIENT_RETRY; attempt++) {
+                try {
+                    const pollResp = await axios.get(poll_url, {
+                        headers: { Authorization: `Bearer ${apiKey}` },
+                        timeout: 15000,
+                        httpsAgent,
+                    });
+                    pollData = pollResp.data;
+                    consecutiveErrors = 0;
+                    break;
+                } catch (pollErr) {
+                    const { status } = await getAxiosErrorDetails(pollErr);
+                    if (status === 429 && attempt < SEGMIND_TRANSIENT_RETRY) {
+                        await sleep(3000 * attempt); // back-off
+                        continue;
+                    }
+                    if (attempt === SEGMIND_TRANSIENT_RETRY) {
+                        consecutiveErrors++;
+                        console.warn(`[SpriteSheet] Poll #${polls} failed (${consecutiveErrors} consecutive):`, pollErr.message);
+                        if (consecutiveErrors >= 4) {
+                            return res.status(502).json({ success: false, message: 'Lost connection to Segmind while polling. Please try again.' });
+                        }
+                        break; // skip this poll cycle, try next
+                    }
+                }
+            }
+
+            if (!pollData) continue; // transient failure — keep going
+
+            const { status, output, error } = pollData;
+            const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
+            console.log(`[SpriteSheet] Poll #${polls} (${elapsed}s): status=${status}`);
+
+            if (status === 'COMPLETED') {
+                // Parse output (may be a JSON string)
+                let parsed = output;
+                if (typeof parsed === 'string') {
+                    try { parsed = JSON.parse(parsed); } catch { /* keep as-is */ }
+                }
+
+                const images = extractSegmindImages(parsed);
+                console.log(`[SpriteSheet] Complete in ${elapsed}s — ${images.length} image(s) found. Output keys: ${typeof parsed === 'object' && parsed ? Object.keys(parsed).join(', ') : typeof parsed}`);
+
+                return res.json({
+                    success: true,
+                    images,                     // array of URLs — frontend uses [0] as primary
+                    output: parsed,             // raw parsed output for debugging
+                    elapsedSeconds: parseFloat(elapsed),
+                    pollCount: polls,
+                });
+            }
+
+            if (status === 'FAILED' || status === 'CANCELLED') {
+                const errMsg = error || `Generation ${status.toLowerCase()}`;
+                console.error(`[SpriteSheet] ${status} after ${elapsed}s:`, errMsg);
+                return res.status(500).json({ success: false, message: errMsg });
+            }
+
+            // QUEUED / PROCESSING / IN_PROGRESS — keep polling
+        }
+
+        // Hard timeout
+        const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
+        console.error(`[SpriteSheet] Timeout after ${elapsed}s (${polls} polls)`);
+        return res.status(504).json({ success: false, message: `Generation timed out after ${elapsed}s. Please try again.` });
+
+    } catch (err) {
+        const { status, message } = await getAxiosErrorDetails(err);
+        console.error('[SpriteSheet] Unexpected error:', status, message);
+        return res.status(status || 500).json({ success: false, message: message || 'Sprite sheet generation error' });
     }
 });
 

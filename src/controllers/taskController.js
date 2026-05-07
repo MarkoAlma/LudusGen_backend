@@ -5,7 +5,13 @@ import { storageService } from "../services/storageService.js";
 import { enqueueTripoTask, enqueueBatch } from "../workers/queues.js";
 import { estimateCost } from "../lib/creditEstimator.js";
 import { resolveEnginePreset } from "../lib/enginePresets.js";
-import { deductCredits, refundCredits, linkTaskIdToTransaction, hasBeenCharged } from "../services/creditService.js";
+import { refundCredits, hasBeenCharged, findDebitTransactionForTask } from "../services/creditService.js";
+import {
+  reserveCreditsForTask,
+  refundCreditReservation,
+  linkReservationToTask,
+  getCreateFailureRefundReason,
+} from "../services/tripoBillingService.js";
 import { registerTask as registerForRecovery, unregisterTask, getRegisteredTaskMeta } from "../services/taskRecoveryService.js";
 import {
   MARKETPLACE_COLLECTIONS,
@@ -18,6 +24,13 @@ import admin from "firebase-admin";
 import { createHash } from "node:crypto";
 import { registerJob, unregisterJob } from "../lib/jobRegistry.js";
 import { getTaskLookupHttpStatus, isMissingTripoTaskError } from "../lib/tripoTaskErrors.js";
+import { normalizeTripoTaskStatus } from "../utils/tripoTaskStatus.js";
+import {
+  SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+  TRIPO_API_NO_BALANCE_CODE,
+  TRIPO_API_UNAVAILABLE_CODE,
+  buildTripoAvailability,
+} from "../services/serviceAvailabilityService.js";
 
 const USE_QUEUE = process.env.USE_QUEUE === "true";
 const DEBUG_TRIPO = process.env.DEBUG_TRIPO === "true";
@@ -74,6 +87,54 @@ function errorPayload(err, message = err.message) {
     ...(err.code && { tripoCode: err.code }),
     ...(err.suggestion && { tripoSuggestion: err.suggestion }),
   };
+}
+
+function handleBillingErrorResponse(res, err) {
+  if (err?.code === TRIPO_API_NO_BALANCE_CODE) {
+    return res.status(402).json({
+      success: false,
+      service: "tripo",
+      available: false,
+      message: err.message,
+      code: err.code,
+      availableCredits: err.available,
+      requiredCredits: err.required,
+    });
+  }
+
+  if (err?.code === TRIPO_API_UNAVAILABLE_CODE) {
+    return res.status(503).json({
+      success: false,
+      service: "tripo",
+      available: false,
+      message: SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+      code: err.code,
+    });
+  }
+
+  if (err?.code === "INSUFFICIENT_CREDITS" || err?.code === "INSUFFICIENT_TRIPO_CREDITS") {
+    return res.status(402).json({
+      success: false,
+      message: `Insufficient credits: ${err.available} available, ${err.required} required. Please top up your balance.`,
+      code: "INSUFFICIENT_CREDITS",
+    });
+  }
+
+  console.error("[TaskController] Billing reservation error:", err?.message || err);
+  return res.status(500).json({
+    success: false,
+    message: "Credit reservation failed. Please try again.",
+    code: "BILLING_RESERVATION_FAILED",
+  });
+}
+
+async function refundUncreatedDirectBatchReservations(batchReservations, reason) {
+  const refunds = [];
+  for (const reservation of batchReservations || []) {
+    if (reservation?.taskId) continue;
+    refunds.push(refundCreditReservation(reservation, reason));
+  }
+  return Promise.allSettled(refunds);
 }
 
 function omitUndefined(obj) {
@@ -154,7 +215,7 @@ function toMillis(value) {
 
 function getHistoryExpiryMillis(data) {
   if (!data || typeof data !== "object") return null;
-  if (data.marketplaceLocked === true || data.marketplaceAssetId) return null;
+  if (isMarketplaceProtectedHistoryData(data)) return null;
   const explicitExpiry = toMillis(data.expiresAt);
   if (explicitExpiry != null) return explicitExpiry;
 
@@ -165,6 +226,28 @@ function getHistoryExpiryMillis(data) {
   if (ts != null) return ts + HISTORY_TTL_MS;
 
   return null;
+}
+
+function isMarketplaceProtectedHistoryData(data) {
+  if (!data || typeof data !== "object") return false;
+  return Boolean(
+    data.marketplaceLocked === true ||
+      data.marketplaceAssetId ||
+      data.mode === "marketplace" ||
+      data.params?.mode === "marketplace" ||
+      data.params?.type === "marketplace_asset" ||
+      data.params?.downloadOnly === true,
+  );
+}
+
+function shouldPreserveMarketplaceHistoryDoc(reason) {
+  const value = String(reason || "");
+  return (
+    value === "expired_ttl" ||
+    value === "dead_model" ||
+    value === "model_proxy_source_missing" ||
+    value.startsWith("model_proxy_")
+  );
 }
 
 async function userOwnsTask(taskId, uid) {
@@ -219,6 +302,9 @@ async function writePendingHistoryTask({
     originalModelTaskId: body.original_model_task_id ?? body.original_model_id,
     originalTaskId: body.original_task_id,
     draftModelTaskId: body.draft_model_task_id,
+    model_seed: body.model_seed,
+    image_seed: body.image_seed,
+    texture_seed: body.texture_seed,
     preprocessTaskId: body.preprocessTaskId,
     preprocessTaskType: body.preprocessTaskType,
     generate_parts: body.generate_parts === true ? true : undefined,
@@ -242,11 +328,102 @@ async function writePendingHistoryTask({
   }
 }
 
+async function syncSuccessfulHistoryTaskFromStatus({
+  taskId,
+  userId,
+  result,
+  taskMeta,
+}) {
+  if (!taskId || !userId) return;
+  if (normalizeTripoTaskStatus(result?.status) !== "success") return;
+
+  const modelUrl =
+    result?.modelUrl ||
+    result?.model_url ||
+    result?.rawOutput?.model_url ||
+    null;
+  if (!modelUrl) return;
+
+  const db = admin.firestore();
+  const existing = await db.collection(HISTORY_COLLECTION)
+    .where("taskId", "==", taskId)
+    .where("userId", "==", userId)
+    .limit(1)
+    .get();
+  const existingDoc = existing.docs[0] ?? null;
+  const existingData = existingDoc?.data() ?? null;
+
+  if (existingData?.status === "succeeded" && existingData?.model_url === modelUrl) {
+    return;
+  }
+
+  const taskType =
+    taskMeta?.type ||
+    existingData?.params?.type ||
+    result?.type ||
+    result?.taskType ||
+    "unknown";
+  const mode = existingData?.mode || TASK_TYPE_TO_MODE[taskType] || "generate";
+  const now = Date.now();
+  const previewImageUrls = Array.isArray(result?.previewImageUrls)
+    ? result.previewImageUrls.filter(Boolean)
+    : (Array.isArray(existingData?.params?.preview_image_urls)
+      ? existingData.params.preview_image_urls
+      : []);
+  const previewImageUrl =
+    result?.previewImageUrl ||
+    previewImageUrls[0] ||
+    existingData?.params?.preview_image_url ||
+    null;
+
+  const targetRef = existingDoc?.ref ?? db.collection(HISTORY_COLLECTION).doc(`tripo_${taskId}`);
+  const historyPatch = omitUndefined({
+    userId,
+    prompt: existingData?.prompt ?? taskMeta?.prompt ?? result?.prompt ?? taskType,
+    name: existingData?.name ?? taskMeta?.prompt ?? result?.prompt ?? undefined,
+    status: "succeeded",
+    model_url: modelUrl,
+    source: existingData?.source ?? (taskType === "import_model" ? "upload" : "tripo"),
+    mode,
+    taskId,
+    params: omitUndefined({
+      ...(existingData?.params ?? {}),
+      model_version: taskMeta?.modelVersion ?? existingData?.params?.model_version ?? null,
+      mode,
+      type: taskType,
+      texture: taskMeta?.texture === true || existingData?.params?.texture === true,
+      pbr: taskMeta?.pbr === true || existingData?.params?.pbr === true,
+      chosen_source: result?.chosenSource ?? existingData?.params?.chosen_source ?? null,
+      consumed_credit: result?.consumedCredit ?? existingData?.params?.consumed_credit ?? null,
+      preview_image_url: previewImageUrl,
+      preview_image_urls: previewImageUrls,
+      originalTaskId: result?.originalTaskId ?? existingData?.params?.originalTaskId ?? null,
+      rig_type: result?.rigType ?? existingData?.params?.rig_type ?? null,
+      topology: result?.topology ?? existingData?.params?.topology ?? null,
+    }),
+    ts: now,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: now + HISTORY_TTL_MS,
+  });
+  if (!existingData?.createdAt) {
+    historyPatch.createdAt = admin.firestore.FieldValue.serverTimestamp();
+  }
+
+  await targetRef.set(historyPatch, { merge: true });
+}
+
 async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
   const cleanDocs = uniqueDocs(docs);
-  if (cleanDocs.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0 };
+  if (cleanDocs.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0, preserved: 0 };
 
-  const b2Keys = [...new Set(cleanDocs.map(doc => doc.data()?.b2_key).filter(Boolean))];
+  const storageDocs = cleanDocs.filter((doc) => !isMarketplaceProtectedHistoryData(doc.data()));
+  const preserveProtectedDocs = shouldPreserveMarketplaceHistoryDoc(reason);
+  const deletableDocs = cleanDocs.filter(
+    (doc) => !(preserveProtectedDocs && isMarketplaceProtectedHistoryData(doc.data())),
+  );
+  const preserved = cleanDocs.length - deletableDocs.length;
+
+  const b2Keys = [...new Set(storageDocs.map(doc => doc.data()?.b2_key).filter(Boolean))];
   let b2Deleted = 0;
   let b2Failed = 0;
   for (const key of b2Keys) {
@@ -257,15 +434,16 @@ async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
 
   let deleted = 0;
   const db = admin.firestore();
-  for (let i = 0; i < cleanDocs.length; i += 500) {
+  for (let i = 0; i < deletableDocs.length; i += 500) {
     const batch = db.batch();
-    const slice = cleanDocs.slice(i, i + 500);
+    const slice = deletableDocs.slice(i, i + 500);
     slice.forEach(doc => batch.delete(doc.ref));
     await batch.commit();
     deleted += slice.length;
   }
 
-  return { deleted, b2Deleted, b2Failed };
+  console.log(`[HistoryController] cleanup reason=${reason} docs=${deleted} preserved=${preserved} b2Deleted=${b2Deleted} b2Failed=${b2Failed}`);
+  return { deleted, b2Deleted, b2Failed, preserved };
 }
 
 async function deleteHistoryForDeadModel({ taskId, modelUrl, uid = null, reason = "dead_model" }) {
@@ -358,6 +536,64 @@ async function getAuthorizedHistoryForModelProxy(taskId, uid, modelUrl = null) {
   return authorizeHistoryDocForModelProxy(taskDoc, uid);
 }
 
+function collectHistoryPreviewImageUrls(historyData = {}) {
+  const params = historyData.params ?? {};
+  return [...new Set([
+    ...(Array.isArray(historyData.previewImageUrls) ? historyData.previewImageUrls : []),
+    ...(Array.isArray(historyData.preview_image_urls) ? historyData.preview_image_urls : []),
+    ...(historyData.previewImageUrl ? [historyData.previewImageUrl] : []),
+    ...(historyData.preview_image_url ? [historyData.preview_image_url] : []),
+    ...(Array.isArray(params.previewImageUrls) ? params.previewImageUrls : []),
+    ...(Array.isArray(params.preview_image_urls) ? params.preview_image_urls : []),
+    ...(params.previewImageUrl ? [params.previewImageUrl] : []),
+    ...(params.preview_image_url ? [params.preview_image_url] : []),
+  ].filter(Boolean))];
+}
+
+async function buildArchivedTaskFallback(taskId, uid) {
+  const authorizedHistory = await getAuthorizedHistoryForModelProxy(taskId, uid);
+  if (!authorizedHistory) return null;
+
+  const historyData = authorizedHistory.data ?? {};
+  const params = historyData.params ?? {};
+  const previewImageUrls = collectHistoryPreviewImageUrls(historyData);
+
+  let modelUrl = historyData.model_url ?? null;
+  if (historyData.b2_key) {
+    try {
+      const signedUrl = await storageService.getSignedUrl(historyData.b2_key);
+      if (signedUrl) modelUrl = signedUrl;
+    } catch (err) {
+      console.warn(`[TaskController] archived task fallback B2 URL failed for ${taskId}:`, err.message);
+    }
+  }
+
+  const normalizedStatus = historyData.status === "succeeded" ? "success" : (historyData.status ?? "success");
+  return {
+    success: true,
+    status: normalizedStatus,
+    progress: normalizedStatus === "success" ? 100 : 0,
+    modelUrl,
+    tripoTraceId: null,
+    chosenSource: params.chosen_source ?? "history",
+    rigCheckResult: params.is_animatable ?? null,
+    rigType: params.rig_type ?? params.topology ?? null,
+    topology: params.topology ?? null,
+    previewImageUrl: previewImageUrls[0] ?? null,
+    previewImageUrls,
+    consumedCredit: params.consumed_credit ?? null,
+    originalTaskId: params.originalTaskId ?? params.originalModelTaskId ?? params.draftModelTaskId ?? null,
+    rawOutput: {
+      model_url: modelUrl,
+      preview_image_url: previewImageUrls[0] ?? null,
+      preview_image_urls: previewImageUrls,
+    },
+    errorMessage: null,
+    errorCode: null,
+    archivedHistoryFallback: true,
+  };
+}
+
 /* ─── Task: create (unified) ──────────────────────────────────────────── */
 export async function createTask(req, res) {
   const { type, callback_url, idempotency_key, ...rest } = req.body;
@@ -365,8 +601,8 @@ export async function createTask(req, res) {
   const jobId = req.body.jobId;
   const controller = new AbortController();
   let estimatedCost = 0;
-  let creditsDeducted = false;
-  let tempTxId = null;
+  let creditReservation = null;
+  let batchReservations = [];
   let tripoTaskCreated = false;
 
   try {
@@ -507,34 +743,16 @@ export async function createTask(req, res) {
     const estimateResult = estimateCost(body);
     estimatedCost = estimateResult.total;
 
-    if (estimatedCost > 0 && userId) {
-      tempTxId = `pending_${type}_${Date.now()}`;
+    const isDirectImageBatch = !USE_QUEUE && body.type === "image_to_model" && Array.isArray(body.batch_images) && body.batch_images.length > 1;
+    if (!isDirectImageBatch) {
       try {
-        const tripoBalance = await getTripoClient().getBalance();
-        const availableTripo = tripoBalance.balance ?? 0;
-        if (availableTripo < estimatedCost) {
-          return res.status(402).json({
-            success: false,
-            message: `Insufficient credits: ${availableTripo} available, ${estimatedCost} required. Please top up your balance.`,
-            code: "INSUFFICIENT_CREDITS",
-          });
-        }
-      } catch (balanceErr) {
-        console.error(`[TaskController] Tripo balance check error:`, balanceErr.message);
-      }
-
-      try {
-        await deductCredits(userId, estimatedCost, tempTxId, type);
-        creditsDeducted = true;
+        creditReservation = await reserveCreditsForTask({
+          userId,
+          amount: estimatedCost,
+          taskType: type,
+        });
       } catch (creditErr) {
-        if (creditErr.code === "INSUFFICIENT_CREDITS") {
-          return res.status(402).json({
-            success: false,
-            message: `Insufficient credits: ${creditErr.available} available, ${creditErr.required} required. Please top up your balance.`,
-            code: "INSUFFICIENT_CREDITS",
-          });
-        }
-        console.error(`[TaskController] Credit deduction error:`, creditErr.message);
+        return handleBillingErrorResponse(res, creditErr);
       }
     }
 
@@ -605,10 +823,7 @@ export async function createTask(req, res) {
               hasTexture,
             });
             if (histType === "refine_model") {
-              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
-                await refundCredits(userId, estimatedCost, tempTxId, "already_refined_source");
-                creditsDeducted = false;
-              }
+              await refundCreditReservation(creditReservation, "already_refined_source");
               return res.status(400).json({
                 success: false,
                 message: "A már refine-olt modelleket nem lehet újra refine-olni.",
@@ -635,10 +850,7 @@ export async function createTask(req, res) {
               if (!upstreamSnap.empty) effectiveParentData = upstreamSnap.docs[0].data();
             }
             if (histType && !REFINE_DIRECT_SOURCE_TYPES.has(histType) && !upstreamTaskId) {
-              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
-                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_source");
-                creditsDeducted = false;
-              }
+              await refundCreditReservation(creditReservation, "unsupported_refine_source");
               return res.status(400).json({
                 success: false,
                 message: `Ez a modell nem finomítható. A refine_model csak alap generálásból származó modellre alkalmazható. Forrástípus: ${histType}`,
@@ -647,10 +859,7 @@ export async function createTask(req, res) {
             }
             const sourceVersion = getHistoryModelVersion(effectiveParentData);
             if (!isRefineModelVersionSupported(sourceVersion)) {
-              if (userId && estimatedCost > 0 && tempTxId && creditsDeducted) {
-                await refundCredits(userId, estimatedCost, tempTxId, "unsupported_refine_model_version");
-                creditsDeducted = false;
-              }
+              await refundCreditReservation(creditReservation, "unsupported_refine_model_version");
               return res.status(400).json({
                 success: false,
                 message: `Refine csak Tripo v1.4 draft modellel működik. Ez a modell: ${sourceVersion}`,
@@ -719,23 +928,30 @@ export async function createTask(req, res) {
       if (body.batch_images && body.batch_images.length > 1) {
         const { batch_images, ...common } = body;
         const taskIds = [];
+        const directBatchPlans = [];
         for (const token of batch_images) {
           const subBody = {
             ...common,
             file: typeof token === "string" ? { type: "jpg", file_token: token } : token,
           };
+          const subEstimate = estimateCost(subBody);
+          const subReservation = await reserveCreditsForTask({
+            userId,
+            amount: subEstimate.total,
+            taskType: subBody.type,
+          });
+          batchReservations.push(subReservation);
+          directBatchPlans.push({ subBody, subReservation });
+        }
+        for (const plan of directBatchPlans) {
+          const { subBody, subReservation } = plan;
           const taskId = await taskService.create(subBody, {
             callbackUrl: callback_url,
             idempotencyKey: uuid(),
             signal: controller.signal,
           });
           tripoTaskCreated = true;
-          
-          if (userId && tempTxId) {
-            linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
-              console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
-            );
-          }
+          await linkReservationToTask(subReservation, taskId);
           if (userId) {
             await writePendingHistoryTask({
               taskId,
@@ -759,12 +975,7 @@ export async function createTask(req, res) {
         });
         tripoTaskCreated = true;
 
-        // Link real taskId to credit transaction for refunds
-        if (userId && tempTxId) {
-          linkTaskIdToTransaction(userId, tempTxId, taskId).catch(e =>
-            console.error(`[TaskController] Failed to link taskId ${taskId}:`, e.message)
-          );
-        }
+        await linkReservationToTask(creditReservation, taskId);
 
         // Register for background recovery with inherited prompt
         if (userId) {
@@ -791,24 +1002,34 @@ export async function createTask(req, res) {
       type,
       userId,
       estimatedCost,
-      creditsDeducted,
+      creditsDeducted: Boolean(creditReservation?.creditsDeducted || batchReservations.some((reservation) => reservation?.creditsDeducted)),
       requestBody: req.body,
       error: err.message,
     });
 
     const refundDeductedCredits = async (reason) => {
-      if (!userId || estimatedCost <= 0 || !creditsDeducted || !tempTxId || tripoTaskCreated) return;
       try {
-        await refundCredits(userId, estimatedCost, tempTxId, reason);
-        creditsDeducted = false;
+        if (batchReservations.length > 0) {
+          await refundUncreatedDirectBatchReservations(batchReservations, reason);
+          return;
+        }
+        if (!tripoTaskCreated) {
+          await refundCreditReservation(creditReservation, reason);
+        }
       } catch (refundErr) {
         console.error(`[TaskController] Refund error (${reason}):`, refundErr.message);
       }
     };
 
+    if (err?.code === TRIPO_API_NO_BALANCE_CODE || err?.code === TRIPO_API_UNAVAILABLE_CODE) {
+      await refundDeductedCredits("tripo_api_unavailable");
+      return handleBillingErrorResponse(res, err);
+    }
+
     // Tripo 403 = insufficient credit → refund the locally deducted amount
     if (err.message?.includes("403") && err.message?.includes("credit")) {
-      if (userId && estimatedCost > 0 && creditsDeducted) {
+      if (userId && estimatedCost > 0) {
+        console.log(`[TaskController] Tripo returned 403 credit error — refunding ${estimatedCost} credits to user ${userId}`);
         await refundDeductedCredits("tripo_403_insufficient_credit");
       }
     }
@@ -816,7 +1037,7 @@ export async function createTask(req, res) {
     // Tripo 1004 on refine_model = model has no draft output (was generated with texture, or wrong task type)
     let userMessage = err.message;
     if (type === "refine_model" && err.message?.includes("1004")) {
-      if (userId && estimatedCost > 0 && creditsDeducted) {
+      if (userId && estimatedCost > 0) {
         await refundDeductedCredits("refine_no_draft_output");
       }
       userMessage = "Ez a modell nem finomítható. A Refine csak textúra nélkül generált (draft) modelleknél működik. Generálj új modellt textúra nélkül, majd alkalmazd rá a Refine-t.";
@@ -830,7 +1051,7 @@ export async function createTask(req, res) {
       userMessage = "A Tripo nem fogadta el a texture pass parametereit. Ellenorizd a texture targetet es a referencia kepet, majd probald ujra.";
     }
 
-    await refundDeductedCredits(type === "texture_model" ? "texture_model_create_failed" : "tripo_create_failed");
+    await refundDeductedCredits(getCreateFailureRefundReason(type, err));
 
     res.status(400).json(errorPayload(err, userMessage));
   } finally {
@@ -844,16 +1065,19 @@ export async function getTask(req, res) {
     if (!await requireTaskAccess(req, res)) return;
     const taskMeta = getRegisteredTaskMeta(req.params.taskId);
     const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
+    const preferRetopoOutput = ["convert_model", "smart_low_poly"].includes(taskMeta?.type);
     const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
     logDebug("[TaskController][getTask-debug] request:", {
       taskId: req.params.taskId,
       taskMeta,
       preferTexturedOutput,
+      preferRetopoOutput,
       preferDraftOutput,
     });
     const result = await taskService.get(req.params.taskId, {
       preferBaseModel: preferDraftOutput,
       preferPbrModel: preferTexturedOutput,
+      preferRetopoModel: preferRetopoOutput,
     });
     logDebug("[TaskController][getTask-debug] result:", {
       taskId: req.params.taskId,
@@ -867,10 +1091,28 @@ export async function getTask(req, res) {
     });
     // FIX: result.success-t kivesszük, hogy ne írja felül a success: true-t
     const { success: _ignored, ...taskData } = result;
+    try {
+      await syncSuccessfulHistoryTaskFromStatus({
+        taskId: req.params.taskId,
+        userId: req.user?.uid,
+        result,
+        taskMeta,
+      });
+    } catch (syncErr) {
+      console.warn(`[TaskController] successful task history sync failed for ${req.params.taskId}:`, syncErr.message);
+    }
     res.json({ success: true, ...taskData });
   } catch (err) {
     console.error("[TaskController] getTask error:", err.message);
     const status = getTaskLookupHttpStatus(err);
+    if (status === 410) {
+      const archivedFallback = await buildArchivedTaskFallback(req.params.taskId, req.user?.uid ?? null);
+      if (archivedFallback) {
+        console.log(`[TaskController] getTask served archived history fallback for ${req.params.taskId}`);
+        res.json(archivedFallback);
+        return;
+      }
+    }
     res.status(status).json(
       errorPayload(err, status === 410 ? "Task expired or deleted from source" : err.message),
     );
@@ -907,10 +1149,12 @@ export async function streamTask(req, res) {
     while (!closed) {
       const taskMeta = getRegisteredTaskMeta(taskId);
       const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
+      const preferRetopoOutput = ["convert_model", "smart_low_poly"].includes(taskMeta?.type);
       const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
       const result = await taskService.get(taskId, {
         preferBaseModel: preferDraftOutput,
         preferPbrModel: preferTexturedOutput,
+        preferRetopoModel: preferRetopoOutput,
       });
       const { success: _ignored, ...taskData } = result;
       send("status", { success: true, ...taskData, ts: Date.now() });
@@ -942,7 +1186,39 @@ export async function streamTask(req, res) {
 export async function cancelTask(req, res) {
   try {
     if (!await requireTaskAccess(req, res)) return;
-    const result = await taskService.cancel(req.params.taskId);
+
+    const { taskId } = req.params;
+    const userId = req.user?.uid;
+
+    // Fetch current task status BEFORE cancelling.
+    // Refund only if the task is still "queued" — Tripo hasn't started
+    // processing it yet so their side hasn't debited their credits either.
+    let statusBeforeCancel = null;
+    try {
+      const currentTask = await getTripoClient().getTask(taskId);
+      statusBeforeCancel = normalizeTripoTaskStatus(currentTask?.status ?? "");
+    } catch (fetchErr) {
+      console.warn(`[TaskController] cancelTask: could not fetch status for ${taskId}:`, fetchErr.message);
+      // Status unknown — proceed with cancel but skip refund to be safe.
+    }
+
+    const result = await taskService.cancel(taskId);
+
+    if (statusBeforeCancel === "queued" && userId) {
+      // Task was still queued — Tripo hadn't started billing. Refund the user.
+      try {
+        const debit = await findDebitTransactionForTask(taskId, userId);
+        if (debit?.data?.amount > 0) {
+          await refundCredits(userId, debit.data.amount, taskId, "cancel_while_queued");
+          console.log(`[TaskController] Refunded ${debit.data.amount} credits for queued task ${taskId} (user ${userId})`);
+        }
+      } catch (refundErr) {
+        console.error(`[TaskController] Refund after cancel failed for task ${taskId}:`, refundErr.message);
+      }
+    } else if (statusBeforeCancel && statusBeforeCancel !== "queued") {
+      console.log(`[TaskController] Task ${taskId} was already ${statusBeforeCancel} when cancelled — no refund (Tripo credits consumed)`);
+    }
+
     res.json({ success: true, cancelled: result.cancelled, message: result.message });
   } catch (err) {
     console.warn("[TaskController] cancelTask:", err.message);
@@ -950,7 +1226,6 @@ export async function cancelTask(req, res) {
   }
 }
 
-/* ─── Task: acknowledge (stop background poll) ────────────────────────── */
 export async function acknowledgeTask(req, res) {
   try {
     const { taskId } = req.params;
@@ -989,10 +1264,17 @@ export async function getBalance(req, res) {
   try {
     const client = getTripoClient();
     const data = await client.getBalance();
-    res.json({ success: true, ...data });
+    const availability = buildTripoAvailability(data);
+    res.json({ success: true, ...data, ...availability });
   } catch (err) {
     console.error("[TaskController] balance error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(503).json({
+      success: false,
+      service: "tripo",
+      available: false,
+      message: SERVICE_TEMPORARILY_UNAVAILABLE_MESSAGE,
+      code: TRIPO_API_UNAVAILABLE_CODE,
+    });
   }
 }
 
@@ -1178,13 +1460,18 @@ export async function modelProxy(req, res) {
   };
 
   try {
-    let authorizedHistory = null;
-    if (taskIdParam) {
-      authorizedHistory = await getAuthorizedHistoryForModelProxy(taskIdParam, requesterId, url);
-      if (!authorizedHistory) {
-        res.status(403).json({ success: false, message: "Forbidden" });
-        return;
-      }
+    const authorizedHistory = await getAuthorizedHistoryForModelProxy(taskIdParam, requesterId, url);
+    if (!authorizedHistory) {
+      res.status(403).json({ success: false, message: "Forbidden" });
+      return;
+    }
+
+    if (!taskIdParam) {
+      const historyTaskId = authorizedHistory.data?.taskId;
+      const fallbackTaskId = authorizedHistory.doc?.id?.startsWith("tripo_")
+        ? authorizedHistory.doc.id.slice("tripo_".length)
+        : null;
+      taskIdParam = historyTaskId || fallbackTaskId || null;
     }
 
     const sendModelEntry = (entry, cacheHeader = "HIT") => {
@@ -1553,7 +1840,7 @@ export async function cleanupExpiredHistory(req, res) {
       .get();
 
     const expiredDocs = snap.docs.filter((doc) => {
-      if (doc.data()?.marketplaceLocked === true || doc.data()?.marketplaceAssetId) return false;
+      if (isMarketplaceProtectedHistoryData(doc.data())) return false;
       const expiresAt = getHistoryExpiryMillis(doc.data());
       return expiresAt != null && expiresAt <= now;
     });

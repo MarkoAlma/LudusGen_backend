@@ -215,6 +215,37 @@ export function getPurchaseId(buyerId, assetId) {
   return `${buyerId}_${assetId}`;
 }
 
+function getMarketplacePublicBackendUrl() {
+  const configured = (
+    process.env.PUBLIC_BACKEND_URL ||
+    process.env.BACKEND_URL ||
+    process.env.API_BASE_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    ""
+  ).trim();
+
+  const fallback = process.env.NODE_ENV === "production"
+    ? "https://ludusgen-backend.onrender.com"
+    : "";
+  const value = configured || fallback;
+  if (!value) return "";
+
+  try {
+    const url = new URL(value);
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+export function getMarketplacePreviewImageUrl(assetId, asset = {}) {
+  const previewKey = asset.preview?.key || asset.storage?.thumbKey || asset.thumbKey;
+  if (!assetId || !String(previewKey || "").startsWith("marketplace/previews/")) return null;
+  const path = `/api/marketplace/assets/${assetId}/preview`;
+  const backendUrl = getMarketplacePublicBackendUrl();
+  return backendUrl ? `${backendUrl}${path}` : path;
+}
+
 export function normalizeAssetForClient(id, data = {}) {
   return {
     id,
@@ -251,6 +282,7 @@ export async function syncPurchasedAssetToHistory(buyerId, assetId, asset, purch
   const now = Date.now();
   const storageKey = getStorageKey(asset);
   const downloadUrl = `/api/marketplace/assets/${assetId}/download?inline=1`;
+  const previewImageUrl = getMarketplacePreviewImageUrl(assetId, asset);
 
   if (asset.type === "3d") {
     await db.collection("tripo_history").doc(`marketplace_${buyerId}_${assetId}`).set({
@@ -258,6 +290,10 @@ export async function syncPurchasedAssetToHistory(buyerId, assetId, asset, purch
       prompt: asset.title || asset.storage?.fileName || "Marketplace 3D asset",
       status: "succeeded",
       model_url: downloadUrl,
+      previewImageUrl: previewImageUrl ?? null,
+      previewImageUrls: previewImageUrl ? [previewImageUrl] : [],
+      preview_image_url: previewImageUrl ?? null,
+      preview_image_urls: previewImageUrl ? [previewImageUrl] : [],
       source: "tripo",
       mode: "marketplace",
       taskId: asset.tripo?.importTaskId || null,
@@ -270,6 +306,8 @@ export async function syncPurchasedAssetToHistory(buyerId, assetId, asset, purch
         compatible: asset.tripo?.compatible === true,
         fileType: asset.storage?.fileName?.split(".").pop()?.toLowerCase() || null,
         downloadOnly: asset.tripo?.compatible !== true,
+        previewImageUrl: previewImageUrl ?? null,
+        previewImageUrls: previewImageUrl ? [previewImageUrl] : [],
       },
       ts: now,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),

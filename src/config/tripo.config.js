@@ -274,7 +274,7 @@ export const MODEL_CAPABILITIES = {
     multiview:    true,  batch:     true,  tPose:      false, inParts:     false,
     negPrompt:    true,  smartLowPoly: false, quad:    false,
     autoSize:     true,  exportUv:  true,  makeBetter: true,
-    modelSeed:    true,  imageSeed: false, textureSeed: true,
+    modelSeed:    true,  imageSeed: true,  textureSeed: true,
   },
   "v3.1-20260211": {
     ultraMesh:    true,  texture:   true,  pbr:        true,  tex4K:       true,
@@ -325,3 +325,27 @@ export const DEFAULT_CAPABILITIES = MODEL_CAPABILITIES["v2.5-20250123"];
 
 // History TTL in milliseconds (7 days)
 export const HISTORY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TASK TYPE → PANEL MODE MAPPING  (single source of truth)
+// Imported by taskController, taskRecoveryService, webhookController.
+// ─────────────────────────────────────────────────────────────────────────────
+export const TASK_TYPE_TO_MODE = {
+  text_to_model:            "generate",
+  image_to_model:           "generate",
+  multiview_to_model:       "generate",
+  import_model:             "upload",
+  generate_image:           "views",
+  generate_multiview_image: "views",
+  edit_multiview_image:     "views",
+  refine_model:             "refine",
+  stylize_model:            "stylize",
+  texture_model:            "texture",
+  convert_model:            "retopo",
+  smart_low_poly:           "retopo",
+  mesh_segmentation:        "segment",
+  mesh_completion:          "fill_parts",
+  animate_rig:              "animate",
+  animate_retarget:         "animate",
+  animate_prerigcheck:      "animate",
+};

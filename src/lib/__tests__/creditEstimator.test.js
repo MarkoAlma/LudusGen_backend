@@ -178,6 +178,34 @@ function assert(condition, label) {
   assert(result.total === 10, `Two edited images should cost 10 credits, got ${result.total}`);
 }
 
+console.log("\nScenario: texture_model detailed quality charges HD texture and style reference");
+{
+  const result = estimateCost({
+    type: "texture_model",
+    original_model_task_id: "task-123",
+    texture_quality: "detailed",
+    style_reference: true,
+  });
+
+  assert(result.total === 25, `Detailed texture with style reference should cost 25 credits, got ${result.total}`);
+  assert(result.breakdown.base === 20, `Detailed texture base should be 20, got ${result.breakdown.base}`);
+  assert(result.breakdown.style_reference === 5, `Style reference addon should be 5, got ${result.breakdown.style_reference}`);
+}
+
+console.log("\nScenario: animate_retarget charges per requested animation");
+{
+  const result = estimateCost({
+    type: "animate_retarget",
+    original_model_task_id: "task-123",
+    animations: ["walk", "run"],
+  });
+
+  assert(result.total === 20, `Two retarget animations should cost 20 credits, got ${result.total}`);
+  assert(result.breakdown.animate_retarget === 20, `Retarget breakdown should be 20, got ${result.breakdown.animate_retarget}`);
+}
+
+console.log(`\n${"=".repeat(60)}`);
+console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
 if (failed > 0) {
   console.error("BILLING TESTS FAILED");
   process.exit(1);
