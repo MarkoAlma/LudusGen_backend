@@ -264,6 +264,9 @@ export async function persistPendingRecoveryTask({
     originalModelTaskId: body.original_model_task_id ?? body.original_model_id,
     originalTaskId: body.original_task_id,
     draftModelTaskId: body.draft_model_task_id,
+    model_seed: body.model_seed,
+    image_seed: body.image_seed,
+    texture_seed: body.texture_seed,
     preprocessTaskId: body.preprocessTaskId,
     preprocessTaskType: body.preprocessTaskType,
     generate_parts: body.generate_parts === true ? true : undefined,
@@ -437,16 +440,18 @@ async function saveToHistory(entry, taskData) {
     console.log(`[TaskRecovery] animate_retarget ${entry.taskId}: animated_models count=${animatedModels.length}`, animatedModels);
   }
   const prefersTexturedOutput = entry.type === "texture_model" || entry.texture === true || entry.pbr === true;
+  const prefersRetopoOutput = ["convert_model", "smart_low_poly"].includes(entry.type);
   const prefersDraftOutput = !prefersTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(entry.type);
   const { modelUrl, chosenSource, previewImageUrl, previewImageUrls } = extractModelUrl(
     { output: out, type: entry.type },
-    { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput },
+    { preferBaseModel: prefersDraftOutput, preferPbrModel: prefersTexturedOutput, preferRetopoModel: prefersRetopoOutput },
   );
   if (DEBUG_TRIPO) console.log("[TaskRecovery] output selection:", JSON.stringify({
     taskId: entry.taskId,
     type: entry.type,
     prefersDraftOutput,
     prefersTexturedOutput,
+    prefersRetopoOutput,
     chosenSource,
     modelUrl,
     availableOutputKeys: Object.keys(out),
@@ -513,6 +518,9 @@ async function saveToHistory(entry, taskData) {
         originalModelTaskId: taskInput.original_model_task_id ?? taskInput.original_model_id ?? null,
         originalTaskId: taskInput.original_task_id ?? null,
         draftModelTaskId: taskInput.draft_model_task_id ?? null,
+        model_seed: taskInput.model_seed ?? existingData?.params?.model_seed ?? null,
+        image_seed: taskInput.image_seed ?? existingData?.params?.image_seed ?? null,
+        texture_seed: taskInput.texture_seed ?? existingData?.params?.texture_seed ?? null,
         rig_type: out.rig_type ?? out.topology ?? null,
         topology: out.topology ?? null,
         is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,

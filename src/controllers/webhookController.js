@@ -138,10 +138,11 @@ async function saveCompletedTaskToHistory(taskId, payload) {
   const taskInput = taskData.input ?? taskData.request ?? {};
   const taskType = payload.type ?? taskData.type;
   const preferTexturedOutput = taskType === "texture_model" || taskInput.texture === true || taskInput.pbr === true;
+  const preferRetopoOutput = ["convert_model", "smart_low_poly"].includes(taskType);
   const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskType);
   const { modelUrl, chosenSource, previewImageUrl, previewImageUrls } = extractModelUrl(
     { output: out, type: taskType },
-    { preferBaseModel: preferDraftOutput, preferPbrModel: preferTexturedOutput },
+    { preferBaseModel: preferDraftOutput, preferPbrModel: preferTexturedOutput, preferRetopoModel: preferRetopoOutput },
   );
 
 
@@ -196,6 +197,9 @@ async function saveCompletedTaskToHistory(taskId, payload) {
       preview_image_urls: previewImageUrls ?? [],
       originalModelTaskId: taskInput.original_model_task_id ?? taskInput.original_model_id ?? null,
       draftModelTaskId: taskInput.draft_model_task_id ?? null,
+      model_seed: taskInput.model_seed ?? null,
+      image_seed: taskInput.image_seed ?? null,
+      texture_seed: taskInput.texture_seed ?? null,
       rig_type: out.rig_type ?? out.topology ?? null,
       topology: out.topology ?? null,
       is_animatable: out.is_animatable ?? out.animatable ?? out.riggable ?? null,

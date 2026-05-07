@@ -10,6 +10,10 @@
 export function extractModelUrl(task, opts = {}) {
   const out = task.output ?? {};
   const taskType = task.type ?? null;
+  const isRetopoTask =
+    opts.preferRetopoModel === true ||
+    taskType === "convert_model" ||
+    taskType === "smart_low_poly";
 
   // Handle image-only task types (generate_image, generate_multiview_image)
   if (taskType === "generate_multiview_image" || taskType === "edit_multiview_image") {
@@ -60,7 +64,28 @@ export function extractModelUrl(task, opts = {}) {
       ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskType));
   let orderedOutputs;
 
-  if (shouldPreferTextured) {
+  if (isRetopoTask) {
+    orderedOutputs = [
+      {
+        key: taskType === "smart_low_poly" ? "low_poly_model" : "converted_model",
+        value: taskType === "smart_low_poly" ? out.low_poly_model : out.converted_model,
+      },
+      {
+        key: taskType === "smart_low_poly" ? "converted_model" : "low_poly_model",
+        value: taskType === "smart_low_poly" ? out.converted_model : out.low_poly_model,
+      },
+      { key: "model", value: out.model },
+      { key: "model_url", value: out.model_url },
+      { key: "pbr_model", value: out.pbr_model },
+      { key: "textured_model", value: out.textured_model },
+      { key: "base_model", value: out.base_model },
+      { key: "rigged_model", value: out.rigged_model },
+      { key: "animated_model", value: animatedModel },
+      { key: "segmented_model", value: out.segmented_model },
+      { key: "stylized_model", value: out.stylized_model },
+      { key: "refined_model", value: out.refined_model },
+    ];
+  } else if (shouldPreferTextured) {
     orderedOutputs = [
       { key: "pbr_model", value: out.pbr_model },
       { key: "textured_model", value: out.textured_model },

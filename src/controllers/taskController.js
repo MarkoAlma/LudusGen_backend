@@ -217,7 +217,7 @@ function toMillis(value) {
 
 function getHistoryExpiryMillis(data) {
   if (!data || typeof data !== "object") return null;
-  if (data.marketplaceLocked === true || data.marketplaceAssetId) return null;
+  if (isMarketplaceProtectedHistoryData(data)) return null;
   const explicitExpiry = toMillis(data.expiresAt);
   if (explicitExpiry != null) return explicitExpiry;
 
@@ -228,6 +228,28 @@ function getHistoryExpiryMillis(data) {
   if (ts != null) return ts + HISTORY_TTL_MS;
 
   return null;
+}
+
+function isMarketplaceProtectedHistoryData(data) {
+  if (!data || typeof data !== "object") return false;
+  return Boolean(
+    data.marketplaceLocked === true ||
+      data.marketplaceAssetId ||
+      data.mode === "marketplace" ||
+      data.params?.mode === "marketplace" ||
+      data.params?.type === "marketplace_asset" ||
+      data.params?.downloadOnly === true,
+  );
+}
+
+function shouldPreserveMarketplaceHistoryDoc(reason) {
+  const value = String(reason || "");
+  return (
+    value === "expired_ttl" ||
+    value === "dead_model" ||
+    value === "model_proxy_source_missing" ||
+    value.startsWith("model_proxy_")
+  );
 }
 
 async function userOwnsTask(taskId, uid) {
@@ -282,6 +304,9 @@ async function writePendingHistoryTask({
     originalModelTaskId: body.original_model_task_id ?? body.original_model_id,
     originalTaskId: body.original_task_id,
     draftModelTaskId: body.draft_model_task_id,
+    model_seed: body.model_seed,
+    image_seed: body.image_seed,
+    texture_seed: body.texture_seed,
     preprocessTaskId: body.preprocessTaskId,
     preprocessTaskType: body.preprocessTaskType,
     generate_parts: body.generate_parts === true ? true : undefined,
@@ -305,11 +330,102 @@ async function writePendingHistoryTask({
   }
 }
 
+async function syncSuccessfulHistoryTaskFromStatus({
+  taskId,
+  userId,
+  result,
+  taskMeta,
+}) {
+  if (!taskId || !userId) return;
+  if (normalizeTripoTaskStatus(result?.status) !== "success") return;
+
+  const modelUrl =
+    result?.modelUrl ||
+    result?.model_url ||
+    result?.rawOutput?.model_url ||
+    null;
+  if (!modelUrl) return;
+
+  const db = admin.firestore();
+  const existing = await db.collection(HISTORY_COLLECTION)
+    .where("taskId", "==", taskId)
+    .where("userId", "==", userId)
+    .limit(1)
+    .get();
+  const existingDoc = existing.docs[0] ?? null;
+  const existingData = existingDoc?.data() ?? null;
+
+  if (existingData?.status === "succeeded" && existingData?.model_url === modelUrl) {
+    return;
+  }
+
+  const taskType =
+    taskMeta?.type ||
+    existingData?.params?.type ||
+    result?.type ||
+    result?.taskType ||
+    "unknown";
+  const mode = existingData?.mode || TASK_TYPE_TO_MODE[taskType] || "generate";
+  const now = Date.now();
+  const previewImageUrls = Array.isArray(result?.previewImageUrls)
+    ? result.previewImageUrls.filter(Boolean)
+    : (Array.isArray(existingData?.params?.preview_image_urls)
+      ? existingData.params.preview_image_urls
+      : []);
+  const previewImageUrl =
+    result?.previewImageUrl ||
+    previewImageUrls[0] ||
+    existingData?.params?.preview_image_url ||
+    null;
+
+  const targetRef = existingDoc?.ref ?? db.collection(HISTORY_COLLECTION).doc(`tripo_${taskId}`);
+  const historyPatch = omitUndefined({
+    userId,
+    prompt: existingData?.prompt ?? taskMeta?.prompt ?? result?.prompt ?? taskType,
+    name: existingData?.name ?? taskMeta?.prompt ?? result?.prompt ?? undefined,
+    status: "succeeded",
+    model_url: modelUrl,
+    source: existingData?.source ?? (taskType === "import_model" ? "upload" : "tripo"),
+    mode,
+    taskId,
+    params: omitUndefined({
+      ...(existingData?.params ?? {}),
+      model_version: taskMeta?.modelVersion ?? existingData?.params?.model_version ?? null,
+      mode,
+      type: taskType,
+      texture: taskMeta?.texture === true || existingData?.params?.texture === true,
+      pbr: taskMeta?.pbr === true || existingData?.params?.pbr === true,
+      chosen_source: result?.chosenSource ?? existingData?.params?.chosen_source ?? null,
+      consumed_credit: result?.consumedCredit ?? existingData?.params?.consumed_credit ?? null,
+      preview_image_url: previewImageUrl,
+      preview_image_urls: previewImageUrls,
+      originalTaskId: result?.originalTaskId ?? existingData?.params?.originalTaskId ?? null,
+      rig_type: result?.rigType ?? existingData?.params?.rig_type ?? null,
+      topology: result?.topology ?? existingData?.params?.topology ?? null,
+    }),
+    ts: now,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: now + HISTORY_TTL_MS,
+  });
+  if (!existingData?.createdAt) {
+    historyPatch.createdAt = admin.firestore.FieldValue.serverTimestamp();
+  }
+
+  await targetRef.set(historyPatch, { merge: true });
+}
+
 async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
   const cleanDocs = uniqueDocs(docs);
-  if (cleanDocs.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0 };
+  if (cleanDocs.length === 0) return { deleted: 0, b2Deleted: 0, b2Failed: 0, preserved: 0 };
 
-  const b2Keys = [...new Set(cleanDocs.map(doc => doc.data()?.b2_key).filter(Boolean))];
+  const storageDocs = cleanDocs.filter((doc) => !isMarketplaceProtectedHistoryData(doc.data()));
+  const preserveProtectedDocs = shouldPreserveMarketplaceHistoryDoc(reason);
+  const deletableDocs = cleanDocs.filter(
+    (doc) => !(preserveProtectedDocs && isMarketplaceProtectedHistoryData(doc.data())),
+  );
+  const preserved = cleanDocs.length - deletableDocs.length;
+
+  const b2Keys = [...new Set(storageDocs.map(doc => doc.data()?.b2_key).filter(Boolean))];
   let b2Deleted = 0;
   let b2Failed = 0;
   for (const key of b2Keys) {
@@ -320,16 +436,16 @@ async function deleteHistoryDocsWithStorage(docs, reason = "history_delete") {
 
   let deleted = 0;
   const db = admin.firestore();
-  for (let i = 0; i < cleanDocs.length; i += 500) {
+  for (let i = 0; i < deletableDocs.length; i += 500) {
     const batch = db.batch();
-    const slice = cleanDocs.slice(i, i + 500);
+    const slice = deletableDocs.slice(i, i + 500);
     slice.forEach(doc => batch.delete(doc.ref));
     await batch.commit();
     deleted += slice.length;
   }
 
-  console.log(`[HistoryController] cleanup reason=${reason} docs=${deleted} b2Deleted=${b2Deleted} b2Failed=${b2Failed}`);
-  return { deleted, b2Deleted, b2Failed };
+  console.log(`[HistoryController] cleanup reason=${reason} docs=${deleted} preserved=${preserved} b2Deleted=${b2Deleted} b2Failed=${b2Failed}`);
+  return { deleted, b2Deleted, b2Failed, preserved };
 }
 
 async function deleteHistoryForDeadModel({ taskId, modelUrl, uid = null, reason = "dead_model" }) {
@@ -966,16 +1082,19 @@ export async function getTask(req, res) {
     if (!await requireTaskAccess(req, res)) return;
     const taskMeta = getRegisteredTaskMeta(req.params.taskId);
     const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
+    const preferRetopoOutput = ["convert_model", "smart_low_poly"].includes(taskMeta?.type);
     const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
     logDebug("[TaskController][getTask-debug] request:", {
       taskId: req.params.taskId,
       taskMeta,
       preferTexturedOutput,
+      preferRetopoOutput,
       preferDraftOutput,
     });
     const result = await taskService.get(req.params.taskId, {
       preferBaseModel: preferDraftOutput,
       preferPbrModel: preferTexturedOutput,
+      preferRetopoModel: preferRetopoOutput,
     });
     logDebug("[TaskController][getTask-debug] result:", {
       taskId: req.params.taskId,
@@ -989,6 +1108,16 @@ export async function getTask(req, res) {
     });
     // FIX: result.success-t kivesszük, hogy ne írja felül a success: true-t
     const { success: _ignored, ...taskData } = result;
+    try {
+      await syncSuccessfulHistoryTaskFromStatus({
+        taskId: req.params.taskId,
+        userId: req.user?.uid,
+        result,
+        taskMeta,
+      });
+    } catch (syncErr) {
+      console.warn(`[TaskController] successful task history sync failed for ${req.params.taskId}:`, syncErr.message);
+    }
     res.json({ success: true, ...taskData });
   } catch (err) {
     console.error("[TaskController] getTask error:", err.message);
@@ -1037,10 +1166,12 @@ export async function streamTask(req, res) {
     while (!closed) {
       const taskMeta = getRegisteredTaskMeta(taskId);
       const preferTexturedOutput = taskMeta?.type === "texture_model" || taskMeta?.texture === true || taskMeta?.pbr === true;
+      const preferRetopoOutput = ["convert_model", "smart_low_poly"].includes(taskMeta?.type);
       const preferDraftOutput = !preferTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(taskMeta?.type);
       const result = await taskService.get(taskId, {
         preferBaseModel: preferDraftOutput,
         preferPbrModel: preferTexturedOutput,
+        preferRetopoModel: preferRetopoOutput,
       });
       const { success: _ignored, ...taskData } = result;
       send("status", { success: true, ...taskData, ts: Date.now() });
@@ -1739,7 +1870,7 @@ export async function cleanupExpiredHistory(req, res) {
       .get();
 
     const expiredDocs = snap.docs.filter((doc) => {
-      if (doc.data()?.marketplaceLocked === true || doc.data()?.marketplaceAssetId) return false;
+      if (isMarketplaceProtectedHistoryData(doc.data())) return false;
       const expiresAt = getHistoryExpiryMillis(doc.data());
       return expiresAt != null && expiresAt <= now;
     });

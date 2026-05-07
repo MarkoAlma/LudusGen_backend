@@ -32,6 +32,21 @@ assert(
 );
 
 assert(
+  controllerSource.includes("getMarketplaceAssetPreview"),
+  "marketplace controller should expose a lightweight public image preview endpoint for stored preview keys",
+);
+
+assert(
+  controllerSource.match(/export async function getMarketplaceAssetPreview[\s\S]*?if \(data\.status !== "published"\)/),
+  "marketplace preview endpoint should not serve hidden or deleted assets publicly",
+);
+
+assert(
+  !controllerSource.includes("return res.redirect(302, fallbackUrl);"),
+  "marketplace preview endpoint should not redirect to raw fallback history URLs",
+);
+
+assert(
   controllerSource.includes("data.tripo?.sourceHistoryId || data.source?.id || null"),
   "3D marketplace preview fallback should resolve the source history record first",
 );
