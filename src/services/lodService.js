@@ -13,7 +13,6 @@ class LodService {
    */
   async generateChain(sourceTaskId, levels = LOD_PRESETS, exportZip = false, userId = null) {
     const client = getTripoClient();
-    console.log(`[LOD] generating ${levels.length} levels from task=${sourceTaskId}`);
 
     const lodLevels = levels.map((l, i) => ({
       level: i, label: l.label, face_limit: l.face_limit, status: "pending",

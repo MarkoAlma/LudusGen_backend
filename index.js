@@ -210,7 +210,6 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-console.log('☁️ Cloudinary configured:', process.env.CLOUDINARY_CLOUD_NAME ? '✅' : '❌ Missing credentials');
 
 // ==================== FIREBASE ADMIN INIT ====================
 try {
@@ -229,12 +228,8 @@ try {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
-  console.log("✅ Firebase Admin inicializálva");
 } catch (error) {
   console.error("❌ Firebase Admin init hiba:", error.message);
-  if (!process.env.FIREBASE_PROJECT_ID) {
-    console.log("Győződj meg róla, hogy a serviceAccountKey.json létezik, vagy állítsd be a környezeti változókat!");
-  }
 }
 
 const db = admin.firestore();
@@ -259,24 +254,15 @@ const smtpTransporter = nodemailer.createTransport({
 
 
 
-console.log('[Email] Provider:', MAIL_PROVIDER);
-console.log('[Email] From configured:', getMailFrom() ? 'yes' : 'no');
-console.log('[Email] Frontend URL:', getFrontendUrl());
 
 if (MAIL_PROVIDER === 'smtp') {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
     console.warn('[Email] SMTP credentials are missing. Set EMAIL_USER and EMAIL_PASSWORD.');
   } else {
     smtpTransporter.verify(function (error) {
-      if (error) {
-        console.log('[Email] SMTP connection error:', getSafeErrorMessage(error));
-      } else {
-        console.log('[Email] SMTP server is ready to send emails');
-      }
     });
   }
 } else {
-  console.log('[Email] Using Resend HTTP API for transactional emails');
 }
 
 async function sendTransactionalEmail(mailOptions) {
@@ -518,10 +504,6 @@ async function sendVerificationEmail(email, verificationLink, displayName) {
   };
 
   const info = await sendTransactionalEmail(mailOptions);
-  console.log('[Email] Verification email sent to:', maskEmail(email));
-  if (info.messageId) {
-    console.log('[Email] Message ID:', info.messageId);
-  }
   return info;
 }
 
@@ -626,7 +608,6 @@ app.post("/api/register-user", async (req, res) => {
       });
     }
 
-    console.log("📝 Registering new user:", email);
 
     // 1. Firebase Auth user létrehozása (Admin SDK - NEM jelentkeztet be!)
     const userRecord = await admin.auth().createUser({
@@ -636,14 +617,12 @@ app.post("/api/register-user", async (req, res) => {
       emailVerified: false,
     });
 
-    console.log("✅ Firebase Auth user created:", userRecord.uid);
 
     // 2. Email verifikációs link generálása
     const verificationLink = normalizeAuthActionLink(await admin.auth().generateEmailVerificationLink(email, {
       url: getFrontendUrl(),
     }));
 
-    console.log("📧 Email verification link generated");
 
     // 3. Email küldése
     try {
@@ -680,8 +659,6 @@ app.post("/api/register-user", async (req, res) => {
       },
     });
 
-    console.log("✅ Firestore user document created");
-    console.log("✅ Registration complete for:", email);
 
     res.json({
       success: true,
@@ -755,7 +732,6 @@ app.post("/api/validate-password", async (req, res) => {
       });
     }
 
-    console.log("🔐 Validating password for:", email);
 
     const firebaseApiKey = process.env.FIREBASE_API_KEY;
 
@@ -781,7 +757,6 @@ app.post("/api/validate-password", async (req, res) => {
     const data = await response.json();
 
     if (response.ok) {
-      console.log("✅ Password is valid for:", email);
 
       // Email verifikáció ellenőrzése
       const userRecord = await admin.auth().getUserByEmail(email);
@@ -797,7 +772,6 @@ app.post("/api/validate-password", async (req, res) => {
         message: "Jelszó helyes"
       });
     } else {
-      console.log("❌ Invalid password for:", email);
       res.status(401).json({
         success: false,
         message: "Hibás email/jelszó páros"
@@ -815,7 +789,6 @@ app.post("/api/validate-password", async (req, res) => {
 app.post("/api/login-with-2fa", async (req, res) => {
   try {
     const { email, code } = req.body;
-    console.log("🔐 2FA Login attempt:", email);
 
     if (!email || !code) {
       return res.status(400).json({
@@ -858,7 +831,6 @@ app.post("/api/login-with-2fa", async (req, res) => {
         ...twoFAData,
         backupCodes: updatedBackupCodes,
       });
-      console.log(`✅ Backup kód használva. Megmaradt: ${updatedBackupCodes.length}`);
     }
 
     if (isValid) {
@@ -992,7 +964,6 @@ app.get("/api/get-user/:uid", async (req, res) => {
 
     // 🔥 HA NEM LÉTEZIK, HOZZUK LÉTRE
     if (!userDoc.exists) {
-      console.log("⚠️ User document not found, creating it now for:", uid);
 
       const userRecord = await admin.auth().getUser(uid);
       const isGoogleProvider = userRecord.providerData.some(
@@ -1013,7 +984,6 @@ app.get("/api/get-user/:uid", async (req, res) => {
         }
       });
 
-      console.log("✅ User document created for:", userRecord.email);
 
       // Frissen létrehozott dokumentum visszaadása
       const newUserDoc = await userDocRef.get();
@@ -1056,7 +1026,6 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
     const userId = req.userId;
     const userEmail = req.userEmail;
 
-    console.log('🔧 Setting up MFA for user:', userId);
 
     const existing2FA = await get2FAData(userId);
 
@@ -1064,11 +1033,9 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
     let backupCodes;
 
     if (existing2FA?.secret && !existing2FA.is2FAEnabled) {
-      console.log('♻️ Reusing existing secret');
       secret = existing2FA.secret;
       backupCodes = existing2FA.backupCodes;
     } else {
-      console.log('🆕 Generating new secret with Speakeasy');
 
       const secretObj = speakeasy.generateSecret({
         name: `LudusGen (${userEmail})`,
@@ -1079,7 +1046,6 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
       secret = secretObj.base32;
       backupCodes = generateBackupCodes();
 
-      console.log('💾 Saving new secret to DB...');
 
       await save2FAData(userId, {
         secret,
@@ -1088,14 +1054,12 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
       });
 
       const verification = await get2FAData(userId);
-      console.log('✅ Secrets match:', verification?.secret === secret);
     }
 
     const testToken = speakeasy.totp({
       secret: secret,
       encoding: 'base32'
     });
-    console.log('🧪 Test token generated:', testToken);
 
     const otpauthUrl = speakeasy.otpauthURL({
       secret: secret,
@@ -1106,7 +1070,6 @@ app.get("/api/setup-mfa", verifyFirebaseToken, async (req, res) => {
 
     const qr = await QRCode.toDataURL(otpauthUrl);
 
-    console.log('✅ MFA setup data prepared');
 
     res.json({
       qr,
@@ -1127,9 +1090,6 @@ app.post("/api/verify-mfa", verifyFirebaseToken, async (req, res) => {
     const userId = req.userId;
     const code = String(req.body.code || "").trim();
 
-    console.log('🔐 Verify MFA Request:');
-    console.log('User ID:', userId);
-    console.log('Code received:', code);
 
     if (!code || code.length !== 6) {
       console.warn('❌ Invalid code format');
@@ -1164,14 +1124,12 @@ app.post("/api/verify-mfa", verifyFirebaseToken, async (req, res) => {
       window: 2
     });
 
-    console.log('🔍 Verification result:', verified);
 
     if (!verified) {
       const currentToken = speakeasy.totp({
         secret: twoFAData.secret,
         encoding: 'base32'
       });
-      console.log('❓ Current valid token would be:', currentToken);
 
       return res.status(400).json({
         success: false,
@@ -1179,7 +1137,6 @@ app.post("/api/verify-mfa", verifyFirebaseToken, async (req, res) => {
       });
     }
 
-    console.log('✅ Code verified, activating 2FA...');
 
     await save2FAData(userId, {
       secret: twoFAData.secret,
@@ -1188,7 +1145,6 @@ app.post("/api/verify-mfa", verifyFirebaseToken, async (req, res) => {
       enabledAt: new Date().toISOString(),
     });
 
-    console.log('✅ 2FA successfully enabled for user:', userId);
 
     res.json({
       success: true,
@@ -1232,7 +1188,6 @@ app.post("/api/disable-2fa", verifyFirebaseToken, async (req, res) => {
         backupCodes: [],
       });
 
-      console.log('🔓 2FA disabled for user:', userId);
 
       res.json({
         success: true,
@@ -1290,8 +1245,6 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
     const userId = req.userId;
     const { name, displayName, bio } = req.body;
 
-    console.log('📥 Update profile request for user:', userId);
-    console.log('📥 Received data:', { name, displayName, bio });
 
     if (displayName !== undefined && (!displayName || displayName.trim().length < 1)) {
       return res.status(400).json({
@@ -1315,19 +1268,16 @@ app.post("/api/update-profile", verifyFirebaseToken, async (req, res) => {
 
     updateData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
 
-    console.log('💾 Saving to Firestore:', updateData);
 
     await db.collection("users").doc(userId).set(
       updateData,
       { merge: true }
     );
 
-    console.log('✅ Profile updated successfully');
 
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
 
-    console.log('📤 Sending back updated user data');
 
     res.json({
       success: true,
@@ -1359,12 +1309,6 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
       });
     }
 
-    console.log('📸 Uploading profile picture to Cloudinary for user:', userId);
-    console.log('📁 File info:', {
-      originalname: req.file.originalname,
-      size: req.file.size,
-      mimetype: req.file.mimetype
-    });
 
     // Get old profile picture to delete from Cloudinary
     const userDoc = await db.collection("users").doc(userId).get();
@@ -1393,15 +1337,12 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 
     const cloudinaryResult = await uploadPromise;
 
-    console.log('☁️ Cloudinary upload successful:', cloudinaryResult.public_id);
 
     // Delete old image from Cloudinary if exists
     if (oldPublicId) {
       try {
         await cloudinary.uploader.destroy(oldPublicId);
-        console.log('🗑️ Old profile picture deleted from Cloudinary');
       } catch (err) {
-        console.log('⚠️ Could not delete old image from Cloudinary:', err.message);
       }
     }
 
@@ -1415,7 +1356,6 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
       { merge: true }
     );
 
-    console.log('✅ Profile picture uploaded successfully');
 
     res.json({
       success: true,
@@ -1443,7 +1383,6 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 //       });
 //     }
 
-//     console.log("🔐 Validating Google token for:", email);
 
 //     // Google token verifikálása
 //     const decodedToken = await admin.auth().verifyIdToken(googleToken);
@@ -1471,7 +1410,6 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 //       });
 //     }
 
-//     console.log("✅ Google token is valid for:", email);
 
 //     // 🔥 FIRESTORE DOKUMENTUM LÉTREHOZÁSA (ha még nincs)
 //     const userDocRef = admin.firestore().collection("users").doc(decodedToken.uid);
@@ -1491,9 +1429,7 @@ app.post("/api/upload-profile-picture", verifyFirebaseToken, upload.single('prof
 //           backupCodes: []
 //         }
 //       });
-//       console.log("✅ Google user document created in Firestore for:", email);
 //     } else {
-//       console.log("✅ Google user document already exists for:", email);
 //     }
 
 //     // ✅ TÁROLJUK A SESSION-T 2FA-hoz (mint az emailes verzióban)
@@ -1534,7 +1470,6 @@ setInterval(() => {
   for (const [sessionId, sessionData] of pendingAuth.entries()) {
     if (now - sessionData.timestamp > fiveMinutes) {
       pendingAuth.delete(sessionId);
-      console.log(`🗑️ Expired session deleted: ${sessionId}`);
     }
   }
 }, 60 * 1000);
@@ -1544,7 +1479,6 @@ app.post("/api/login-with-2fa-google", async (req, res) => {
   try {
     const { sessionId, code } = req.body;
 
-    console.log("🔐 Google 2FA Login attempt with sessionId:", sessionId);
 
     if (!sessionId || !code) {
       return res.status(400).json({
@@ -1593,7 +1527,6 @@ app.post("/api/login-with-2fa-google", async (req, res) => {
         ...twoFAData,
         backupCodes: updatedBackupCodes,
       });
-      console.log(`✅ Backup kód használva. Megmaradt: ${updatedBackupCodes.length}`);
     }
 
     if (isValid) {
@@ -1633,7 +1566,6 @@ app.post("/api/validate-google-session", async (req, res) => {
       });
     }
 
-    console.log("🔐 Validating Firebase token for Google user:", email);
 
     // ✅ Firebase ID token verifikálása (ez most működni fog!)
     const decodedToken = await admin.auth().verifyIdToken(firebaseIdToken);
@@ -1654,7 +1586,6 @@ app.post("/api/validate-google-session", async (req, res) => {
       });
     }
 
-    console.log("✅ Firebase token is valid for:", email);
 
     // 🔥 FIRESTORE DOKUMENTUM LÉTREHOZÁSA (ha még nincs)
     const userDocRef = admin.firestore().collection("users").doc(decodedToken.uid);
@@ -1682,9 +1613,7 @@ app.post("/api/validate-google-session", async (req, res) => {
           }
         });
 
-        console.log("✅ Google user document created in Firestore for:", email);
       } else {
-        console.log("✅ Google user document already exists for:", email);
       }
     });
 
@@ -1698,7 +1627,6 @@ app.post("/api/validate-google-session", async (req, res) => {
       provider: 'google'
     });
 
-    console.log("✅ Session created:", sessionId);
 
     res.json({
       success: true,
@@ -1723,7 +1651,6 @@ app.post('/api/forgot-password', async (req, res) => {
       return res.status(200).json({ message: 'If an account exists, we sent the email.' });
     }
 
-    console.log('📨 Forgot password requested for:', maskEmail(email));
 
     // 1. Ellenőrzd hogy létezik-e a user (Firebase Admin)
     let userRecord;
@@ -1746,7 +1673,6 @@ app.post('/api/forgot-password', async (req, res) => {
       'Forgot password email sending timed out',
     );
 
-    console.log('📧 Forgot password email sent to:', maskEmail(email));
 
     res.status(200).json({ message: 'If an account exists, we sent the email.' });
   } catch (error) {
@@ -1759,7 +1685,6 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
   try {
     const userId = req.userId;
 
-    console.log('🗑️ Deleting profile picture for user:', userId);
 
     const userDoc = await db.collection("users").doc(userId).get();
     const profilePicture = userDoc.data()?.profilePicture;
@@ -1776,9 +1701,7 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
     if (publicId) {
       try {
         await cloudinary.uploader.destroy(publicId);
-        console.log('✅ Profile picture deleted from Cloudinary');
       } catch (err) {
-        console.log('⚠️ Could not delete from Cloudinary:', err.message);
       }
     }
 
@@ -1792,7 +1715,6 @@ app.delete("/api/delete-profile-picture", verifyFirebaseToken, async (req, res) 
       { merge: true }
     );
 
-    console.log('✅ Profile picture deleted successfully');
 
     res.json({
       success: true,
@@ -1930,7 +1852,6 @@ app.post('/api/add-credits', verifyFirebaseToken, async (req, res) => {
     const updatedDoc = await userRef.get();
     const newBalance = updatedDoc.data().credits;
 
-    console.log(`✅ Credits added: ${pkg.amount} (${pkg.id}) → user ${userId}, balance: ${newBalance}`);
     res.json({ success: true, credits: newBalance, added: pkg.amount, package: pkg });
 
   } catch (error) {
@@ -1984,7 +1905,7 @@ recoverStalePipelines().catch((err) =>
 // ==================== SERVER START ====================
 
 const PORT = Number(process.env.PORT || 3001);
-const server = app.listen(PORT, () => console.log(`Backend running on port ${PORT} (Email + Speakeasy)`));
+const server = app.listen(PORT);
 
 server.on("error", (error) => {
   stopTaskRecovery();
@@ -1998,4 +1919,3 @@ server.on("error", (error) => {
 // Graceful shutdown — stop background recovery
 process.on("SIGINT", () => { stopTaskRecovery(); server.close(); });
 process.on("SIGTERM", () => { stopTaskRecovery(); server.close(); });
-

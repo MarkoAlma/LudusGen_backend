@@ -29,7 +29,6 @@ export function registerJob(jobId, userId, controller, timeoutMs = 600000) {
     unregisterJob(jobId);
 
     const timeoutId = setTimeout(() => {
-        console.log(`[Timeout] Job ${jobId} exceeded ${timeoutMs}ms. Aborting.`);
         controller.abort();
         activeJobs.delete(jobId);
     }, timeoutMs);

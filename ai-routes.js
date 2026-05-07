@@ -221,7 +221,6 @@ router.post('/cancel-job', verifyFirebaseToken, (req, res) => {
         if (!job.userId || job.userId !== req.userId) {
             return res.status(403).json({ success: false, message: 'You are not allowed to cancel this job' });
         }
-        console.log(`[Cancel] User requested cancellation for job: ${jobId}`);
         job.controller.abort();
         unregisterJob(jobId);
         return res.json({ success: true, message: 'Job cancelled' });
@@ -289,7 +288,6 @@ function printTokenUsage(provider, model, usage) {
     const sExtra = extraT > 0 ? `| EXTRA: \x1b[36m${String(extraT).padStart(6)}\x1b[0m ` : "".padEnd(0);
     const sTotal = String(totalT).padStart(7);
 
-    console.log(`\x1b[32m[USAGE]\x1b[0m \x1b[1m${p}\x1b[0m | \x1b[36m${m}\x1b[0m | IN: \x1b[33m${sIn}\x1b[0m | OUT: \x1b[33m${sOut}\x1b[0m ${sExtra}| TOTAL: \x1b[35m${sTotal}\x1b[0m`);
 }
 
 // ── Firestore usage log ───────────────────────────────────────────────────────
@@ -368,6 +366,92 @@ function normalizeMessages(messages) {
     finalMessages.push(...chatMsgs);
 
     return finalMessages;
+}
+
+const NVIDIA_GEMMA_MODELS = new Set([
+    'google/gemma-3-27b-it',
+    'google/gemma-3n-e4b-it',
+    'google/gemma-4-31b-it',
+]);
+
+function isNvidiaGemmaModel(model) {
+    return NVIDIA_GEMMA_MODELS.has(model);
+}
+
+function prependTextToMessageContent(content, prefix) {
+    if (!prefix) return content;
+
+    if (Array.isArray(content)) {
+        return [{ type: 'text', text: prefix }, ...content];
+    }
+
+    const text = content === null || content === undefined ? '' : String(content);
+    return text.trim() ? `${prefix}\n\n${text}` : prefix;
+}
+
+function nvidiaGemmaContentToString(content) {
+    if (!Array.isArray(content)) {
+        return content === null || content === undefined ? '' : String(content);
+    }
+
+    const textParts = [];
+    const imageTags = [];
+
+    for (const part of content) {
+        if (part?.type === 'text') {
+            const text = typeof part.text === 'string' ? part.text.trim() : '';
+            if (text) textParts.push(text);
+            continue;
+        }
+
+        if (part?.type === 'image_url') {
+            const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+            if (typeof url === 'string' && url.trim()) {
+                imageTags.push(`<img src="${url.trim()}" />`);
+            }
+        }
+    }
+
+    return [...textParts, ...imageTags].join('\n\n');
+}
+
+function normalizeNvidiaGemmaMessages(messages) {
+    const normalized = normalizeMessages(messages);
+    const systemContent = [];
+    const chatMessages = [];
+
+    for (const message of normalized) {
+        if (message.role === 'system') {
+            systemContent.push(typeof message.content === 'string' ? message.content : JSON.stringify(message.content));
+            continue;
+        }
+
+        if (message.role === 'user' || message.role === 'assistant') {
+            chatMessages.push({
+                ...message,
+                content: message.role === 'user'
+                    ? nvidiaGemmaContentToString(message.content)
+                    : message.content,
+            });
+        }
+    }
+
+    while (chatMessages.length > 0 && chatMessages[0].role === 'assistant') {
+        chatMessages.shift();
+    }
+
+    if (systemContent.length > 0) {
+        const systemPrefix = `[System instructions]\n${systemContent.join('\n\n')}`;
+        const firstUserMessage = chatMessages.find((message) => message.role === 'user');
+
+        if (firstUserMessage) {
+            firstUserMessage.content = prependTextToMessageContent(firstUserMessage.content, systemPrefix);
+        } else {
+            chatMessages.unshift({ role: 'user', content: systemPrefix });
+        }
+    }
+
+    return chatMessages;
 }
 
 function dataUrlToGeminiInlineData(dataUrl) {
@@ -508,7 +592,9 @@ function getModelConfig(modelId) {
         'cerebras-llama8b': { apiModel: 'llama3.1-8b', provider: 'cerebras', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'mistral-large': { apiModel: 'mistral-large-latest', provider: 'mistral', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
         'nvidia-glm4.7': { apiModel: 'z-ai/glm4.7', provider: 'nvidia', defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
-        'google-gemma-3-27b-it': { apiModel: 'google/gemma-3-27b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'google-gemma-3-27b-it': { apiModel: 'google/gemma-3n-e4b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'google-gemma-3n-e4b-it': { apiModel: 'google/gemma-3n-e4b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
+        'google-gemma-4-31b-it': { apiModel: 'google/gemma-4-31b-it', provider: 'nvidia', supportsVision: true, defaultSystemPrompt: 'You are a helpful assistant. Respond in the same language the user writes in.' },
     };
     return MODEL_MAP[modelId] || null;
 }
@@ -892,7 +978,6 @@ Keep it under 180 tokens.`;
 
     await batch.commit();
 
-    console.log(`[Summary] Cumulative summary refreshed. summarized=${nextSummarizedMessageCount}, session=${sessionId}`);
 
     return {
         summaryRefreshed: true,
@@ -930,7 +1015,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
         activeStreams.set(streamKey, controller);
 
         req.on('close', () => {
-            console.log(`[Chat] Kliens lecsatlakozott, AI stream leállítva...`);
             controller.abort();
             activeStreams.delete(streamKey);
         });
@@ -1017,18 +1101,14 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
 
         context = trimToContextLimit(context, 8192 * 32 * 0.8);
 
-        console.log(`[Chat] Kontextus: ${context.length} üzenet, summary: ${sessionData.summary ? 'igen' : 'nem'}`);
 
         // ── Title generálás (csak az első üzenetnél) ──
         if (!sessionData.title) {
             const firstUserText = messageText || '[kep]';
-            console.log(`[Title] Generating for session ${sessionId}, message: "${firstUserText.slice(0, 60)}"`);
             const generatedTitle = await generateSessionTitle(firstUserText);
-            console.log(`[Title] Generated: "${generatedTitle}"`);
             if (generatedTitle) {
                 await sessionRef.set({ title: generatedTitle }, { merge: true });
                 sessionData.title = generatedTitle;
-                console.log(`[Title] Saved to Firestore: "${generatedTitle}"`);
             }
         }
 
@@ -1190,7 +1270,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 stream.on('error', (err) => {
                     if (anthropicStreamClosed) return;
                     if (err.name === 'AbortError') {
-                        console.log('[Anthropic] Stream leállítva.');
                     } else {
                         console.error('Anthropic stream hiba:', err);
                         writeAnthropicSse({ error: err.message || 'Anthropic stream hiba' });
@@ -1281,7 +1360,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             } catch (err) {
                 activeStreams.delete(streamKey);
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[OpenAI] Stream leállítva.');
                 } else {
                     console.error('OpenAI stream hiba:', err);
                     if (!res.writableEnded) {
@@ -1335,7 +1413,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[Cerebras] Stream leállítva.');
                     return;
                 }
                 console.error('Cerebras hiba:', err.response?.data || err.message);
@@ -1455,7 +1532,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[Mistral] Stream leállítva.');
                     return;
                 }
                 console.error('Mistral hiba:', err.response?.data || err.message);
@@ -1574,7 +1650,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[Groq] Stream leállítva.');
                     return;
                 }
                 console.error('Groq hiba:', err.response?.data || err.message);
@@ -1735,7 +1810,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     return res.end();
                 }
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[Gemini] Stream leállítva.');
                     return;
                 }
                 console.error('Gemini kapcsolódási hiba:', err.message);
@@ -1823,7 +1897,30 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
             }
 
-            const nvidiaMsgs = normalizeMessages(context);
+            const usesGemmaSchema = isNvidiaGemmaModel(apiModel);
+            const nvidiaMsgs = usesGemmaSchema
+                ? normalizeNvidiaGemmaMessages(context)
+                : normalizeMessages(context);
+            const nvidiaBody = {
+                model: apiModel,
+                messages: nvidiaMsgs,
+                temperature: Math.min(Math.max(0, temperature), usesGemmaSchema ? 1 : 2),
+                max_tokens: apiModel === 'google/gemma-3-27b-it' || apiModel === 'google/gemma-3n-e4b-it'
+                    ? Math.min(safeMax, 4096)
+                    : apiModel === 'google/gemma-4-31b-it'
+                        ? Math.min(safeMax, 32768)
+                        : safeMax,
+                top_p: Math.min(Math.max(0, top_p), 1),
+                stream: true,
+            };
+
+            if (!usesGemmaSchema) {
+                nvidiaBody.stream_options = { include_usage: true };
+            }
+
+            if (apiModel === 'google/gemma-4-31b-it' || apiModel === 'z-ai/glm4.7') {
+                nvidiaBody.chat_template_kwargs = { enable_thinking: false };
+            }
 
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
@@ -1839,16 +1936,7 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
             try {
                 streamResp = await axios.post(
                     'https://integrate.api.nvidia.com/v1/chat/completions',
-                    {
-                        model: apiModel,
-                        messages: nvidiaMsgs,
-                        temperature: Math.min(Math.max(0, temperature), 2),
-                        max_tokens: safeMax,
-                        top_p: Math.min(Math.max(0, top_p), 1),
-                        stream: true,
-                        stream_options: { include_usage: true },
-                        chat_template_kwargs: { enable_thinking: false }
-                    },
+                    nvidiaBody,
                     {
                         headers: {
                             'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
@@ -1862,11 +1950,20 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[NVIDIA] Stream leállítva.');
                     return;
                 }
-                console.error('NVIDIA kapcsolódási hiba:', err.message);
-                res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+                activeStreams.delete(streamKey);
+                const details = await getAxiosErrorDetails(err);
+                const statusText = details.status ? `HTTP ${details.status}` : 'request failed';
+                const codeText = details.code ? ` (${details.code})` : '';
+                const userMessage = `NVIDIA ${statusText}${codeText}: ${details.message}`;
+                console.error('[NVIDIA] Chat request failed:', {
+                    model: apiModel,
+                    status: details.status,
+                    code: details.code,
+                    message: details.message,
+                });
+                res.write(`data: ${JSON.stringify({ error: userMessage })}\n\n`);
                 return res.end();
             }
 
@@ -2013,7 +2110,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                     break;
                 } catch (err) {
                     if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                        console.log('[ModelScope] Stream leallitva.');
                         return;
                     }
 
@@ -2214,7 +2310,6 @@ router.post('/chat', verifyFirebaseToken, chatLimiter, async (req, res) => {
                 );
             } catch (err) {
                 if (err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
-                    console.log('[OpenRouter] Stream leállítva.');
                     return;
                 }
                 activeStreams.delete(streamKey);
@@ -2371,7 +2466,6 @@ router.post('/chat/stop', verifyFirebaseToken, async (req, res) => {
         const controller = activeStreams.get(streamKey);
 
         if (controller) {
-            console.log(`[Chat] Stop: session ${sessionId}. Stream leállítva.`);
             controller.abort();
             activeStreams.delete(streamKey);
             return res.json({ success: true, message: 'Adatfolyam leállítva' });
@@ -2475,6 +2569,8 @@ router.post('/enhance', verifyFirebaseToken, chatLimiter, async (req, res) => {
 });
 
 // ── VISION DESCRIBE ───────────────────────────────────────────────────────────
+const GEMMA_VISION_MODEL = 'google/gemma-3n-e4b-it';
+
 router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
     try {
         const { images, systemPrompt } = req.body;
@@ -2489,38 +2585,39 @@ router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
             return res.status(500).json({ success: false, message: 'NVIDIA_API_KEY nincs beállítva' });
         }
 
-        const userContentBlocks = [
-            { type: 'text', text: systemPrompt || 'Describe the uploaded image(s) in detail.' },
-            ...images.map((dataUrl) => ({
-                type: 'image_url',
-                image_url: { url: dataUrl },
-            })),
-        ];
+        const userContent = [
+            systemPrompt || 'Describe the uploaded image(s) in detail.',
+            ...images.map((dataUrl) => `<img src="${dataUrl}" />`),
+        ].join('\n\n');
 
         let resp;
         try {
             resp = await axios.post(
                 'https://integrate.api.nvidia.com/v1/chat/completions',
                 {
-                    model: 'google/gemma-3-27b-it',
-                    messages: [{ role: 'user', content: userContentBlocks }],
-                    max_tokens: 1500,
+                    model: GEMMA_VISION_MODEL,
+                    messages: [{ role: 'user', content: userContent }],
+                    max_tokens: 512,
                     temperature: 0.2,
                     top_p: 0.7,
+                    frequency_penalty: 0,
+                    presence_penalty: 0,
                     stream: false,
                 },
                 {
                     headers: {
                         Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
                         'Content-Type': 'application/json',
+                        Accept: 'application/json',
                     },
                     timeout: 90000,
                 }
             );
         } catch (err) {
-            const msg = err.response?.data?.message || err.response?.data?.detail || err.message || 'NVIDIA API hiba';
-            console.error('Vision describe NVIDIA hiba:', msg);
-            return res.status(502).json({ success: false, message: `NVIDIA API hiba: ${msg}` });
+            const details = await getAxiosErrorDetails(err);
+            const statusText = details.status ? `HTTP ${details.status}` : 'request failed';
+            console.error('[Vision Describe] NVIDIA request failed:', details);
+            return res.status(502).json({ success: false, message: `NVIDIA API hiba: ${statusText}: ${details.message}` });
         }
 
         const description = resp.data?.choices?.[0]?.message?.content?.trim() || '';
@@ -2529,7 +2626,7 @@ router.post('/vision-describe', verifyFirebaseToken, async (req, res) => {
         }
 
         await logUsage(req.userId, 'vision-describe', {
-            model: 'google/gemma-3-27b-it',
+            model: GEMMA_VISION_MODEL,
             provider: 'nvidia',
             tokens: resp.data?.usage?.total_tokens || 0,
             images: images.length,
@@ -3430,7 +3527,6 @@ router.post('/generate-image', verifyFirebaseToken, imageLimiter, async (req, re
     } catch (err) {
         unregisterJob(req.body.jobId);
         if (err.name === 'AbortError') {
-            console.log(`[Abort] Job ${req.body.jobId} was aborted.`);
             if (!res.headersSent) {
                 sseStart(res);
                 sseEmit(res, { type: 'error', message: 'Folyamat megszakítva (Timeout/User cancel)' });
@@ -6676,7 +6772,6 @@ router.post('/chat/switch-model', verifyFirebaseToken, async (req, res) => {
             sessionData,
         });
 
-        console.log(`[SwitchModel] ${sessionId} → ${newModelId} (context megőrizve)`);
         return res.json({ success: true, summaryRefreshed: summaryResult.summaryRefreshed });
     } catch (e) {
         console.error('Switch model hiba:', e);
@@ -6930,7 +7025,6 @@ router.delete('/image-gallery', verifyFirebaseToken, async (req, res) => {
         snap.docs.forEach(doc => batch.delete(doc.ref));
         await batch.commit();
 
-        console.log(`[GalleryBulkDelete] Purged ${snap.size} objects for user ${userId}`);
         res.json({ success: true, message: 'Összes kép sikeresen törölve' });
     } catch (err) {
         console.error('[GalleryBulkDelete] Error:', err);
@@ -7678,10 +7772,10 @@ router.post('/sprite-sheet', verifyFirebaseToken, genLimiter, async (req, res) =
             const payload = { Animation_Scene: scene };
             if (characterImage) {
                 // Strip the "data:image/png;base64," prefix for Segmind
-                const base64Data = characterImage.includes('base64,') 
-                    ? characterImage.split('base64,')[1] 
+                const base64Data = characterImage.includes('base64,')
+                    ? characterImage.split('base64,')[1]
                     : characterImage;
-                
+
                 // To maximize compatibility with unknown Segmind workflows, we send the image under likely input names.
                 // We only send it once to prevent Payload Too Large (502) errors.
                 payload.image = base64Data;

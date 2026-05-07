@@ -23,5 +23,3 @@ assert(
   modelProxyBlock.includes("archiveModelProxyFetch"),
   "modelProxy should archive successfully fetched models for durable history reloads",
 );
-
-console.log("tripoModelProxyArchive assertions passed");

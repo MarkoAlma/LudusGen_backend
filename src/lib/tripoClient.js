@@ -23,9 +23,7 @@ const backoffDelay = attempt =>
 
 function logDebug(label, payload) {
   try {
-    console.log(label, JSON.stringify(payload, null, 2));
   } catch {
-    console.log(label, payload);
   }
 }
 
@@ -123,9 +121,6 @@ export class TripoClient {
         cleanup();
         const traceId = getTraceId(res.headers);
         const method = options.method ?? "GET";
-        if (traceId) {
-          console.log(`[TripoClient] ${method} ${path} trace=${traceId}`);
-        }
 
         // 429 — rate limited
         if (res.status === 429) {
@@ -210,22 +205,6 @@ export class TripoClient {
 
   /* ── Task operations ──────────────────────────────────────────── */
   async createTask(taskBody, idempotencyKey, opts = {}) {
-    console.log("[TripoClient] createTask body:", JSON.stringify(taskBody, null, 2));
-
-    // Extra logging for animate tasks to help debugging
-    if (taskBody.type?.startsWith("animate_")) {
-      console.log(`[TripoClient] ${taskBody.type} request details:`, {
-        original_model_task_id: taskBody.original_model_task_id,
-        animation: taskBody.animation,
-        animations: taskBody.animations,
-        rig_type: taskBody.rig_type,
-        out_format: taskBody.out_format,
-        spec: taskBody.spec,
-        bake_animation: taskBody.bake_animation,
-        export_with_geometry: taskBody.export_with_geometry,
-        animate_in_place: taskBody.animate_in_place,
-      });
-    }
 
     const res = await this.post("/task", taskBody, idempotencyKey, opts.signal);
     logDebug("[TripoClient] createTask response:", res);
@@ -243,7 +222,6 @@ export class TripoClient {
   async cancelTask(taskId) {
     // Tripo API does not support task cancellation.
     // We only stop polling on the frontend side.
-    console.log(`[TripoClient] cancel requested for ${taskId} — no-op (Tripo has no cancel endpoint)`);
     return { success: true, cancelled: false, message: "Task cannot be cancelled after submission — it will continue running on Tripo servers until complete." };
   }
 

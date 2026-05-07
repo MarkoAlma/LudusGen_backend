@@ -9,7 +9,6 @@ let failed = 0;
 
 function assert(condition, label) {
   if (condition) {
-    console.log(`  PASS: ${label}`);
     passed++;
   } else {
     console.error(`  FAIL: ${label}`);
@@ -17,7 +16,6 @@ function assert(condition, label) {
   }
 }
 
-console.log("\nScenario 1: cursor round-trip");
 {
   const encoded = encodeImageGalleryCursor({ createdAtMs: 1714000000000, id: "abc123" });
   const decoded = decodeImageGalleryCursor(encoded);
@@ -25,13 +23,11 @@ console.log("\nScenario 1: cursor round-trip");
   assert(decoded?.id === "abc123", "id should survive round-trip");
 }
 
-console.log("\nScenario 2: invalid cursor is ignored");
 {
   const decoded = decodeImageGalleryCursor("not-a-valid-cursor");
   assert(decoded === null, "invalid cursor should decode to null");
 }
 
-console.log("\nScenario 3: invalid payload fields are rejected");
 {
   const invalidCreatedAtCursor = Buffer.from(
     JSON.stringify({ createdAtMs: "not-a-number", id: "abc123" })
@@ -78,15 +74,12 @@ console.log("\nScenario 3: invalid payload fields are rejected");
   );
 }
 
-console.log("\nScenario 4: limit clamp");
 {
   assert(clampImageGalleryLimit(undefined) === 24, "default limit should be 24");
   assert(clampImageGalleryLimit(3) === 3, "small explicit limit should pass through");
   assert(clampImageGalleryLimit(999) === 48, "limit should be capped at 48");
 }
 
-console.log(`\nResults: ${passed} passed, ${failed} failed, ${passed + failed} total`);
 if (failed > 0) {
   process.exit(1);
 }
-console.log("ALL GALLERY CURSOR TESTS PASSED");

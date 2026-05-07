@@ -213,9 +213,6 @@ async function restorePendingHistoryTasks() {
     restored += 1;
   }
 
-  if (restored > 0) {
-    console.log(`[TaskRecovery] Restored ${restored} pending history task(s) from Firestore`);
-  }
 }
 
 export function registerTask(taskId, userId, type, modelVersion, prompt = null, extra = {}) {
@@ -299,7 +296,6 @@ let cleanupInterval = null;
 export function startTaskRecovery() {
   if (pollerInterval) return; // already running
 
-  console.log("[TaskRecovery] Background task recovery started");
   restorePendingHistoryTasks().catch((err) => {
     console.error("[TaskRecovery] Failed to restore pending history tasks:", err.message);
   });
@@ -436,9 +432,6 @@ async function saveToHistory(entry, taskData) {
   const animatedModels = Array.isArray(out.animated_models) && out.animated_models.length > 0
     ? out.animated_models
     : null;
-  if (animatedModels && entry.type === "animate_retarget") {
-    console.log(`[TaskRecovery] animate_retarget ${entry.taskId}: animated_models count=${animatedModels.length}`, animatedModels);
-  }
   const prefersTexturedOutput = entry.type === "texture_model" || entry.texture === true || entry.pbr === true;
   const prefersRetopoOutput = ["convert_model", "smart_low_poly"].includes(entry.type);
   const prefersDraftOutput = !prefersTexturedOutput && ["text_to_model", "image_to_model", "multiview_to_model", "refine_model"].includes(entry.type);

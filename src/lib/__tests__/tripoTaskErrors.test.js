@@ -33,5 +33,3 @@ assert.equal(
   500,
   "unexpected Tripo errors should stay as HTTP 500",
 );
-
-console.log("tripoTaskErrors assertions passed");

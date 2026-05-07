@@ -123,7 +123,6 @@ export async function deductCredits(userId, amount, taskId, taskType) {
     remaining = newBalance;
   });
 
-  console.log(`[CreditService] Deducted ${amount} credits from user ${userId} for task ${taskId}. Remaining: ${remaining}`);
   return { success: true, remaining };
 }
 
@@ -199,7 +198,6 @@ export async function refundCredits(userId, amount, taskId, reason) {
     remaining = newBalance;
   });
 
-  console.log(`[CreditService] Refunded ${amount} credits to user ${userId} for task ${taskId} (${reason}). Remaining: ${remaining}`);
   return { success: true, remaining };
 }
 

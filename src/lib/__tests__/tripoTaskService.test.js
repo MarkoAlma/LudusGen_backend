@@ -146,5 +146,3 @@ assert.throws(
   }),
   /maximum 10 images/
 );
-
-console.log("tripoTaskService assertions passed");

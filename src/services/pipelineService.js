@@ -32,7 +32,6 @@ class PipelineService {
 
     const result = { pipelineId, steps: [], finalModelUrl: null, status: "running" };
     _pipelines.set(pipelineId, result);
-    console.log(`[Pipeline ${pipelineId}] starting (${genType})`);
 
     // Persist initial state to Firestore so a server crash can be detected
     // at boot time and credits refunded for each completed step.
@@ -82,7 +81,6 @@ class PipelineService {
           }, client, req.userId);
           const checkTask = await client.getTask(checkId);
           isAnimatable    = checkTask.output?.is_animatable !== false;
-          console.log(`[Pipeline ${pipelineId}] rig check: isAnimatable=${isAnimatable}`);
         } catch (err) {
           console.warn(`[Pipeline ${pipelineId}] prerigcheck skipped:`, err.message);
           result.steps.push({ type: "animate_prerigcheck", status: "skipped" });
@@ -168,7 +166,7 @@ class PipelineService {
       await updatePipeline(result.pipelineId, { steps: result.steps }).catch(() => {});
 
       const poll = await client.pollTask(taskId, {
-        onProgress: (p, s) => console.log(`[Pipeline step=${type} task=${taskId}] ${s} ${p}%`),
+        onProgress: () => void 0,
       });
       if (!poll.success) {
         await refundCreditReservation(reservation, `pipeline_${type}_${poll.status}`, taskId);

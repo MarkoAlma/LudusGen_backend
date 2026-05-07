@@ -130,7 +130,6 @@ export async function uploadAsset(req, res) {
 
     registerForRecovery(taskId, userId, "import_model", null, displayName, {});
 
-    console.log(`[AssetController] Uploaded asset for user ${userId}, task ${taskId}`);
 
     // Save immediately so Tripo import ownership survives refresh/restart.
     const db = admin.firestore();

@@ -75,7 +75,6 @@ async function processJob(job) {
   const client  = getTripoClient();
   const startMs = Date.now();
 
-  console.log(`[Worker] job=${job.id} type=${taskBody.type} attempt=${job.attemptsMade + 1}`);
 
   await job.updateProgress(0);
 
@@ -166,14 +165,8 @@ async function processJob(job) {
   }
 
   /* ── Pipeline continuation ───────────────────────────────────────── */
-  if (pipelineId && pipelineStep !== undefined) {
-    console.log(`[Worker] pipeline=${pipelineId} step=${pipelineStep} completed task=${taskId}`);
-  }
 
   /* ── Batch tracking ──────────────────────────────────────────────── */
-  if (batchId && batchIndex !== undefined) {
-    console.log(`[Worker] batch=${batchId} item[${batchIndex}] completed task=${taskId}`);
-  }
 
   return jobResult;
 }
@@ -188,7 +181,6 @@ async function deliverCallback(url, result) {
     signal:  AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`Callback HTTP ${res.status} to ${url}`);
-  console.log(`[Worker] callback delivered to ${url}`);
 }
 
 /* ─── Worker instance ─────────────────────────────────────────────────── */
@@ -209,7 +201,6 @@ export function startWorker(concurrency = 5) {
   );
 
   worker.on("completed", (job, result) => {
-    console.log(`[Worker] ✅ job=${job.id} task=${result.taskId} in ${result.durationMs}ms`);
   });
 
   worker.on("failed", async (job, err) => {
@@ -244,15 +235,12 @@ export function startWorker(concurrency = 5) {
     console.error("[Worker] worker error:", err.message);
   });
 
-  console.log(`[Worker] started (concurrency=${concurrency})`);
   return worker;
 }
 
 /* ─── Graceful shutdown ───────────────────────────────────────────────── */
 export async function stopWorker(worker) {
-  console.log("[Worker] shutting down…");
   await worker.close();
-  console.log("[Worker] stopped");
 }
 
 /* ─── Standalone entry point ──────────────────────────────────────────── */

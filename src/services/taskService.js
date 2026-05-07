@@ -350,15 +350,10 @@ class TaskService {
     const idempotencyKey = opts.idempotencyKey ?? crypto.randomUUID();
     const client = getTripoClient();
     const startMs = Date.now();
-    console.log("[TaskService] validated create body:", JSON.stringify({
-      idempotencyKey,
-      validated,
-    }, null, 2));
 
     try {
       const taskId = await client.createTask(validated, idempotencyKey, opts);
       analyticsService.recordTaskStart(taskId, body.type, body.model_version);
-      console.log(`[TaskService] created task ${taskId} (type=${body.type}) in ${Date.now() - startMs}ms`);
       return taskId;
     } catch (err) {
       analyticsService.recordTaskError("unknown", body.type, err.message);
@@ -378,7 +373,6 @@ class TaskService {
     const client = getTripoClient();
     const result = await client.cancelTask(taskId);
     analyticsService.recordTaskEnd(taskId, "stop_requested", 0);
-    console.log(`[TaskService] stop requested for ${taskId} — task is still running on Tripo servers`);
     return result;
   }
 

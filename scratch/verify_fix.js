@@ -109,11 +109,6 @@ const testCases = [
 
 testCases.forEach(tc => {
     const result = normalizeMessages(tc.input);
-    console.log(`Test: ${tc.name}`);
-    console.log(`Input: ${JSON.stringify(tc.input)}`);
-    console.log(`Result: ${JSON.stringify(result)}`);
     // Simple check (not exhaustive)
     const success = JSON.stringify(result) === JSON.stringify(tc.expected) || (tc.name === "Empty content removal" && result.length === 0);
-    console.log(`Status: ${success ? 'PASSED' : 'FAILED'}`);
-    console.log('---');
 });
